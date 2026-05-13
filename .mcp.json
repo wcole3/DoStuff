@@ -1,0 +1,20 @@
+{
+    "mcpServers": {
+        "io.github.upstash/context7": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"@upstash/context7-mcp@1.0.31"
+			],
+			"env": {
+				"CONTEXT7_API_KEY": "ctx7sk-1ee576e6-c2e1-4e64-aecb-b19ef138c5d9"
+			},
+			"gallery": "https://api.mcp.github.com",
+			"version": "1.0.31"
+		},
+		"idea": {
+			"url": "http://127.0.0.1:64342/sse",
+			"type": "sse"
+		}
+    }
+}
