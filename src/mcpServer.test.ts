@@ -16,11 +16,14 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { IssueStore } from "./storage";
 import {
   runGetTicket,
+  runListIssues,
   runCreateTicket,
   runUpdateTicketStatus,
   runUpdateTicketProgress,
   registerMcpTools,
+  getWorkspaceContext,
   DoStuffMcpServer,
+  DEFAULT_WORKFLOW_PROMPT,
   type ToolResult,
 } from "./mcpServer";
 import { ACTIVE_LANE_CAP, type Issue, type Priority, type IssueType, type Status } from "./types";
@@ -300,6 +303,200 @@ describe("get_ticket", () => {
   });
 });
 
+// ----- list_issues -----------------------------------------------------------
+
+describe("list_issues", () => {
+  test("no filters returns all issues sorted by number ascending", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-003", number: 3, title: "C", status: "Complete" }),
+      makeIssue({ id: "DS-001", number: 1, title: "A", status: "Thinking" }),
+      makeIssue({ id: "DS-002", number: 2, title: "B", status: "Planned" }),
+    ]);
+    const res = await runListIssues(store, {});
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { count: number; issues: Array<{ id: string }> };
+    expect(body.count).toBe(3);
+    expect(body.issues.map((i) => i.id)).toEqual(["DS-001", "DS-002", "DS-003"]);
+  });
+
+  test("returns compact fields only (no description, tasks, record, statusHistory)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, title: "Compact", status: "Planned" }),
+    ]);
+    const res = await runListIssues(store, {});
+    const body = payload(res) as { issues: Array<Record<string, unknown>> };
+    const item = body.issues[0];
+    expect(item).toHaveProperty("id");
+    expect(item).toHaveProperty("number");
+    expect(item).toHaveProperty("title");
+    expect(item).toHaveProperty("type");
+    expect(item).toHaveProperty("priority");
+    expect(item).toHaveProperty("status");
+    expect(item).not.toHaveProperty("description");
+    expect(item).not.toHaveProperty("tasks");
+    expect(item).not.toHaveProperty("record");
+    expect(item).not.toHaveProperty("statusHistory");
+  });
+
+  test("status filter limits to matching issues", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, status: "Planned" }),
+      makeIssue({ id: "DS-002", number: 2, status: "Working" }),
+      makeIssue({ id: "DS-003", number: 3, status: "Thinking" }),
+    ]);
+    const res = await runListIssues(store, { status: "Planned" });
+    const body = payload(res) as { count: number; issues: Array<{ id: string }> };
+    expect(body.count).toBe(1);
+    expect(body.issues[0].id).toBe("DS-001");
+  });
+
+  test("type filter limits to matching issues", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, type: "Bug", status: "Planned" }),
+      makeIssue({ id: "DS-002", number: 2, type: "Feature", status: "Planned" }),
+      makeIssue({ id: "DS-003", number: 3, type: "Bug", status: "Working" }),
+    ]);
+    const res = await runListIssues(store, { type: "Bug" });
+    const body = payload(res) as { count: number; issues: Array<{ id: string }> };
+    expect(body.count).toBe(2);
+    expect(body.issues.map((i) => i.id)).toEqual(["DS-001", "DS-003"]);
+  });
+
+  test("priority filter limits to matching issues", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, priority: "Critical", status: "Planned" }),
+      makeIssue({ id: "DS-002", number: 2, priority: "Regular", status: "Planned" }),
+    ]);
+    const res = await runListIssues(store, { priority: "Critical" });
+    const body = payload(res) as { count: number; issues: Array<{ id: string }> };
+    expect(body.count).toBe(1);
+    expect(body.issues[0].id).toBe("DS-001");
+  });
+
+  test("combined type + priority + status filters are ANDed", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, type: "Bug", priority: "Critical", status: "Planned" }),
+      makeIssue({ id: "DS-002", number: 2, type: "Bug", priority: "Regular", status: "Planned" }),
+      makeIssue({ id: "DS-003", number: 3, type: "Feature", priority: "Critical", status: "Planned" }),
+      makeIssue({ id: "DS-004", number: 4, type: "Bug", priority: "Critical", status: "Working" }),
+    ]);
+    const res = await runListIssues(store, { type: "Bug", priority: "Critical", status: "Planned" });
+    const body = payload(res) as { count: number; issues: Array<{ id: string }> };
+    expect(body.count).toBe(1);
+    expect(body.issues[0].id).toBe("DS-001");
+  });
+
+  test("empty store returns count=0 and empty array", async () => {
+    const store = await makeStore([]);
+    const res = await runListIssues(store, {});
+    const body = payload(res) as { count: number; issues: unknown[] };
+    expect(body.count).toBe(0);
+    expect(body.issues).toEqual([]);
+  });
+
+  test("no matches with filter returns count=0 and empty array (not an error)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, type: "Feature", status: "Planned" }),
+    ]);
+    const res = await runListIssues(store, { type: "Bug" });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { count: number; issues: unknown[] };
+    expect(body.count).toBe(0);
+    expect(body.issues).toEqual([]);
+  });
+
+  test("includes Thinking and Complete issues when no status filter", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, status: "Thinking" }),
+      makeIssue({ id: "DS-002", number: 2, status: "Complete" }),
+      makeIssue({ id: "DS-003", number: 3, status: "Planned" }),
+    ]);
+    const res = await runListIssues(store, {});
+    const body = payload(res) as { count: number; issues: Array<{ status: string }> };
+    expect(body.count).toBe(3);
+    const statuses = body.issues.map((i) => i.status).sort();
+    expect(statuses).toEqual(["Complete", "Planned", "Thinking"]);
+  });
+
+  test("smuggled unknown fields rejected by strict schema (isError)", async () => {
+    const store = await makeStore([]);
+    const res = await runListIssues(store, {
+      ...(({ foo: "bar" }) as unknown as object),
+    } as Parameters<typeof runListIssues>[1]);
+    expect(res.isError).toBe(true);
+  });
+});
+
+// ----- workspace context + workflow in responses ------------------------------
+
+describe("workspace context and workflow in tool responses", () => {
+  afterEach(() => {
+    vscode.workspace.workspaceFolders = undefined;
+    vscode.workspace.name = undefined;
+  });
+
+  test("getWorkspaceContext returns null when no workspaceFolders", () => {
+    vscode.workspace.workspaceFolders = undefined;
+    expect(getWorkspaceContext()).toBeNull();
+  });
+
+  test("getWorkspaceContext returns name+rootPath when workspaceFolders set", () => {
+    vscode.workspace.workspaceFolders = [
+      { name: "MyProject", uri: vscode.Uri.file("/home/user/MyProject"), index: 0 },
+    ];
+    vscode.workspace.name = "MyProject";
+    const ctx = getWorkspaceContext();
+    expect(ctx).not.toBeNull();
+    expect(ctx!.name).toBe("MyProject");
+    expect(ctx!.rootPath).toBe("/home/user/MyProject");
+  });
+
+  test("getWorkspaceContext falls back to folder name when workspace.name is undefined", () => {
+    vscode.workspace.workspaceFolders = [
+      { name: "FolderName", uri: vscode.Uri.file("/x"), index: 0 },
+    ];
+    vscode.workspace.name = undefined;
+    const ctx = getWorkspaceContext();
+    expect(ctx!.name).toBe("FolderName");
+  });
+
+  test("tool responses include workspace field (null when no workspace open)", async () => {
+    vscode.workspace.workspaceFolders = undefined;
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Planned" })]);
+
+    const listBody = payload(await runListIssues(store, {})) as Record<string, unknown>;
+    expect(listBody).toHaveProperty("workspace");
+    expect(listBody.workspace).toBeNull();
+
+    const getBody = payload(await runGetTicket(store, { query: "DS-001" })) as Record<string, unknown>;
+    expect(getBody).toHaveProperty("workspace");
+    expect(getBody.workspace).toBeNull();
+
+    const createBody = payload(await runCreateTicket(store, { title: "T" })) as Record<string, unknown>;
+    expect(createBody).toHaveProperty("workspace");
+    expect(createBody.workspace).toBeNull();
+
+    const statusBody = payload(
+      await runUpdateTicketStatus(store, { id: "DS-001", status: "Working" }),
+    ) as Record<string, unknown>;
+    expect(statusBody).toHaveProperty("workspace");
+    expect(statusBody.workspace).toBeNull();
+
+    const progressBody = payload(
+      await runUpdateTicketProgress(store, { id: "DS-001" }),
+    ) as Record<string, unknown>;
+    expect(progressBody).toHaveProperty("workspace");
+    expect(progressBody.workspace).toBeNull();
+  });
+
+  test("list_issues includes workflow field equal to DEFAULT_WORKFLOW_PROMPT when instructions unset", async () => {
+    // mock getConfiguration returns defaultValue ("") for any key → readWorkflowPrompt falls through
+    const store = await makeStore([]);
+    const res = payload(await runListIssues(store, {})) as { workflow: string };
+    expect(res.workflow).toBe(DEFAULT_WORKFLOW_PROMPT);
+  });
+});
+
 // ----- create_ticket ---------------------------------------------------------
 
 describe("create_ticket", () => {
@@ -474,7 +671,7 @@ describe("update_ticket_status", () => {
     expect(store.get("DS-001")!.status).toBe("Complete");
   });
 
-  test("Planned -> Thinking: rejected by schema/enum", async () => {
+  test("Planned -> Thinking: rejected with actionable message explaining the human-triage rule", async () => {
     const store = await makeStore([makeIssue({ id: "DS-001", status: "Planned" })]);
     // bypass schema by casting; handler must still reject
     const res = await runUpdateTicketStatus(store, {
@@ -482,6 +679,8 @@ describe("update_ticket_status", () => {
       status: "Thinking" as Status,
     });
     expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("human triage queue");
+    expect(res.content[0].text).toContain("Planned, Working, Testing");
     expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
@@ -1020,6 +1219,119 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     expect(res.status).toBe(403);
   });
 
+  test("cross-origin Origin header is rejected with 403", async () => {
+    port = nextTestPort();
+    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
+    const store = await makeStore([]);
+    server = new DoStuffMcpServer(store);
+    await server.reconcile();
+
+    const res = await rawRequest(port, {
+      host: "127.0.0.1",
+      headers: { Origin: "https://evil.example.com" },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toContain("cross-origin");
+  });
+
+  test("loopback Origin header is accepted", async () => {
+    port = nextTestPort();
+    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
+    const store = await makeStore([]);
+    server = new DoStuffMcpServer(store);
+    await server.reconcile();
+
+    // Use DELETE so the transport responds quickly without hanging on an SSE stream.
+    const res = await rawRequest(port, {
+      host: "127.0.0.1",
+      method: "DELETE",
+      headers: { Origin: "http://127.0.0.1:3947" },
+    });
+    expect(res.status).not.toBe(403);
+    expect(res.status).not.toBe(404);
+  });
+
+  test("Origin: null (local file) is accepted", async () => {
+    port = nextTestPort();
+    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
+    const store = await makeStore([]);
+    server = new DoStuffMcpServer(store);
+    await server.reconcile();
+
+    const res = await rawRequest(port, {
+      host: "127.0.0.1",
+      method: "DELETE",
+      headers: { Origin: "null" },
+    });
+    expect(res.status).not.toBe(403);
+    expect(res.status).not.toBe(404);
+  });
+
+  test("oversized Content-Length is rejected with 413", async () => {
+    port = nextTestPort();
+    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
+    const store = await makeStore([]);
+    server = new DoStuffMcpServer(store);
+    await server.reconcile();
+
+    // rawRequest uses req.write() which causes chunked encoding (no Content-Length header).
+    // req.end(body) sets Content-Length to the actual body size automatically.
+    const bigBody = "x".repeat(1_100_000); // 1.1 MB
+    const { status, body } = await new Promise<{ status: number; body: string }>(
+      (resolve, reject) => {
+        const req = http.request(
+          {
+            host: "127.0.0.1",
+            port,
+            path: "/mcp",
+            method: "POST",
+            headers: {
+              Host: "127.0.0.1",
+              "Content-Type": "application/json",
+              Accept: "application/json, text/event-stream",
+            },
+          },
+          (res) => {
+            let buf = "";
+            res.setEncoding("utf8");
+            res.on("data", (c) => { buf += c; });
+            res.on("end", () => resolve({ status: res.statusCode ?? 0, body: buf }));
+          },
+        );
+        req.on("error", (e) => {
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code !== "EPIPE" && code !== "ECONNRESET") reject(e);
+        });
+        req.end(bigBody);
+      },
+    );
+    expect(status).toBe(413);
+    expect(body).toContain("too large");
+  });
+
+  test("every response carries X-Content-Type-Options: nosniff", async () => {
+    port = nextTestPort();
+    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
+    const store = await makeStore([]);
+    server = new DoStuffMcpServer(store);
+    await server.reconcile();
+
+    const header = await new Promise<string | undefined>((resolve, reject) => {
+      const req = http.request(
+        { host: "127.0.0.1", port, path: "/mcp", method: "DELETE",
+          headers: { Host: "127.0.0.1" } },
+        (res) => {
+          res.resume();
+          resolve(res.headers["x-content-type-options"] as string | undefined);
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    expect(header).toBe("nosniff");
+  });
+
   test("/mcpfoo and /mcp.evil do not match the MCP path", async () => {
     port = nextTestPort();
     setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
@@ -1141,6 +1453,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     expect(toolNames).toEqual([
       "create_ticket",
       "get_ticket",
+      "list_issues",
       "update_ticket_progress",
       "update_ticket_status",
     ]);
@@ -1162,6 +1475,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       expect(tools.map((t) => t.name).sort()).toEqual([
         "create_ticket",
         "get_ticket",
+        "list_issues",
         "update_ticket_progress",
         "update_ticket_status",
       ]);

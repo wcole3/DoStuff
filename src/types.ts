@@ -85,7 +85,8 @@ export type HostToWebview =
   | { type: "init"; issues: Issue[]; settings: Settings }
   | { type: "issues"; issues: Issue[] }
   | { type: "focusSearch" }
-  | { type: "settings"; settings: Settings };
+  | { type: "settings"; settings: Settings }
+  | { type: "showNewIssue" };
 
 export type WebviewToHost =
   | { type: "ready" }

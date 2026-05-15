@@ -28,39 +28,34 @@ export interface UriLike {
   path: string;
   fsPath: string;
   toString(): string;
-  with?(change: { scheme?: string; path?: string }): UriLike;
+  with(change: { scheme?: string; path?: string }): UriLike;
 }
 
 export type Uri = UriLike;
 
+function makeUri(scheme: string, path: string): UriLike {
+  return {
+    scheme,
+    path,
+    fsPath: path,
+    toString: () => `${scheme}://${path}`,
+    with(change) {
+      return makeUri(change.scheme ?? scheme, change.path ?? path);
+    },
+  };
+}
+
 export const Uri = {
-  file(path: string): UriLike {
-    return {
-      scheme: "file",
-      path,
-      fsPath: path,
-      toString: () => `file://${path}`,
-    };
-  },
+  file(path: string): UriLike { return makeUri("file", path); },
   parse(value: string): UriLike {
     const colon = value.indexOf(":");
     const scheme = colon >= 0 ? value.slice(0, colon) : "file";
     const path = colon >= 0 ? value.slice(colon + 1).replace(/^\/+/, "/") : value;
-    return {
-      scheme,
-      path,
-      fsPath: path,
-      toString: () => value,
-    };
+    return makeUri(scheme, path);
   },
   joinPath(base: UriLike, ...segments: string[]): UriLike {
     const joined = [base.path.replace(/\/+$/, ""), ...segments].join("/");
-    return {
-      scheme: base.scheme,
-      path: joined,
-      fsPath: joined,
-      toString: () => `${base.scheme}://${joined}`,
-    };
+    return makeUri(base.scheme, joined);
   },
 };
 
@@ -293,6 +288,7 @@ export const window: {
 
 export const workspace = {
   workspaceFolders: undefined as WorkspaceFolder[] | undefined,
+  name: undefined as string | undefined,
   getConfiguration: (_section?: string): WorkspaceConfiguration => ({
     get: (<T>(_key: string, defaultValue?: T) => defaultValue) as WorkspaceConfiguration["get"],
     update: (..._args: unknown[]) => Promise.resolve(),

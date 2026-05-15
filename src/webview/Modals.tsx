@@ -15,9 +15,10 @@ interface ModalProps {
   children: ReactNode;
   footer?: ReactNode;
   width?: number;
+  panelStyle?: boolean;
 }
 
-function Modal({ title, onClose, children, footer, width = 480 }: ModalProps) {
+function Modal({ title, onClose, children, footer, width = 480, panelStyle }: ModalProps) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -27,7 +28,7 @@ function Modal({ title, onClose, children, footer, width = 480 }: ModalProps) {
   }, [onClose]);
 
   return (
-    <div className="ds-modal-backdrop" onClick={onClose}>
+    <div className={`ds-modal-backdrop${panelStyle ? " ds-panel-style" : ""}`} onClick={onClose}>
       <div className="ds-modal" style={{ width }} onClick={(e) => e.stopPropagation()}>
         <div className="ds-modal-head">
           <span className="ds-modal-title">{title}</span>
@@ -71,6 +72,7 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
       title="New Issue"
       onClose={onClose}
       width={520}
+      panelStyle
       footer={
         <>
           <button className="ds-btn" onClick={onClose}>

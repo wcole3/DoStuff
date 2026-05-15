@@ -98,6 +98,9 @@ export function startMessageBridge(): void {
         }
         break;
       }
+      case "showNewIssue":
+        window.dispatchEvent(new CustomEvent("dostuff:showNewIssue"));
+        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;

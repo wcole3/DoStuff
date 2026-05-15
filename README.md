@@ -47,7 +47,6 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+I` / `Cmd+Shift+I` | New Issue |
-| `Ctrl+Shift+F` / `Cmd+Shift+F` (sidebar focused) | Focus Search |
 
 ## Settings reference
 
@@ -55,17 +54,39 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | --- | --- | --- | --- |
 | `dostuff.storagePath` | string | `.vscode/dostuff` | Folder (relative to workspace root) where issue JSON files are stored. |
 | `dostuff.autoSave` | boolean | `true` | Persist edits automatically as you type. |
-| `dostuff.mcp.enabled` | boolean | `true` | Run an in-process MCP server that exposes the active ticket queue to local agents. |
+| `dostuff.mcp.enabled` | boolean | `false` | Run an in-process MCP server that exposes the active ticket queue to local agents. |
 | `dostuff.mcp.port` | number | `3947` | Localhost port the MCP server listens on. Endpoint is `http://127.0.0.1:<port>/mcp`. |
 | `dostuff.mcp.instructions` | string | (built-in workflow prompt) | System-level workflow prompt served alongside every ticket. Leave blank to use the default. User-level only. |
 
 ## Using the MCP server
 
-DoStuff runs an HTTP MCP server on `127.0.0.1:<port>` (default `3947`). The endpoint is `/mcp`. It's enabled by default; toggle it with **DoStuff: Toggle MCP Server** or the `dostuff.mcp.enabled` setting.
+DoStuff runs an HTTP MCP server on `127.0.0.1:<port>` (default `3947`). The endpoint is `/mcp`. It is **disabled by default** — enable it with **DoStuff: Toggle MCP Server** or by setting `dostuff.mcp.enabled: true`.
+
+Every tool response includes a `workspace` field (`{ name, rootPath }` or `null`) so agents can immediately verify they are connected to the intended project.
+
+**Multiple workspaces:** only one VSCode window can bind a given port. If you run two workspaces simultaneously with MCP enabled, configure a different `dostuff.mcp.port` in each workspace's settings to avoid the port conflict.
 
 ### Pointing a client at it
 
-For Claude Code, add an entry to your `.mcp.json` (or run `claude mcp add`):
+#### VSCode MCP settings (VS Code 1.99+)
+
+Add to your `settings.json` (user or workspace level):
+
+```json
+"mcp": {
+  "servers": {
+    "dostuff-ticket": {
+      "url": "http://localhost:3947/mcp",
+      "type": "http"
+    }
+  },
+  "inputs": []
+}
+```
+
+#### Claude Code
+
+Add an entry to your `.mcp.json` (or run `claude mcp add`):
 
 ```json
 {
@@ -85,6 +106,7 @@ Customize the workflow prompt that agents receive with every ticket via the `dos
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
 | `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Only Planned / Working / Testing tickets are servable. `statusHistory` and `resolvedAt` are stripped. |
+| `list_issues` | optional `type`, `priority`, `status` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Includes the workflow prompt and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. |
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. |
 | `update_ticket_status` | `id`, `status` (one of Planned / Working / Testing), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete. |
 | `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, or verifyCriteria. |

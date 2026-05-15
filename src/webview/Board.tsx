@@ -11,8 +11,12 @@ import {
 import { FixedSizeList, type ListChildComponentProps } from "react-window";
 import {
   ACTIVE_LANE_CAP,
+  PRIORITIES,
+  TYPES,
   canMoveToActiveLane,
   type Issue,
+  type IssueType,
+  type Priority,
   type Status,
 } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
@@ -250,9 +254,20 @@ function Drawer({
   onDragEnd,
 }: DrawerProps) {
   const [dragOver, setDragOver] = useState(false);
+  const [query, setQuery] = useState("");
+  const [typeFilter, setTypeFilter] = useState<IssueType | "All">("All");
+  const [priorityFilter, setPriorityFilter] = useState<Priority | "All">("All");
   const meta = STATUS_META[status];
   const listWrapRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
+
+  useEffect(() => {
+    if (!open) {
+      setQuery("");
+      setTypeFilter("All");
+      setPriorityFilter("All");
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -264,6 +279,16 @@ function Drawer({
     ro.observe(el);
     return () => ro.disconnect();
   }, [open]);
+
+  const displayedIssues = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return issues.filter((i) => {
+      if (typeFilter !== "All" && i.type !== typeFilter) return false;
+      if (priorityFilter !== "All" && i.priority !== priorityFilter) return false;
+      if (q && !i.title.toLowerCase().includes(q) && !i.id.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [issues, query, typeFilter, priorityFilter]);
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -279,8 +304,8 @@ function Drawer({
   };
 
   const rowData = useMemo<DrawerCardRowData>(
-    () => ({ issues, onOpen, onPickToBoard, status, onDragStart, onDragEnd }),
-    [issues, onOpen, onPickToBoard, status, onDragStart, onDragEnd],
+    () => ({ issues: displayedIssues, onOpen, onPickToBoard, status, onDragStart, onDragEnd }),
+    [displayedIssues, onOpen, onPickToBoard, status, onDragStart, onDragEnd],
   );
 
   return (
@@ -303,13 +328,39 @@ function Drawer({
 
       {open && (
         <div className="bd-drawer-body">
+          <div className="bd-drawer-search">
+            <input
+              className="bd-drawer-search-input"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Filter…"
+            />
+            <select
+              className="bd-drawer-search-select"
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value as IssueType | "All")}
+            >
+              <option value="All">All types</option>
+              {TYPES.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+            <select
+              className="bd-drawer-search-select"
+              value={priorityFilter}
+              onChange={(e) => setPriorityFilter(e.target.value as Priority | "All")}
+            >
+              <option value="All">All priorities</option>
+              {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
           <div className="bd-drawer-help">
             {status === "Thinking"
               ? "Ideas not yet on the board. Click an issue to promote it to Planned."
               : "Completed issues. Drop here to mark complete, or open to review."}
           </div>
-          {issues.length === 0 ? (
-            <div className="bd-lane-empty">No {status.toLowerCase()} issues</div>
+          {displayedIssues.length === 0 ? (
+            <div className="bd-lane-empty">
+              {issues.length === 0 ? `No ${status.toLowerCase()} issues` : "No matches"}
+            </div>
           ) : (
             <div ref={listWrapRef} className="bd-drawer-list">
               {size.height > 0 && (
@@ -317,7 +368,7 @@ function Drawer({
                   className="ds-vlist"
                   height={size.height}
                   width={size.width}
-                  itemCount={issues.length}
+                  itemCount={displayedIssues.length}
                   itemSize={DRAWER_CARD_HEIGHT}
                   itemData={rowData}
                   itemKey={(index, data) => data.issues[index].id}

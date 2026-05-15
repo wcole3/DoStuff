@@ -97,6 +97,12 @@ describe("AddIssueModal", () => {
     await userEvent.click(backdrop);
     expect(closed).toBe(true);
   });
+
+  test("backdrop has ds-panel-style class", () => {
+    render(<AddIssueModal onClose={() => {}} />);
+    const backdrop = document.querySelector(".ds-modal-backdrop") as HTMLElement;
+    expect(backdrop.classList.contains("ds-panel-style")).toBe(true);
+  });
 });
 
 describe("DeleteConfirmModal", () => {

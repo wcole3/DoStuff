@@ -11,6 +11,7 @@
 //
 //   Tools
 //     get_ticket             fetch by #NN, DS-id, or title substring
+//     list_issues            compact id/title index with optional type/priority/status filters
 //     create_ticket          file new ticket in "Thinking" for human triage
 //     update_ticket_status   move ticket between Planned <-> Working <-> Testing
 //                            with lane-cap enforcement (cap=6) and the
@@ -43,7 +44,7 @@ import {
   type Status,
 } from "./types";
 
-const DEFAULT_WORKFLOW_PROMPT = `\
+export const DEFAULT_WORKFLOW_PROMPT = `\
 You are an engineering agent working through the DoStuff issue queue.
 
 Workflow contract:
@@ -123,6 +124,21 @@ const GET_TICKET_INPUT = {
     .describe("Ticket number, DS-id, or a substring of the title."),
 };
 
+const LIST_ISSUES_INPUT = {
+  type: z
+    .enum(["Bug", "Feature", "Refactor", "Chore", "Spike"])
+    .optional()
+    .describe("Narrow to one issue type."),
+  priority: z
+    .enum(["Critical", "High", "Regular", "Low"])
+    .optional()
+    .describe("Narrow to one priority level."),
+  status: z
+    .enum(["Thinking", "Planned", "Working", "Testing", "Complete"])
+    .optional()
+    .describe("Narrow to one status. Omit to list all statuses."),
+};
+
 // Strict schemas used at handler entry to reject smuggled-in extra fields.
 // The SDK's `registerTool({ inputSchema })` takes the raw shape and its
 // behavior for unknown keys is version-dependent. Parsing again in-handler
@@ -131,6 +147,7 @@ const NewTicketSchema   = z.object(NEW_TICKET_INPUT).strict();
 const StatusSchema      = z.object(STATUS_INPUT).strict();
 const ProgressSchema    = z.object(PROGRESS_INPUT).strict();
 const GetTicketSchema   = z.object(GET_TICKET_INPUT).strict();
+const ListIssuesSchema  = z.object(LIST_ISSUES_INPUT).strict();
 
 // ----- Helpers ---------------------------------------------------------------
 
@@ -170,9 +187,23 @@ function isLocalhost(addr: string): boolean {
   );
 }
 
+export function getWorkspaceContext(): { name: string; rootPath: string } | null {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length) return null;
+  return {
+    name: vscode.workspace.name ?? folders[0].name,
+    rootPath: folders[0].uri.fsPath,
+  };
+}
+
 // ----- Pure tool handlers (exported for tests) -------------------------------
 
 export type GetTicketInput = { query: string };
+export type ListIssuesInput = {
+  type?: "Bug" | "Feature" | "Refactor" | "Chore" | "Spike";
+  priority?: "Critical" | "High" | "Regular" | "Low";
+  status?: Status;
+};
 export type CreateTicketInput = {
   title: string;
   description?: string;
@@ -205,7 +236,7 @@ export async function runGetTicket(
   args: GetTicketInput,
 ): Promise<ToolResult> {
   const parsed = GetTicketSchema.safeParse(args);
-  if (!parsed.success) return ToolResultErr(parsed.error.message);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for get_ticket: ${parsed.error.message}`);
   args = parsed.data;
   const q = args.query.trim();
   if (!q) return ToolResultErr("Empty query.");
@@ -266,7 +297,51 @@ export async function runGetTicket(
 
   return ToolResultOk(
     JSON.stringify(
-      { workflow: readWorkflowPrompt(), ticket: publicView(match) },
+      { workspace: getWorkspaceContext(), workflow: readWorkflowPrompt(), ticket: publicView(match) },
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * Return a compact index of all issues, optionally filtered by type, priority,
+ * and/or status. Intended for agent discovery: call with `status: "Planned"`
+ * to see available work, or with no filters to survey the full board.
+ *
+ * Returns `{ count, issues: [{id, number, title, type, priority, status}] }`
+ * sorted by issue number ascending. Includes Thinking and Complete issues so
+ * agents get a complete picture — they still cannot act on those via other tools.
+ */
+export async function runListIssues(
+  store: IssueStore,
+  args: ListIssuesInput,
+): Promise<ToolResult> {
+  const parsed = ListIssuesSchema.safeParse(args);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for list_issues: ${parsed.error.message}`);
+  const { type, priority, status } = parsed.data;
+
+  let issues = store.list();
+  if (type)     issues = issues.filter((i) => i.type === type);
+  if (priority) issues = issues.filter((i) => i.priority === priority);
+  if (status)   issues = issues.filter((i) => i.status === status);
+  issues = [...issues].sort((a, b) => a.number - b.number);
+
+  return ToolResultOk(
+    JSON.stringify(
+      {
+        workspace: getWorkspaceContext(),
+        workflow: readWorkflowPrompt(),
+        count: issues.length,
+        issues: issues.map((i) => ({
+          id:       i.id,
+          number:   i.number,
+          title:    i.title,
+          type:     i.type,
+          priority: i.priority,
+          status:   i.status,
+        })),
+      },
       null,
       2,
     ),
@@ -290,7 +365,7 @@ export async function runCreateTicket(
   args: CreateTicketInput,
 ): Promise<ToolResult> {
   const parsed = NewTicketSchema.safeParse(args);
-  if (!parsed.success) return ToolResultErr(parsed.error.message);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for create_ticket: ${parsed.error.message}`);
   const validated = parsed.data;
   const now = new Date().toISOString();
   const number = store.nextNumber();
@@ -324,6 +399,7 @@ export async function runCreateTicket(
   return ToolResultOk(
     JSON.stringify(
       {
+        workspace: getWorkspaceContext(),
         id: issue.id,
         number: issue.number,
         status: issue.status,
@@ -355,12 +431,14 @@ export async function runUpdateTicketStatus(
   // want the friendlier "Cannot set status to ..." message for those.
   if (!AGENT_WRITABLE_STATUSES.includes(args.status)) {
     return ToolResultErr(
-      `Cannot set status to "${args.status}". Allowed: ${AGENT_WRITABLE_STATUSES.join(", ")}.`,
+      `Agents cannot move a ticket to "${args.status}". ` +
+      `Thinking is the human triage queue — only humans may route work there. ` +
+      `Allowed target statuses for agents: ${AGENT_WRITABLE_STATUSES.join(", ")}.`,
     );
   }
 
   const parsed = StatusSchema.safeParse(args);
-  if (!parsed.success) return ToolResultErr(parsed.error.message);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_status: ${parsed.error.message}`);
   args = parsed.data;
 
   const issue = store.get(args.id);
@@ -413,7 +491,7 @@ export async function runUpdateTicketStatus(
   };
   await store.upsert(next);
   return ToolResultOk(
-    JSON.stringify({ id: next.id, status: next.status, from: issue.status }, null, 2),
+    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id, status: next.status, from: issue.status }, null, 2),
   );
 }
 
@@ -435,7 +513,7 @@ export async function runUpdateTicketProgress(
   args: UpdateProgressInput,
 ): Promise<ToolResult> {
   const parsed = ProgressSchema.safeParse(args);
-  if (!parsed.success) return ToolResultErr(parsed.error.message);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_progress: ${parsed.error.message}`);
   args = parsed.data;
 
   const issue = store.get(args.id);
@@ -474,6 +552,7 @@ export async function runUpdateTicketProgress(
   return ToolResultOk(
     JSON.stringify(
       {
+        workspace: getWorkspaceContext(),
         id: next.id,
         tasks: next.tasks.map((t) => ({ id: t.id, done: t.done })),
         recordLength: next.record.length,
@@ -575,6 +654,10 @@ export class DoStuffMcpServer implements vscode.Disposable {
     const server = http.createServer((req, res) => {
       void this.handleHttpRequest(req, res);
     });
+    // Guard against Slowloris-style DoS: kill connections that never send
+    // headers or never finish sending a request body within these windows.
+    server.headersTimeout = 10_000;
+    server.requestTimeout = 30_000;
 
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -589,6 +672,9 @@ export class DoStuffMcpServer implements vscode.Disposable {
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<void> {
+    // Set on every response — prevents MIME-sniffing attacks.
+    res.setHeader("X-Content-Type-Options", "nosniff");
+
     const remote = req.socket.remoteAddress ?? "";
     if (!isLocalhost(remote)) {
       res.statusCode = 403;
@@ -604,6 +690,26 @@ export class DoStuffMcpServer implements vscode.Disposable {
       res.end("DoStuff MCP rejects non-loopback Host headers");
       return;
     }
+    // CSRF guard: if a browser includes an Origin header (cross-origin POST
+    // from a web page), the origin must also be a loopback address. Legitimate
+    // MCP clients (CLI tools, VS Code) do not send Origin at all, so this
+    // check never fires for them. The string "null" is sent by browsers for
+    // local-file origins (file://) and is treated as safe.
+    const originHeader = req.headers.origin;
+    if (originHeader !== undefined && originHeader !== "null") {
+      let originOk = false;
+      try {
+        const originHost = new URL(originHeader).hostname.toLowerCase();
+        originOk = isLocalhost(originHost);
+      } catch {
+        // Unparseable Origin is not safe.
+      }
+      if (!originOk) {
+        res.statusCode = 403;
+        res.end("DoStuff MCP rejects cross-origin requests");
+        return;
+      }
+    }
     // Match /mcp exactly or as a real path segment — never /mcpfoo or /mcp.evil.
     const url = req.url ?? "";
     const isMcpPath = url === "/mcp" || url.startsWith("/mcp?") || url.startsWith("/mcp/");
@@ -611,6 +717,21 @@ export class DoStuffMcpServer implements vscode.Disposable {
       res.statusCode = 404;
       res.end("Not found. The MCP endpoint is /mcp.");
       return;
+    }
+    // Reject oversized bodies before handing to the transport. Without this
+    // a single huge request can exhaust the extension host's heap. We check
+    // the Content-Length header here; the transport reads the body so we
+    // cannot stream-limit it, but Content-Length covers the common case and
+    // the 30 s requestTimeout above bounds unbounded chunked uploads.
+    const MAX_BODY_BYTES = 1_048_576; // 1 MB
+    const clHeader = req.headers["content-length"];
+    if (clHeader !== undefined) {
+      const cl = parseInt(clHeader, 10);
+      if (!Number.isNaN(cl) && cl > MAX_BODY_BYTES) {
+        res.statusCode = 413;
+        res.end("Request body too large (max 1 MB)");
+        return;
+      }
     }
 
     const mcp = new McpServer(
@@ -692,6 +813,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
             mimeType: "application/json",
             text: JSON.stringify(
               {
+                workspace: getWorkspaceContext(),
                 workflow: readWorkflowPrompt(),
                 tickets: servable,
               },
@@ -804,6 +926,20 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       inputSchema: GET_TICKET_INPUT,
     },
     async (args) => runGetTicket(store, args as GetTicketInput),
+  );
+
+  mcp.registerTool(
+    "list_issues",
+    {
+      title: "List issues",
+      description:
+        "Return a compact index of all issues (id, number, title, type, priority, status). " +
+        "Use this to discover work: pass `status: 'Planned'` to see tickets ready to pick up, " +
+        "or omit all filters to survey the entire board including Thinking and Complete. " +
+        "To fetch the full content of a ticket, use `get_ticket` with its id or number.",
+      inputSchema: LIST_ISSUES_INPUT,
+    },
+    async (args) => runListIssues(store, args as ListIssuesInput),
   );
 
   mcp.registerTool(

@@ -76,6 +76,11 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     this.view?.webview.postMessage({ type: "focusSearch" });
   }
 
+  showNewIssue(): void {
+    this.view?.show?.(true);
+    this.view?.webview.postMessage({ type: "showNewIssue" });
+  }
+
   /** Publish a fresh issue list to the webview. */
   broadcast(issues: Issue[] = this.store.list()) {
     this.view?.webview.postMessage({ type: "issues", issues });

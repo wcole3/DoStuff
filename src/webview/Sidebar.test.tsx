@@ -7,7 +7,7 @@
 // DOM.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render, screen, within, fireEvent } from "@testing-library/react";
+import { act, cleanup, render, screen, within, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Sidebar } from "./Sidebar";
 import {
@@ -169,6 +169,23 @@ describe("Sidebar", () => {
     fireEvent.keyDown(row, { key: " " });
     const refreshed = screen.getByRole("button", { name: /Issue DS-001/i });
     expect(refreshed.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  test("dispatching dostuff:showNewIssue event opens AddIssueModal", () => {
+    render(<Sidebar />);
+    pushInit([]);
+    act(() => { window.dispatchEvent(new CustomEvent("dostuff:showNewIssue")); });
+    expect(screen.queryByPlaceholderText(/short summary/i)).not.toBeNull();
+  });
+
+  test("right-clicking a row opens DeleteConfirmModal", async () => {
+    const issue = makeIssue({ id: "DS-001", title: "Delete me", status: "Planned" });
+    render(<Sidebar />);
+    pushInit([issue]);
+
+    const row = screen.getByRole("button", { name: /Issue DS-001/i });
+    fireEvent.contextMenu(row);
+    expect(screen.queryByText(/delete issue/i)).not.toBeNull();
   });
 
   // Sanity: the eslint-disable here avoids the unused-import warning on

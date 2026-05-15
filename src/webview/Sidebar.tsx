@@ -12,6 +12,7 @@ interface RowData {
   filtered: Issue[];
   expandedId: string | null;
   onToggle: (id: string) => void;
+  onContextMenu: (id: string) => void;
 }
 
 const Row = memo(function Row({ index, style, data }: ListChildComponentProps<RowData>) {
@@ -24,6 +25,7 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
       className={`ds-row ${expanded ? "is-expanded" : ""}`}
       style={style}
       onClick={() => data.onToggle(issue.id)}
+      onContextMenu={(e) => { e.preventDefault(); data.onContextMenu(issue.id); }}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
@@ -134,6 +136,12 @@ export function Sidebar() {
   const searchRef = useRef<HTMLInputElement>(null);
   const [listRef, listSize] = useParentSize();
 
+  useEffect(() => {
+    const handler = () => setModal("add");
+    window.addEventListener("dostuff:showNewIssue", handler);
+    return () => window.removeEventListener("dostuff:showNewIssue", handler);
+  }, []);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return issues
@@ -162,9 +170,14 @@ export function Sidebar() {
     setExpandedId((cur) => (cur === id ? null : id));
   }, []);
 
+  const onContextMenu = useCallback((id: string) => {
+    const issue = issues.find((i) => i.id === id);
+    if (issue) setModal({ kind: "delete", issue });
+  }, [issues]);
+
   const rowData = useMemo<RowData>(
-    () => ({ filtered, expandedId, onToggle }),
-    [filtered, expandedId, onToggle],
+    () => ({ filtered, expandedId, onToggle, onContextMenu }),
+    [filtered, expandedId, onToggle, onContextMenu],
   );
 
   return (

@@ -202,44 +202,24 @@ export async function activate(context: vscode.ExtensionContext) {
       BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate);
     }),
 
-    vscode.commands.registerCommand("dostuff.newIssue", async () => {
-      const title = await vscode.window.showInputBox({
-        prompt: "Issue title",
-        placeHolder: "Short summary…",
-      });
-      if (!title) return;
-      const priority = (await vscode.window.showQuickPick(
-        ["Critical", "High", "Regular", "Low"],
-        { placeHolder: "Priority" }
-      )) as Issue["priority"] | undefined;
-      if (!priority) return;
-      const type = (await vscode.window.showQuickPick(
-        ["Bug", "Feature", "Refactor", "Chore", "Spike"],
-        { placeHolder: "Type" }
-      )) as Issue["type"] | undefined;
-      if (!type) return;
-
-      // New tickets always land in Thinking. The Thinking → Planned promotion
-      // is a deliberate human triage step — no automatic transition.
-      const now = new Date().toISOString();
-      const number = store.nextNumber();
-      const issue: Issue = {
-        id: `DS-${String(number).padStart(3, "0")}`,
-        number,
-        title, type, priority,
-        status: "Thinking",
-        description: "", tasks: [], verifyCriteria: "",
-        createdAt: now,
-        resolvedAt: null,
-        statusHistory: [{ status: "Thinking", at: now, by: "user" }],
-        record: [],
-      };
-      await store.upsert(issue);
-      vscode.window.showInformationMessage(`Created ${issue.id}: ${title}`);
+    vscode.commands.registerCommand("dostuff.newIssue", () => {
+      vscode.commands.executeCommand("workbench.view.extension.dostuff");
+      sidebar.showNewIssue();
     }),
 
     vscode.commands.registerCommand("dostuff.focusSearch", () => {
       sidebar.focusSearch();
+    }),
+
+    vscode.commands.registerCommand("dostuff.clearAll", async () => {
+      const answer = await vscode.window.showWarningMessage(
+        "Delete all issues? This cannot be undone.",
+        { modal: true },
+        "Clear All",
+      );
+      if (answer !== "Clear All") return;
+      await store.replaceAll([]);
+      vscode.window.showInformationMessage("DoStuff: All issues cleared.");
     }),
 
     vscode.commands.registerCommand("dostuff.exportJson", async () => {
@@ -249,9 +229,13 @@ export async function activate(context: vscode.ExtensionContext) {
         exportedAt: new Date().toISOString(),
         issues,
       };
+      const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+      const filename = `dostuff-issues-${new Date().toISOString().slice(0, 10)}.json`;
       const uri = await vscode.window.showSaveDialog({
         filters: { JSON: ["json"] },
-        defaultUri: vscode.Uri.file(`dostuff-issues-${new Date().toISOString().slice(0, 10)}.json`),
+        defaultUri: wsRoot
+          ? wsRoot.with({ path: `${wsRoot.path}/${filename}` })
+          : vscode.Uri.file(filename),
         saveLabel: "Export",
       });
       if (!uri) return;

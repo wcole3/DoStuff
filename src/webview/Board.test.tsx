@@ -8,7 +8,7 @@
 // `is-full` class.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { Board, decideDrop } from "./Board";
 import { ACTIVE_LANE_CAP, type Issue } from "../types";
 import {
@@ -180,6 +180,49 @@ describe("Board rendering", () => {
     pushInit(seed);
     const workingLane = Array.from(document.querySelectorAll(".bd-lane"))[1];
     expect(workingLane?.classList.contains("is-full")).toBe(false);
+  });
+});
+
+describe("Drawer search + filter", () => {
+  test("filter input limits visible cards in the Thinking drawer", async () => {
+    const a = makeIssue({ id: "DS-001", title: "Alpha task", status: "Thinking" });
+    const b = makeIssue({ id: "DS-002", title: "Beta task", status: "Thinking" });
+    render(<Board />);
+    pushInit([a, b]);
+
+    // Open the Thinking (left) drawer by clicking its head button.
+    const drawerBtn = document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement;
+    fireEvent.click(drawerBtn);
+
+    // Both cards visible before filtering.
+    expect(screen.queryByText("Alpha task")).not.toBeNull();
+    expect(screen.queryByText("Beta task")).not.toBeNull();
+
+    // Type into the filter input.
+    const filterInput = screen.getByPlaceholderText("Filter…");
+    fireEvent.change(filterInput, { target: { value: "alpha" } });
+
+    expect(screen.queryByText("Alpha task")).not.toBeNull();
+    expect(screen.queryByText("Beta task")).toBeNull();
+  });
+
+  test("closing the Thinking drawer resets filter query", () => {
+    const a = makeIssue({ id: "DS-011", title: "Gamma issue", status: "Thinking" });
+    render(<Board />);
+    pushInit([a]);
+
+    const drawerBtn = document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement;
+    fireEvent.click(drawerBtn);
+
+    const filterInput = screen.getByPlaceholderText("Filter…");
+    fireEvent.change(filterInput, { target: { value: "no match" } });
+    expect(screen.queryByText("Gamma issue")).toBeNull();
+
+    // Close drawer.
+    fireEvent.click(drawerBtn);
+    // Reopen — filter should be gone.
+    fireEvent.click(drawerBtn);
+    expect(screen.queryByText("Gamma issue")).not.toBeNull();
   });
 });
 
