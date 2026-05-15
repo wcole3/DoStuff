@@ -11,7 +11,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOURNAME"
+    "url": "https://github.com/wcole3/DoStuff"
   },
   "scripts": {
     "dev": "echo 'Open this directory in VSCode and then run your extension with F5 or `Run and Debug > Run Extension`!'",
@@ -56,7 +56,7 @@
       "activitybar": [
         {
           "id": "dostuff",
-          "title": "DoStuff: Issues",
+          "title": "DoStuff",
           "icon": "media/icon.svg"
         }
       ]
@@ -117,6 +117,12 @@
         "title": "Settings",
         "category": "DoStuff",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "dostuff.clearAll",
+        "title": "Clear All Issues…",
+        "category": "DoStuff",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
@@ -141,6 +147,9 @@
         },
         {
           "command": "dostuff.mcp.editInstructions"
+        },
+        {
+          "command": "dostuff.clearAll"
         }
       ],
       "view/title": [
@@ -168,6 +177,11 @@
           "command": "dostuff.openSettings",
           "when": "view == dostuff.sidebar",
           "group": "navigation@5"
+        },
+        {
+          "command": "dostuff.clearAll",
+          "when": "view == dostuff.sidebar",
+          "group": "navigation@6"
         }
       ]
     },
@@ -176,12 +190,6 @@
         "command": "dostuff.newIssue",
         "key": "ctrl+shift+i",
         "mac": "cmd+shift+i"
-      },
-      {
-        "command": "dostuff.focusSearch",
-        "key": "ctrl+shift+f",
-        "mac": "cmd+shift+f",
-        "when": "focusedView == dostuff.sidebar"
       }
     ],
     "configuration": {
@@ -197,9 +205,16 @@
           "default": true,
           "description": "Persist edits automatically as you type."
         },
+        "dostuff.activeLaneCap": {
+          "type": "number",
+          "default": 6,
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Maximum number of tickets allowed in each active lane (Planned, Working, Testing). Enforced by the UI, host, and MCP server."
+        },
         "dostuff.mcp.enabled": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "scope": "application",
           "description": "Run an in-process MCP server that exposes the active ticket queue to local agents."
         },
@@ -213,7 +228,7 @@
         },
         "dostuff.mcp.instructions": {
           "type": "string",
-          "default": "You are working from the DoStuff issue board. Tickets in 'Planned', 'Working', or 'Testing' are servable. Use get_ticket to fetch a ticket, then update_ticket_status to move it through the workflow (Planned -> Working -> Testing). Use update_ticket_progress to check off tasks and append progress notes as you work. Do not move tickets back to 'Thinking' (human triage only) or to 'Complete' (human approval only). Each active lane is capped at 6 tickets; a move that would exceed the cap will be rejected.",
+          "default": "",
           "editPresentation": "multilineText",
           "scope": "application",
           "markdownDescription": "System-level workflow prompt served alongside every ticket. Leave blank to use the built-in default. Only configurable at the user (application) level — not per-workspace."

@@ -50,11 +50,12 @@ export function decideDrop(
   currentIssues: Issue[],
   id: string,
   targetStatus: Status,
+  cap = ACTIVE_LANE_CAP,
 ): DropDecision {
   const issue = currentIssues.find((i) => i.id === id);
   if (!issue) return { kind: "missing" };
   if (issue.status === targetStatus) return { kind: "noop", issue };
-  const guard = canMoveToActiveLane(currentIssues, targetStatus, id);
+  const guard = canMoveToActiveLane(currentIssues, targetStatus, id, cap);
   if (guard !== true) return { kind: "blocked", reason: guard };
   return { kind: "ok", next: { ...issue, status: targetStatus } };
 }
@@ -118,6 +119,7 @@ const BoardCard = memo(function BoardCard({
 interface LaneProps {
   status: Status;
   issues: Issue[];
+  cap: number;
   dragId: string | null;
   onDragStart: (e: DragEvent<HTMLDivElement>, issue: Issue) => void;
   onDragEnd: () => void;
@@ -125,11 +127,11 @@ interface LaneProps {
   onOpen: (issue: Issue) => void;
 }
 
-function Lane({ status, issues, dragId, onDragStart, onDragEnd, onDropIssue, onOpen }: LaneProps) {
+function Lane({ status, issues, cap, dragId, onDragStart, onDragEnd, onDropIssue, onOpen }: LaneProps) {
   const [dragOver, setDragOver] = useState(false);
   const meta = STATUS_META[status];
   const count = issues.length;
-  const isFull = count >= ACTIVE_LANE_CAP;
+  const isFull = count >= cap;
   const dragBlocked = isFull && dragOver && dragId !== null && issues.every((i) => i.id !== dragId);
 
   const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -158,8 +160,8 @@ function Lane({ status, issues, dragId, onDragStart, onDragEnd, onDropIssue, onO
       <div className="bd-lane-head">
         <span className="bd-lane-dot" style={{ background: meta.color }} />
         <span className="bd-lane-title">{status}</span>
-        <span className="bd-lane-count" title={`${count} of ${ACTIVE_LANE_CAP} tickets`}>
-          {count}/{ACTIVE_LANE_CAP}
+        <span className="bd-lane-count" title={`${count} of ${cap} tickets`}>
+          {count}/{cap}
         </span>
       </div>
       <div className="bd-lane-body">
@@ -413,7 +415,7 @@ function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
 }
 
 export function Board() {
-  const { issues, initialized } = useIssues();
+  const { issues, settings, initialized } = useIssues();
   const [dragId, setDragId] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [leftOpen, setLeftOpen] = useState(false);
@@ -438,18 +440,20 @@ export function Board() {
     if (!exists) setDragId(null);
   }, [issues, dragId]);
 
+  const cap = settings?.activeLaneCap ?? ACTIVE_LANE_CAP;
+
   const setStatus = useCallback(
     (id: string, newStatus: Status) => {
       const issue = issues.find((i) => i.id === id);
       if (!issue || issue.status === newStatus) return;
-      const guard = canMoveToActiveLane(issues, newStatus, id);
+      const guard = canMoveToActiveLane(issues, newStatus, id, cap);
       if (guard !== true) {
         showToast(guard);
         return;
       }
       postUpdateIssue({ ...issue, status: newStatus });
     },
-    [issues, showToast],
+    [issues, showToast, cap],
   );
 
   const onDragStart = useCallback(
@@ -521,6 +525,7 @@ export function Board() {
             key={s}
             status={s}
             issues={byStatus[s]}
+            cap={cap}
             dragId={dragId}
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}

@@ -183,8 +183,9 @@ export class IssueStore {
   private get settings(): Settings {
     const c = vscode.workspace.getConfiguration("dostuff");
     return {
-      storagePath: c.get<string>("storagePath", ".vscode/dostuff"),
-      autoSave:    c.get<boolean>("autoSave", true),
+      storagePath:   c.get<string>("storagePath", ".vscode/dostuff"),
+      autoSave:      c.get<boolean>("autoSave", true),
+      activeLaneCap: c.get<number>("activeLaneCap", 6),
     };
   }
 

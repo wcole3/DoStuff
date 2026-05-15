@@ -18,8 +18,9 @@ const ID_RE = /^DS-\d+$/;
 function readSettings(): Settings {
   const cfg = vscode.workspace.getConfiguration("dostuff");
   return {
-    storagePath: cfg.get<string>("storagePath", ".vscode/dostuff"),
-    autoSave:    cfg.get<boolean>("autoSave", true),
+    storagePath:    cfg.get<string>("storagePath", ".vscode/dostuff"),
+    autoSave:       cfg.get<boolean>("autoSave", true),
+    activeLaneCap:  cfg.get<number>("activeLaneCap", 6),
   };
 }
 

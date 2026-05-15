@@ -166,6 +166,12 @@ export function Sidebar() {
 
   const expandedIssue = expandedId ? issues.find((i) => i.id === expandedId) ?? null : null;
 
+  useEffect(() => {
+    if (expandedId && !issues.find((i) => i.id === expandedId)) {
+      setExpandedId(null);
+    }
+  }, [issues, expandedId]);
+
   const onToggle = useCallback((id: string) => {
     setExpandedId((cur) => (cur === id ? null : id));
   }, []);

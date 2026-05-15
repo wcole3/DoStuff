@@ -1,13 +1,14 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
   PRIORITIES,
   TYPES,
   type Issue,
   type IssueType,
   type Priority,
+  type Task,
 } from "../types";
 import { Icon } from "./Icons";
-import { postCreateIssue, postDeleteIssue } from "./messaging";
+import { newTaskId, postCreateIssue, postDeleteIssue } from "./messaging";
 
 interface ModalProps {
   title: string;
@@ -53,6 +54,20 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
   const [priority, setPriority] = useState<Priority>("Regular");
   const [description, setDescription] = useState("");
   const [verifyCriteria, setVerifyCriteria] = useState("");
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const newTaskInputRef = useRef<HTMLInputElement>(null);
+
+  const addTask = () => {
+    setTasks((prev) => [...prev, { id: newTaskId(), text: "", done: false }]);
+    // focus the new row after render
+    setTimeout(() => newTaskInputRef.current?.focus(), 0);
+  };
+
+  const updateTask = (id: string, text: string) =>
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, text } : t)));
+
+  const removeTask = (id: string) =>
+    setTasks((prev) => prev.filter((t) => t.id !== id));
 
   const submit = () => {
     if (!title.trim()) return;
@@ -63,6 +78,7 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
       description,
       verifyCriteria,
       status: "Thinking",
+      tasks: tasks.filter((t) => t.text.trim()).map((t) => ({ ...t, text: t.text.trim() })),
     });
     onClose();
   };
@@ -152,6 +168,44 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
             placeholder="How will we know this is done?"
           />
         </label>
+        <div className="ds-form-row">
+          <div className="ds-d-section-head">
+            <span>Tasks</span>
+            <button className="ds-d-add-task" onClick={addTask} title="Add task" aria-label="Add task">
+              <Icon name="plus" size={12} />
+            </button>
+          </div>
+          {tasks.length > 0 && (
+            <div className="ds-d-tasks">
+              {tasks.map((task, i) => (
+                <div className="ds-task ds-task--no-check" key={task.id}>
+                  <input
+                    className="ds-task-text"
+                    ref={i === tasks.length - 1 ? newTaskInputRef : undefined}
+                    value={task.text}
+                    placeholder="Task description"
+                    onChange={(e) => updateTask(task.id, e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") { e.preventDefault(); addTask(); }
+                      if (e.key === "Backspace" && task.text === "") {
+                        e.preventDefault();
+                        removeTask(task.id);
+                      }
+                    }}
+                  />
+                  <button
+                    className="ds-task-rm"
+                    onClick={() => removeTask(task.id)}
+                    title="Remove"
+                    aria-label="Remove task"
+                  >
+                    <Icon name="close" size={10} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </Modal>
   );

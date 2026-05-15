@@ -101,6 +101,7 @@ export type WebviewToHost =
 export interface Settings {
   storagePath: string;
   autoSave: boolean;
+  activeLaneCap: number;
 }
 
 /**
@@ -116,13 +117,14 @@ export function canMoveToActiveLane(
   currentIssues: Issue[],
   targetStatus: Status,
   movingIssueId?: string,
+  cap = ACTIVE_LANE_CAP,
 ): true | string {
   if (!isActiveLane(targetStatus)) return true;
   const count = currentIssues.filter(
     (i) => i.status === targetStatus && i.id !== movingIssueId,
   ).length;
-  if (count >= ACTIVE_LANE_CAP) {
-    return `Lane "${targetStatus}" is full (${count}/${ACTIVE_LANE_CAP}). Complete or move a ticket out before adding another.`;
+  if (count >= cap) {
+    return `Lane "${targetStatus}" is full (${count}/${cap}). Complete or move a ticket out before adding another.`;
   }
   return true;
 }

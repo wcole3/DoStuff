@@ -4,8 +4,7 @@ import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
-import { SAMPLE_ISSUES } from "./sampleData";
-import { DoStuffMcpServer } from "./mcpServer";
+import { DEFAULT_WORKFLOW_PROMPT, DoStuffMcpServer } from "./mcpServer";
 import {
   ACTIVE_LANE_CAP,
   canMoveToActiveLane,
@@ -17,7 +16,6 @@ import {
   type StatusEvent,
 } from "./types";
 
-const SEED_FLAG = "dostuff.seeded.v1";
 
 export type UpdateBy = "user" | "agent";
 
@@ -123,12 +121,12 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
   return { valid, skipped };
 }
 
-/** Lanes that exceed ACTIVE_LANE_CAP in the given set. Empty if all within cap. */
-export function activeLaneOverflow(set: Issue[]): Array<{ lane: Status; count: number }> {
+/** Lanes that exceed `cap` in the given set. Empty if all within cap. */
+export function activeLaneOverflow(set: Issue[], cap = ACTIVE_LANE_CAP): Array<{ lane: Status; count: number }> {
   const out: Array<{ lane: Status; count: number }> = [];
   for (const lane of ["Planned", "Working", "Testing"] as const) {
     const count = set.filter((i) => i.status === lane).length;
-    if (count > ACTIVE_LANE_CAP) out.push({ lane, count });
+    if (count > cap) out.push({ lane, count });
   }
   return out;
 }
@@ -136,13 +134,6 @@ export function activeLaneOverflow(set: Issue[]): Array<{ lane: Status; count: n
 export async function activate(context: vscode.ExtensionContext) {
   const store = new IssueStore(context);
   await store.init();
-
-  // Seed sample data on first activation only — never again, even if the user
-  // empties the workspace.
-  if (!context.globalState.get(SEED_FLAG) && store.list().length === 0) {
-    for (const issue of SAMPLE_ISSUES) await store.upsert(issue);
-    await context.globalState.update(SEED_FLAG, true);
-  }
 
   /**
    * Host-side issue update handler. Single chokepoint for any path that
@@ -178,7 +169,8 @@ export async function activate(context: vscode.ExtensionContext) {
     const next = merged.next;
 
     if (next.status !== prior.status) {
-      const check = canMoveToActiveLane(store.list(), next.status, next.id);
+      const cap = vscode.workspace.getConfiguration("dostuff").get<number>("activeLaneCap", ACTIVE_LANE_CAP);
+      const check = canMoveToActiveLane(store.list(), next.status, next.id, cap);
       if (check !== true) {
         vscode.window.showWarningMessage(`DoStuff: ${check}`);
         sidebar.broadcast();
@@ -296,10 +288,11 @@ export async function activate(context: vscode.ExtensionContext) {
         for (const i of valid) byId.set(i.id, i);
         return [...byId.values()];
       })();
-      const overflowing = activeLaneOverflow(postSet);
+      const importCap = vscode.workspace.getConfiguration("dostuff").get<number>("activeLaneCap", ACTIVE_LANE_CAP);
+      const overflowing = activeLaneOverflow(postSet, importCap);
       if (overflowing.length > 0) {
         const summary = overflowing
-          .map(({ lane, count }) => `${lane}: ${count}/${ACTIVE_LANE_CAP}`)
+          .map(({ lane, count }) => `${lane}: ${count}/${importCap}`)
           .join(", ");
         vscode.window.showErrorMessage(
           `Import refused — active-lane cap exceeded (${summary}). ` +
@@ -350,12 +343,13 @@ export async function activate(context: vscode.ExtensionContext) {
       const cfg = vscode.workspace.getConfiguration("dostuff");
       const current = cfg.get<string>("mcp.instructions", "");
       const next = await vscode.window.showInputBox({
-        prompt: "System workflow instructions served to MCP clients (blank = built-in default)",
-        value: current,
+        prompt: "Edit custom instructions. Clear all text to revert to the built-in default.",
+        value: current || DEFAULT_WORKFLOW_PROMPT,
         ignoreFocusOut: true,
       });
       if (next === undefined) return;
-      await cfg.update("mcp.instructions", next, vscode.ConfigurationTarget.Global);
+      const toSave = next.trim() === DEFAULT_WORKFLOW_PROMPT.trim() ? "" : next;
+      await cfg.update("mcp.instructions", toSave, vscode.ConfigurationTarget.Global);
     }),
   );
   await mcp.reconcile();

@@ -122,9 +122,8 @@ button { font: inherit; color: inherit; }
   overflow: hidden;
 }
 
-/* FixedSizeList outer div — hide native scrollbar; mouse wheel / keyboard still scroll */
-.ds-vlist { scrollbar-width: none; }
-.ds-vlist::-webkit-scrollbar { display: none; }
+/* FixedSizeList outer div */
+.ds-vlist { scrollbar-width: thin; }
 .ds-sb-empty {
   padding: 30px 16px; text-align: center;
   font-size: 12px; opacity: .55;
@@ -311,6 +310,9 @@ button { font: inherit; color: inherit; }
   grid-template-columns: 18px 1fr 18px;
   align-items: center; gap: 6px;
   padding: 1px 2px;
+}
+.ds-task--no-check {
+  grid-template-columns: 1fr 18px;
 }
 .ds-task-check {
   width: 14px; height: 14px;

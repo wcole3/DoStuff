@@ -95,7 +95,7 @@ export function restoreVsCodeApi(): void {
   // would force a fresh resolveApi() that throws if hit too early.
 }
 
-const defaultSettings: Settings = { storagePath: ".vscode/dostuff", autoSave: true };
+const defaultSettings: Settings = { storagePath: ".vscode/dostuff", autoSave: true, activeLaneCap: 6 };
 
 /**
  * Push an `init`-shaped message into the webview store. messaging.ts's
