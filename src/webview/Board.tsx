@@ -314,6 +314,7 @@ function Drawer({
             <div ref={listWrapRef} className="bd-drawer-list">
               {size.height > 0 && (
                 <FixedSizeList
+                  className="ds-vlist"
                   height={size.height}
                   width={size.width}
                   itemCount={issues.length}

@@ -33,6 +33,7 @@
 html, body, #root { height: 100%; }
 body {
   margin: 0;
+  padding: 0;
   font-family: var(--vscode-font-family, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
   font-size: var(--vscode-font-size, 13px);
   color: var(--vsc-fg);
@@ -118,14 +119,12 @@ button { font: inherit; color: inherit; }
 .ds-sb-list {
   flex: 1;
   min-height: 0;
-  overflow-y: auto; overflow-x: hidden;
-  scrollbar-width: thin;
+  overflow: hidden;
 }
-.ds-sb-list::-webkit-scrollbar { width: 10px; }
-.ds-sb-list::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, .3); border-radius: 6px; border: 2px solid transparent;
-  background-clip: content-box;
-}
+
+/* FixedSizeList outer div — hide native scrollbar; mouse wheel / keyboard still scroll */
+.ds-vlist { scrollbar-width: none; }
+.ds-vlist::-webkit-scrollbar { display: none; }
 .ds-sb-empty {
   padding: 30px 16px; text-align: center;
   font-size: 12px; opacity: .55;
@@ -562,18 +561,18 @@ button { font: inherit; color: inherit; }
 /* Drawers (Thinking + Complete) */
 .bd-drawer {
   --drawer-accent: var(--accent);
-  background: var(--vsc-sidebar-bg);
-  border-right: 1px solid var(--vsc-border);
+  background: var(--vsc-editor-bg);
+  border-right: 1px solid var(--vsc-border-2);
   display: flex; flex-direction: column;
   min-width: 0;
   position: relative;
 }
 .bd-drawer-right {
   border-right: none;
-  border-left: 1px solid var(--vsc-border);
+  border-left: 1px solid var(--vsc-border-2);
 }
 .bd-drawer.is-drag-over {
-  background: color-mix(in srgb, var(--drawer-accent) 12%, var(--vsc-sidebar-bg));
+  background: color-mix(in srgb, var(--drawer-accent) 12%, var(--vsc-editor-bg));
 }
 .bd-drawer-head {
   background: transparent;

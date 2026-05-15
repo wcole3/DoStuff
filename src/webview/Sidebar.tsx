@@ -237,6 +237,8 @@ export function Sidebar() {
             </div>
           ) : listSize.height > 0 ? (
             <FixedSizeList
+              className="ds-vlist"
+              style={{ width: "100%" }}
               height={listSize.height}
               width={listSize.width}
               itemCount={filtered.length}
