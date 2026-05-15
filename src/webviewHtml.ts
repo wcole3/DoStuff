@@ -4,10 +4,9 @@
 import * as vscode from "vscode";
 
 export function getNonce(): string {
-  let s = "";
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  for (let i = 0; i < 32; i++) s += possible.charAt(Math.floor(Math.random() * possible.length));
-  return s;
+  // crypto.randomUUID() is available on VSCode's Node runtime (>=19) and is a
+  // stronger source than Math.random for CSP nonces.
+  return globalThis.crypto.randomUUID().replace(/-/g, "");
 }
 
 interface WebviewOpts {
@@ -19,9 +18,9 @@ interface WebviewOpts {
 /**
  * Returns the HTML payload for a DoStuff webview.
  *
- * The webview is a self-contained React app under `media/`. We compile it ahead of time
- * (or use a bundler) and reference the built artifacts via `asWebviewUri`. CSP is locked
- * to nonced inline scripts + same-origin assets so offline workspaces still load.
+ * The webview is a self-contained React app under `media/`. esbuild emits
+ * `media/index.js` and `media/styles.css` (see scripts/esbuild.config.ts).
+ * CSP is locked to nonced inline scripts + same-origin assets.
  */
 export function getWebviewHtml({ webview, extensionUri, mode }: WebviewOpts): string {
   const asset = (p: string) =>
@@ -30,7 +29,7 @@ export function getWebviewHtml({ webview, extensionUri, mode }: WebviewOpts): st
   const nonce = getNonce();
   const csp = [
     `default-src 'none'`,
-    `img-src ${webview.cspSource} https: data:`,
+    `img-src ${webview.cspSource} data:`,
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `font-src ${webview.cspSource}`,
     `script-src 'nonce-${nonce}'`,
@@ -50,7 +49,7 @@ export function getWebviewHtml({ webview, extensionUri, mode }: WebviewOpts): st
     window.__DOSTUFF_MODE__ = "${mode}";
     window.__VSCODE_API__ = acquireVsCodeApi();
   </script>
-  <script nonce="${nonce}" src="${asset("webview.js")}"></script>
+  <script nonce="${nonce}" src="${asset("index.js")}"></script>
 </body>
 </html>`;
 }

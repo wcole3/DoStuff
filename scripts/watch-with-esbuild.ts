@@ -1,9 +1,6 @@
 import esbuild from "esbuild";
-import config from "./esbuild.config";
+import { extensionConfig, webviewConfig } from "./esbuild.config";
 
-try {
-  const context = await esbuild.context(config);
-  await context.watch();
-} catch (e) {
-  process.exit(1);
-}
+const ctxA = await esbuild.context(extensionConfig);
+const ctxB = await esbuild.context(webviewConfig);
+await Promise.all([ctxA.watch(), ctxB.watch()]);

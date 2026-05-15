@@ -1,10 +1,11 @@
+// webview build emits: media/index.js, media/styles.css (referenced by webviewHtml.ts)
 import type { BuildOptions } from "esbuild";
 
-const config: BuildOptions = {
+export const extensionConfig: BuildOptions = {
   entryPoints: ["./src/extension.ts"],
   bundle: true,
   platform: "node",
-  target: "node12",
+  target: "node18",
   outdir: "./dist",
   outbase: "./src",
   outExtension: {
@@ -17,6 +18,26 @@ const config: BuildOptions = {
     ".js": "js",
   },
   logLevel: "info",
+  sourcemap: true,
 };
 
-export default config;
+export const webviewConfig: BuildOptions = {
+  entryPoints: ["./src/webview/index.tsx", "./src/webview/styles.css"],
+  bundle: true,
+  platform: "browser",
+  target: ["es2020"],
+  outdir: "./media",
+  outbase: "./src/webview",
+  format: "iife",
+  loader: {
+    ".tsx": "tsx",
+    ".ts": "ts",
+    ".css": "css",
+    ".svg": "file",
+  },
+  jsx: "automatic",
+  define: { "process.env.NODE_ENV": '"production"' },
+  logLevel: "info",
+  sourcemap: "linked",
+  legalComments: "none",
+};

@@ -5,7 +5,18 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import type { Issue, WebviewToHost } from "./types";
+import type { ApplyIssueUpdate } from "./sidebarProvider";
+import type { Issue, Settings, WebviewToHost } from "./types";
+
+const ID_RE = /^DS-\d+$/;
+
+function readSettings(): Settings {
+  const cfg = vscode.workspace.getConfiguration("dostuff");
+  return {
+    storagePath: cfg.get<string>("storagePath", ".vscode/dostuff"),
+    autoSave:    cfg.get<boolean>("autoSave", true),
+  };
+}
 
 export class BoardPanel {
   public static readonly viewType = "dostuff.board";
@@ -13,8 +24,13 @@ export class BoardPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly output: vscode.OutputChannel;
 
-  static showOrCreate(extensionUri: vscode.Uri, store: IssueStore) {
+  static showOrCreate(
+    extensionUri: vscode.Uri,
+    store: IssueStore,
+    applyUpdate: ApplyIssueUpdate,
+  ) {
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
 
     if (BoardPanel.current) {
@@ -33,16 +49,24 @@ export class BoardPanel {
       }
     );
 
-    BoardPanel.current = new BoardPanel(panel, extensionUri, store);
+    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate);
+  }
+
+  /** Re-broadcast current truth to the live board panel, if any. */
+  static broadcast(issues: Issue[]) {
+    BoardPanel.current?.broadcast(issues);
   }
 
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
-    private readonly store: IssueStore
+    private readonly store: IssueStore,
+    private readonly applyUpdate: ApplyIssueUpdate,
   ) {
     this.panel = panel;
     this.panel.iconPath = vscode.Uri.joinPath(extensionUri, "media", "icon.svg");
+    this.output = vscode.window.createOutputChannel("DoStuff Board");
+    this.disposables.push(this.output);
 
     this.panel.webview.html = getWebviewHtml({
       webview: this.panel.webview,
@@ -62,7 +86,7 @@ export class BoardPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
   }
 
-  private broadcast(issues: Issue[]) {
+  broadcast(issues: Issue[] = this.store.list()) {
     this.panel.webview.postMessage({ type: "issues", issues });
   }
 
@@ -72,21 +96,38 @@ export class BoardPanel {
         this.panel.webview.postMessage({
           type: "init",
           issues: this.store.list(),
-          settings: vscode.workspace.getConfiguration("dostuff") as any,
+          settings: readSettings(),
         });
         break;
-      case "updateIssue":
-        await this.store.upsert(msg.issue);
+      case "updateIssue": {
+        const issue = (msg as { issue?: unknown }).issue;
+        if (!issue || typeof issue !== "object" || !ID_RE.test((issue as Issue).id ?? "")) {
+          this.output.appendLine(`Rejected updateIssue: bad id (${JSON.stringify(issue)})`);
+          break;
+        }
+        await this.applyUpdate(issue as Issue);
         break;
-      case "deleteIssue":
-        await this.store.remove(msg.id);
+      }
+      case "deleteIssue": {
+        const id = (msg as { id?: unknown }).id;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected deleteIssue: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        await this.store.remove(id);
         break;
+      }
       case "importJson":
         vscode.commands.executeCommand("dostuff.importJson");
         break;
       case "exportJson":
         vscode.commands.executeCommand("dostuff.exportJson");
         break;
+      // The board view ignores message types only the sidebar handles
+      // (e.g. "createIssue", "openBoard", "openSettings"). Log + drop.
+      default: {
+        this.output.appendLine(`Unhandled webview message in board: ${JSON.stringify(msg)}`);
+      }
     }
   }
 

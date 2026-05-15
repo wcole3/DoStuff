@@ -5,6 +5,7 @@
 # Whitelist what you need
 !.vscodeignore
 !dist/*
+!media/*
 !CHANGELOG.md
 !LICENSE.txt
 !README.md

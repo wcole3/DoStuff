@@ -1,8 +1,29 @@
 // Shared types for the DoStuff extension.
 
-export type IssueType = "Bug" | "Feature" | "Refactor" | "Chore" | "Spike";
-export type Priority  = "Critical" | "High" | "Regular" | "Low";
-export type Status    = "Thinking" | "Planned" | "Working" | "Testing" | "Complete";
+export const ACTIVE_LANE_CAP = 6;
+export const ACTIVE_LANES = ["Planned", "Working", "Testing"] as const;
+export type ActiveLane = (typeof ACTIVE_LANES)[number];
+export function isActiveLane(s: string): s is ActiveLane {
+  return (ACTIVE_LANES as readonly string[]).includes(s);
+}
+
+export const STATUSES   = ["Thinking", "Planned", "Working", "Testing", "Complete"] as const;
+export const PRIORITIES = ["Critical", "High", "Regular", "Low"] as const;
+export const TYPES      = ["Bug", "Feature", "Refactor", "Chore", "Spike"] as const;
+
+export type Status    = (typeof STATUSES)[number];
+export type Priority  = (typeof PRIORITIES)[number];
+export type IssueType = (typeof TYPES)[number];
+
+export function isStatus(v: unknown): v is Status {
+  return typeof v === "string" && (STATUSES as readonly string[]).includes(v);
+}
+export function isPriority(v: unknown): v is Priority {
+  return typeof v === "string" && (PRIORITIES as readonly string[]).includes(v);
+}
+export function isType(v: unknown): v is IssueType {
+  return typeof v === "string" && (TYPES as readonly string[]).includes(v);
+}
 
 export interface Task {
   id: string;
@@ -68,7 +89,7 @@ export type HostToWebview =
 
 export type WebviewToHost =
   | { type: "ready" }
-  | { type: "createIssue"; partial: Omit<Issue, "id" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt"> & { tasks?: Task[] } }
+  | { type: "createIssue"; partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record"> & { tasks?: Task[] } }
   | { type: "updateIssue"; issue: Issue }
   | { type: "deleteIssue"; id: string }
   | { type: "openBoard" }
@@ -77,11 +98,30 @@ export type WebviewToHost =
   | { type: "openSettings" };
 
 export interface Settings {
-  storageMode: "json-files" | "sqlite";
   storagePath: string;
   autoSave: boolean;
 }
 
-export const STATUSES:   Status[]    = ["Thinking", "Planned", "Working", "Testing", "Complete"];
-export const PRIORITIES: Priority[]  = ["Critical", "High", "Regular", "Low"];
-export const TYPES:      IssueType[] = ["Bug", "Feature", "Refactor", "Chore", "Spike"];
+/**
+ * Lane-cap check. Returns `true` if a move into `targetStatus` is allowed,
+ * otherwise an error string describing why.
+ *
+ *  - Inactive targets (Thinking, Complete) are always allowed.
+ *  - Active targets (Planned, Working, Testing) are capped at ACTIVE_LANE_CAP.
+ *  - The issue identified by `movingIssueId` is excluded from the count so an
+ *    in-place save of an already-located ticket isn't blocked by itself.
+ */
+export function canMoveToActiveLane(
+  currentIssues: Issue[],
+  targetStatus: Status,
+  movingIssueId?: string,
+): true | string {
+  if (!isActiveLane(targetStatus)) return true;
+  const count = currentIssues.filter(
+    (i) => i.status === targetStatus && i.id !== movingIssueId,
+  ).length;
+  if (count >= ACTIVE_LANE_CAP) {
+    return `Lane "${targetStatus}" is full (${count}/${ACTIVE_LANE_CAP}). Complete or move a ticket out before adding another.`;
+  }
+  return true;
+}

@@ -1,4 +1,4 @@
 import esbuild from "esbuild";
-import config from "./esbuild.config";
+import { extensionConfig, webviewConfig } from "./esbuild.config";
 
-esbuild.build(config).catch(() => process.exit(1));
+Promise.all([esbuild.build(extensionConfig), esbuild.build(webviewConfig)]).catch(() => process.exit(1));

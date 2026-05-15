@@ -1,46 +1,52 @@
-// VSCode-style icons (Codicon-inspired SVGs)
-// Stroke-based, 16x16 viewBox, currentColor.
+import { memo, type CSSProperties, type ReactNode } from "react";
+import type { IssueType, Priority, Status } from "../types";
 
-const Icon = ({ name, size = 16, style }) => {
-  const paths = ICON_PATHS[name];
-  if (!paths) return null;
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      style={{ flexShrink: 0, ...style }}
-    >
-      {paths}
-    </svg>
-  );
-};
+export type IconName =
+  | "search"
+  | "close"
+  | "chevronRight"
+  | "chevronDown"
+  | "chevronUp"
+  | "plus"
+  | "trash"
+  | "filter"
+  | "refresh"
+  | "more"
+  | "board"
+  | "list"
+  | "flame"
+  | "arrowUp"
+  | "arrow"
+  | "arrowDown"
+  | "files"
+  | "database"
+  | "settings"
+  | "download"
+  | "upload"
+  | "edit"
+  | "check"
+  | "drag"
+  | "bug"
+  | "sparkle"
+  | "wrench"
+  | "broom"
+  | "flask"
+  | "clock"
+  | "calendar"
+  | "panelLeft";
 
-const ICON_PATHS = {
+const ICON_PATHS: Record<IconName, ReactNode> = {
   search: (
     <>
       <circle cx="7" cy="7" r="4.5" />
       <path d="M10.5 10.5L14 14" />
     </>
   ),
-  close: (
-    <>
-      <path d="M3 3l10 10M13 3L3 13" />
-    </>
-  ),
+  close: <path d="M3 3l10 10M13 3L3 13" />,
   chevronRight: <path d="M6 3l4 5-4 5" />,
   chevronDown: <path d="M3 6l5 4 5-4" />,
   chevronUp: <path d="M3 10l5-4 5 4" />,
-  plus: (
-    <>
-      <path d="M8 3v10M3 8h10" />
-    </>
-  ),
+  plus: <path d="M8 3v10M3 8h10" />,
   trash: (
     <>
       <path d="M3.5 4.5h9M6 4.5V3a1 1 0 011-1h2a1 1 0 011 1v1.5M5 4.5l.5 8.5a1 1 0 001 1h3a1 1 0 001-1l.5-8.5" />
@@ -79,21 +85,9 @@ const ICON_PATHS = {
   flame: (
     <path d="M8 14c2.5 0 4-1.7 4-4 0-2-1.2-3-2-4.5 0-1.5-1-2.5-2-3.5-.4 2-2 2.5-3 4.5C4.3 8 4 9 4 10c0 2.3 1.5 4 4 4z" fill="currentColor" stroke="none" />
   ),
-  arrowUp: (
-    <>
-      <path d="M8 13V3M4 7l4-4 4 4" />
-    </>
-  ),
-  arrow: (
-    <>
-      <path d="M3 8h10M9 4l4 4-4 4" />
-    </>
-  ),
-  arrowDown: (
-    <>
-      <path d="M8 3v10M4 9l4 4 4-4" />
-    </>
-  ),
+  arrowUp: <path d="M8 13V3M4 7l4-4 4 4" />,
+  arrow: <path d="M3 8h10M9 4l4 4-4 4" />,
+  arrowDown: <path d="M8 3v10M4 9l4 4 4-4" />,
   files: (
     <>
       <path d="M3 2h6l3 3v9H3z" />
@@ -113,21 +107,9 @@ const ICON_PATHS = {
       <path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" />
     </>
   ),
-  download: (
-    <>
-      <path d="M8 2v8M4 7l4 4 4-4M3 13h10" />
-    </>
-  ),
-  upload: (
-    <>
-      <path d="M8 11V3M4 6l4-4 4 4M3 13h10" />
-    </>
-  ),
-  edit: (
-    <>
-      <path d="M11 2l3 3-8 8H3v-3z" />
-    </>
-  ),
+  download: <path d="M8 2v8M4 7l4 4 4-4M3 13h10" />,
+  upload: <path d="M8 11V3M4 6l4-4 4 4M3 13h10" />,
+  edit: <path d="M11 2l3 3-8 8H3v-3z" />,
   check: <path d="M3 8l3.5 3.5L13 5" />,
   drag: (
     <>
@@ -183,8 +165,33 @@ const ICON_PATHS = {
   ),
 };
 
-// Type → icon mapping
-const TYPE_ICON = {
+interface IconProps {
+  name: IconName;
+  size?: number;
+  style?: CSSProperties;
+}
+
+export const Icon = memo(function Icon({ name, size = 16, style }: IconProps) {
+  const paths = ICON_PATHS[name];
+  if (!paths) return null;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ flexShrink: 0, ...style }}
+    >
+      {paths}
+    </svg>
+  );
+});
+
+export const TYPE_ICON: Record<IssueType, IconName> = {
   Bug: "bug",
   Feature: "sparkle",
   Refactor: "wrench",
@@ -192,21 +199,17 @@ const TYPE_ICON = {
   Spike: "flask",
 };
 
-// Priority → icon/color
-const PRIORITY_META = {
+export const PRIORITY_META: Record<Priority, { icon: IconName; color: string }> = {
   Critical: { icon: "flame", color: "#f48771" },
   High: { icon: "arrowUp", color: "#e2c08d" },
   Regular: { icon: "arrow", color: "#75beff" },
   Low: { icon: "arrowDown", color: "#888888" },
 };
 
-// Status colors (lane accents)
-const STATUS_META = {
+export const STATUS_META: Record<Status, { color: string; label: string }> = {
   Thinking: { color: "#a0a0a0", label: "Thinking" },
   Planned: { color: "#75beff", label: "Planned" },
   Working: { color: "#dcdcaa", label: "Working" },
   Testing: { color: "#c586c0", label: "Testing" },
   Complete: { color: "#89d185", label: "Complete" },
 };
-
-window.DS_ICONS = { Icon, TYPE_ICON, PRIORITY_META, STATUS_META };
