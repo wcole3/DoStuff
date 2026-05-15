@@ -124,7 +124,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
 /** Lanes that exceed `cap` in the given set. Empty if all within cap. */
 export function activeLaneOverflow(set: Issue[], cap = ACTIVE_LANE_CAP): Array<{ lane: Status; count: number }> {
   const out: Array<{ lane: Status; count: number }> = [];
-  for (const lane of ["Planned", "Working", "Testing"] as const) {
+  for (const lane of ["Planned", "Working", "Verification"] as const) {
     const count = set.filter((i) => i.status === lane).length;
     if (count > cap) out.push({ lane, count });
   }
@@ -143,7 +143,7 @@ export async function activate(context: vscode.ExtensionContext) {
    *      fields (see {@link mergeIssueUpdate}). Server-derived fields like
    *      `statusHistory`, `resolvedAt`, `id`, `number`, `createdAt`, `record`
    *      are never trusted from the webview payload.
-   *   2. Enforcing the active-lane cap (Planned/Working/Testing ≤ 6).
+   *   2. Enforcing the active-lane cap (Planned/Working/Verification ≤ 6).
    *   3. Note: the UI is allowed to move a ticket out of "Complete" (humans can
    *      correct mis-clicks). The MCP layer enforces a stricter contract.
    *

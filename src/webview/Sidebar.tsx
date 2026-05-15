@@ -124,7 +124,7 @@ function useParentSize(): [RefObject<HTMLDivElement>, { width: number; height: n
 
 type StatusFilter = "All" | Status;
 
-const VISIBLE_BY_DEFAULT: Status[] = ["Thinking", "Planned", "Working", "Testing"];
+const VISIBLE_BY_DEFAULT: Status[] = ["Thinking", "Planned", "Working", "Verification"];
 
 export function Sidebar() {
   const { issues, initialized } = useIssues();

@@ -2,7 +2,7 @@
 //
 // Surface:
 //   Resources
-//     dostuff://tickets                       List of servable tickets (Planned/Working/Testing)
+//     dostuff://tickets                       List of servable tickets (Planned/Working/Verification)
 //     dostuff://tickets/{id}                  One ticket
 //     dostuff://instructions/workflow         The workflow prompt
 //
@@ -13,7 +13,7 @@
 //     get_ticket             fetch by #NN, DS-id, or title substring
 //     list_issues            compact id/title index with optional type/priority/status filters
 //     create_ticket          file new ticket in "Thinking" for human triage
-//     update_ticket_status   move ticket between Planned <-> Working <-> Testing
+//     update_ticket_status   move ticket between Planned <-> Working <-> Verification
 //                            with lane-cap enforcement (cap=6) and the
 //                            Thinking-one-way rule (current must already be active)
 //     update_ticket_progress toggle task[].done and append a record entry
@@ -21,8 +21,8 @@
 // Constraints enforced by the server (not just the schema):
 //   - Tickets in Thinking or Complete are never returned by the read APIs.
 //   - update_ticket_status rejects:
-//       * targets that aren't Planned/Working/Testing
-//       * current status that isn't Planned/Working/Testing (Thinking-one-way)
+//       * targets that aren't Planned/Working/Verification
+//       * current status that isn't Planned/Working/Verification (Thinking-one-way)
 //       * moves into a lane already at ACTIVE_LANE_CAP
 //   - update_ticket_progress can only touch tasks[].done and append to record.
 
@@ -54,14 +54,14 @@ Workflow contract:
      i.e. "get ticket 42 and begin work" or "start on the OAuth ticket".
   2. Tickets have descriptions and verify criteria written by the human. Read before
      starting.  Some tickets have subtasks to help you plan.
-  3. Read \`dostuff://tickets\` to discover work. Only Planned / Working / Testing
+  3. Read \`dostuff://tickets\` to discover work. Only Planned / Working / Verification
      tickets are visible -- Thinking tickets are drafts the human is still shaping,
      and Complete tickets are done.
   4. When you start a ticket, call \`update_ticket_status\` to move it to "Working".
-     When you believe it's ready for verification, move it to "Testing".
-  5. You cannot mark a ticket "Complete". A human reviews Testing tickets and
+     When you believe it's ready for verification, move it to "Verification".
+  5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
      decides. If your verification fails, move it back to "Working".
-  6. Active lanes (Planned, Working, Testing) are capped at ${ACTIVE_LANE_CAP} tickets each.
+  6. Active lanes (Planned, Working, Verification) are capped at ${ACTIVE_LANE_CAP} tickets each.
      Moves that would exceed the cap are rejected.
   7. As you make progress, call \`update_ticket_progress\` to tick tasks off and
      append a short note to the ticket's record. Be terse and factual.
@@ -100,7 +100,7 @@ const NEW_TICKET_INPUT = {
 
 const STATUS_INPUT = {
   id: z.string().regex(/^DS-\d+$/, "Expected an id like DS-001"),
-  status: z.enum(["Thinking", "Planned", "Working", "Testing", "Complete"] as const),
+  status: z.enum(["Thinking", "Planned", "Working", "Verification", "Complete"] as const),
   note: z.string().max(2_000).optional(),
 };
 
@@ -135,7 +135,7 @@ const LIST_ISSUES_INPUT = {
     .optional()
     .describe("Narrow to one priority level."),
   status: z
-    .enum(["Thinking", "Planned", "Working", "Testing", "Complete"])
+    .enum(["Thinking", "Planned", "Working", "Verification", "Complete"])
     .optional()
     .describe("Narrow to one status. Omit to list all statuses."),
 };
@@ -227,7 +227,7 @@ export type UpdateProgressInput = {
  *
  * Returns the ticket plus the current workflow prompt as JSON.
  *
- * - Only Planned / Working / Testing tickets are servable; Thinking and
+ * - Only Planned / Working / Verification tickets are servable; Thinking and
  *   Complete return an error.
  * - Title-substring queries that match multiple servable tickets return an
  *   ambiguity error listing each candidate so the agent can narrow.
@@ -290,7 +290,7 @@ export async function runGetTicket(
   if (!AGENT_SERVABLE_STATUSES.includes(match.status)) {
     return ToolResultErr(
       `Ticket #${match.number} (${match.id}) is in "${match.status}". ` +
-        `Only Planned, Working, and Testing tickets are servable. ` +
+        `Only Planned, Working, and Verification tickets are servable. ` +
         (match.status === "Thinking"
           ? "Ask the human to triage and move it to Planned first."
           : "This work is already complete."),
@@ -414,12 +414,12 @@ export async function runCreateTicket(
 }
 
 /**
- * Move a ticket between the active lanes (Planned / Working / Testing).
+ * Move a ticket between the active lanes (Planned / Working / Verification).
  *
  * Returns `{ id, status, from }` on success.
  *
- * - Target must be Planned, Working, or Testing — never Thinking or Complete.
- * - Current status must already be Planned, Working, or Testing; agents
+ * - Target must be Planned, Working, or Verification — never Thinking or Complete.
+ * - Current status must already be Planned, Working, or Verification; agents
  *   cannot promote out of Thinking or re-open Complete tickets.
  * - The destination lane is capped at `ACTIVE_LANE_CAP` (6); a move that
  *   would exceed the cap is rejected with an error naming the lane.
@@ -461,7 +461,7 @@ export async function runUpdateTicketStatus(
       );
     }
     return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may only move tickets that are already Planned, Working, or Testing.`,
+      `Ticket ${issue.id} is in "${issue.status}". Agents may only move tickets that are already Planned, Working, or Verification.`,
     );
   }
 
@@ -504,7 +504,7 @@ export async function runUpdateTicketStatus(
  *
  * Returns `{ id, tasks, recordLength }` on success.
  *
- * - The ticket must currently be Planned, Working, or Testing.
+ * - The ticket must currently be Planned, Working, or Verification.
  * - Every `taskUpdates[].id` must match an existing task on the ticket; an
  *   unknown id rejects the whole call.
  * - This is the only MCP tool that writes ticket content. Title, description,
@@ -524,7 +524,7 @@ export async function runUpdateTicketProgress(
 
   if (!AGENT_SERVABLE_STATUSES.includes(issue.status)) {
     return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may only update tickets that are Planned, Working, or Testing.`,
+      `Ticket ${issue.id} is in "${issue.status}". Agents may only update tickets that are Planned, Working, or Verification.`,
     );
   }
 
@@ -801,7 +801,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
     {
       title: "DoStuff tickets (active)",
       description:
-        "All tickets currently in a non-terminal state (Planned, Working, Testing).",
+        "All tickets currently in a non-terminal state (Planned, Working, Verification).",
       mimeType: "application/json",
     },
     async (uri) => {
@@ -835,7 +835,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
     {
       title: "DoStuff ticket",
       description:
-        "A single ticket. Only Planned / Working / Testing tickets are returned.",
+        "A single ticket. Only Planned / Working / Verification tickets are returned.",
       mimeType: "application/json",
     },
     async (uri, variables) => {
@@ -847,7 +847,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
       }
       if (!AGENT_SERVABLE_STATUSES.includes(issue.status)) {
         throw new Error(
-          `Ticket ${id} is in "${issue.status}" -- only Planned, Working, and Testing tickets are served.`,
+          `Ticket ${id} is in "${issue.status}" -- only Planned, Working, and Verification tickets are served.`,
         );
       }
       return {
@@ -925,7 +925,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "Look up an active ticket and return its full content + the workflow prompt. " +
         "`query` may be a ticket number (e.g. '#42' or '42'), an id (e.g. 'DS-042'), " +
         "or a case-insensitive substring of the ticket title. Only tickets currently " +
-        "in Planned, Working, or Testing are servable; Thinking and Complete are rejected.",
+        "in Planned, Working, or Verification are servable; Thinking and Complete are rejected.",
       inputSchema: GET_TICKET_INPUT,
     },
     async (args) => runGetTicket(store, args as GetTicketInput),
@@ -962,7 +962,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
     {
       title: "Update ticket status",
       description:
-        "Move a ticket between Planned, Working, and Testing. " +
+        "Move a ticket between Planned, Working, and Verification. " +
         "You cannot mark a ticket Complete -- only a human reviewer can do that. " +
         "You also cannot move a ticket back to Thinking once it has left. " +
         `Each active lane is capped at ${ACTIVE_LANE_CAP} tickets; a move that would exceed the cap is rejected.`,

@@ -210,6 +210,6 @@ export const STATUS_META: Record<Status, { color: string; label: string }> = {
   Thinking: { color: "#a0a0a0", label: "Thinking" },
   Planned: { color: "#75beff", label: "Planned" },
   Working: { color: "#dcdcaa", label: "Working" },
-  Testing: { color: "#c586c0", label: "Testing" },
+  Verification: { color: "#c586c0", label: "Verification" },
   Complete: { color: "#89d185", label: "Complete" },
 };

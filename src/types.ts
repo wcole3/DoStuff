@@ -1,13 +1,13 @@
 // Shared types for the DoStuff extension.
 
 export const ACTIVE_LANE_CAP = 6;
-export const ACTIVE_LANES = ["Planned", "Working", "Testing"] as const;
+export const ACTIVE_LANES = ["Planned", "Working", "Verification"] as const;
 export type ActiveLane = (typeof ACTIVE_LANES)[number];
 export function isActiveLane(s: string): s is ActiveLane {
   return (ACTIVE_LANES as readonly string[]).includes(s);
 }
 
-export const STATUSES   = ["Thinking", "Planned", "Working", "Testing", "Complete"] as const;
+export const STATUSES   = ["Thinking", "Planned", "Working", "Verification", "Complete"] as const;
 export const PRIORITIES = ["Critical", "High", "Regular", "Low"] as const;
 export const TYPES      = ["Bug", "Feature", "Refactor", "Chore", "Spike"] as const;
 
@@ -75,10 +75,10 @@ export interface Issue {
 }
 
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
-export const AGENT_WRITABLE_STATUSES: Status[] = ["Planned", "Working", "Testing"];
+export const AGENT_WRITABLE_STATUSES: Status[] = ["Planned", "Working", "Verification"];
 
 /** Statuses that get served as tickets to MCP clients. */
-export const AGENT_SERVABLE_STATUSES: Status[] = ["Planned", "Working", "Testing"];
+export const AGENT_SERVABLE_STATUSES: Status[] = ["Planned", "Working", "Verification"];
 
 /** Wire format for host ↔ webview messaging. */
 export type HostToWebview =
@@ -109,7 +109,7 @@ export interface Settings {
  * otherwise an error string describing why.
  *
  *  - Inactive targets (Thinking, Complete) are always allowed.
- *  - Active targets (Planned, Working, Testing) are capped at ACTIVE_LANE_CAP.
+ *  - Active targets (Planned, Working, Verification) are capped at ACTIVE_LANE_CAP.
  *  - The issue identified by `movingIssueId` is excluded from the count so an
  *    in-place save of an already-located ticket isn't blocked by itself.
  */

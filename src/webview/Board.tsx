@@ -23,7 +23,7 @@ import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, relTime } from "./IssueDetail";
 import { postUpdateIssue, useIssues } from "./messaging";
 
-const ACTIVE_LANES: Status[] = ["Planned", "Working", "Testing"];
+const ACTIVE_LANES: Status[] = ["Planned", "Working", "Verification"];
 const DRAWER_CARD_HEIGHT = 64;
 const TOAST_TTL_MS = 3000;
 
@@ -488,7 +488,7 @@ export function Board() {
       Thinking: [],
       Planned: [],
       Working: [],
-      Testing: [],
+      Verification: [],
       Complete: [],
     };
     for (const i of issues) map[i.status].push(i);

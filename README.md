@@ -24,11 +24,11 @@ Open the DoStuff icon in the activity bar. The view lists every issue sorted by 
 Run **DoStuff: Show Board** from the command palette (or click the board icon in the sidebar title bar). The board has five lanes:
 
 ```text
-Thinking drawer  →  Planned  →  Working  →  Testing  →  Complete drawer
+Thinking drawer  →  Planned  →  Working  →  Verification  →  Complete drawer
    (left)                                                    (right)
 ```
 
-Drag a card between lanes to change its status. Each active lane (Planned, Working, Testing) is capped at **6 open tickets**; the UI rejects drops that would exceed the cap with a toast.
+Drag a card between lanes to change its status. Each active lane (Planned, Working, Verification) is capped at **6 open tickets**; the UI rejects drops that would exceed the cap with a toast.
 
 ### Import / export
 
@@ -38,9 +38,9 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 
 - New tickets always start in **Thinking** for human triage.
 - Only humans can promote a ticket from Thinking to Planned. Agents cannot.
-- Tickets move freely between Planned, Working, and Testing.
+- Tickets move freely between Planned, Working, and Verification.
 - Only humans can move a ticket to **Complete** (via the UI).
-- Active lanes (Planned, Working, Testing) are each capped at 6 open tickets. This is a workflow throttle: finish or de-scope before starting more work.
+- Active lanes (Planned, Working, Verification) are each capped at 6 open tickets. This is a workflow throttle: finish or de-scope before starting more work.
 
 ## Keyboard shortcuts
 
@@ -114,14 +114,14 @@ Workflow contract:
      i.e. "get ticket 42 and begin work" or "start on the OAuth ticket".
   2. Tickets have descriptions and verify criteria written by the human. Read before
      starting.  Some tickets have subtasks to help you plan.
-  3. Read \`dostuff://tickets\` to discover work. Only Planned / Working / Testing
+  3. Read \`dostuff://tickets\` to discover work. Only Planned / Working / Verification
      tickets are visible -- Thinking tickets are drafts the human is still shaping,
      and Complete tickets are done.
   4. When you start a ticket, call \`update_ticket_status\` to move it to "Working".
-     When you believe it's ready for verification, move it to "Testing".
-  5. You cannot mark a ticket "Complete". A human reviews Testing tickets and
+     When you believe it's ready for verification, move it to "Verification".
+  5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
      decides. If your verification fails, move it back to "Working".
-  6. Active lanes (Planned, Working, Testing) are capped at ${ACTIVE_LANE_CAP} tickets each.
+  6. Active lanes (Planned, Working, Verification) are capped at ${ACTIVE_LANE_CAP} tickets each.
      Moves that would exceed the cap are rejected.
   7. As you make progress, call \`update_ticket_progress\` to tick tasks off and
      append a short note to the ticket's record. Be terse and factual.
@@ -139,15 +139,15 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
-| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Only Planned / Working / Testing tickets are servable. `statusHistory` and `resolvedAt` are stripped. |
+| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Only Planned / Working / Verification tickets are servable. `statusHistory` and `resolvedAt` are stripped. |
 | `list_issues` | optional `type`, `priority`, `status` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Includes the workflow prompt and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. |
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. |
-| `update_ticket_status` | `id`, `status` (one of Planned / Working / Testing), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete. |
+| `update_ticket_status` | `id`, `status` (one of Planned / Working / Verification), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete. |
 | `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, or verifyCriteria. |
 
 ### Resources
 
-- `dostuff://tickets` — list of active (Planned / Working / Testing) tickets.
+- `dostuff://tickets` — list of active (Planned / Working / Verification) tickets.
 - `dostuff://tickets/{id}` — one active ticket.
 - `dostuff://instructions/workflow` — the workflow prompt.
 

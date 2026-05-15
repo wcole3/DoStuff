@@ -210,7 +210,7 @@
           "default": 6,
           "minimum": 1,
           "maximum": 50,
-          "description": "Maximum number of tickets allowed in each active lane (Planned, Working, Testing). Enforced by the UI, host, and MCP server."
+          "description": "Maximum number of tickets allowed in each active lane (Planned, Working, Verification). Enforced by the UI, host, and MCP server."
         },
         "dostuff.mcp.enabled": {
           "type": "boolean",

@@ -134,13 +134,13 @@ describe("get_ticket", () => {
 
   test("by DS- id", async () => {
     const store = await makeStore([
-      makeIssue({ number: 1, id: "DS-001", title: "Boot scaffold", status: "Testing" }),
+      makeIssue({ number: 1, id: "DS-001", title: "Boot scaffold", status: "Verification" }),
     ]);
     const res = await runGetTicket(store, { query: "DS-001" });
     expect(res.isError).toBeFalsy();
     const body = payload(res) as { ticket: { id: string; status: string } };
     expect(body.ticket.id).toBe("DS-001");
-    expect(body.ticket.status).toBe("Testing");
+    expect(body.ticket.status).toBe("Verification");
   });
 
   test("by title substring (case-insensitive)", async () => {
@@ -641,15 +641,15 @@ describe("update_ticket_status", () => {
     expect(store.get("DS-001")!.status).toBe("Working");
   });
 
-  test("Working -> Testing: allowed", async () => {
+  test("Working -> Verification: allowed", async () => {
     const store = await makeStore([makeIssue({ id: "DS-001", status: "Working" })]);
-    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Testing" });
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Verification" });
     expect(res.isError).toBeFalsy();
-    expect(store.get("DS-001")!.status).toBe("Testing");
+    expect(store.get("DS-001")!.status).toBe("Verification");
   });
 
-  test("Testing -> Planned: allowed", async () => {
-    const store = await makeStore([makeIssue({ id: "DS-001", status: "Testing" })]);
+  test("Verification -> Planned: allowed", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification" })]);
     const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Planned" });
     expect(res.isError).toBeFalsy();
     expect(store.get("DS-001")!.status).toBe("Planned");
@@ -680,7 +680,7 @@ describe("update_ticket_status", () => {
     });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("human triage queue");
-    expect(res.content[0].text).toContain("Planned, Working, Testing");
+    expect(res.content[0].text).toContain("Planned, Working, Verification");
     expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
@@ -1507,7 +1507,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     const store = await makeStore([
       makeIssue({ id: "DS-001", number: 1, title: "Planned one", status: "Planned" }),
       makeIssue({ id: "DS-002", number: 2, title: "Working one", status: "Working" }),
-      makeIssue({ id: "DS-003", number: 3, title: "Testing one", status: "Testing" }),
+      makeIssue({ id: "DS-003", number: 3, title: "Testing one", status: "Verification" }),
       makeIssue({ id: "DS-004", number: 4, title: "Thinking one", status: "Thinking" }),
       makeIssue({ id: "DS-005", number: 5, title: "Complete one", status: "Complete" }),
     ]);
@@ -1525,7 +1525,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     expect(ids).toEqual(["DS-001", "DS-002", "DS-003"]);
     // Thinking and Complete must be filtered out.
     for (const t of payload.tickets) {
-      expect(["Planned", "Working", "Testing"]).toContain(t.status);
+      expect(["Planned", "Working", "Verification"]).toContain(t.status);
     }
   });
 

@@ -107,7 +107,7 @@ describe("decideDrop", () => {
         }),
       );
     }
-    issues.push(makeIssue({ id: "DS-099", number: 99, status: "Testing" }));
+    issues.push(makeIssue({ id: "DS-099", number: 99, status: "Verification" }));
     const r = decideDrop(issues, "DS-099", "Complete");
     expect(r.kind).toBe("ok");
   });
@@ -141,7 +141,7 @@ describe("Board rendering", () => {
     const counters = Array.from(document.querySelectorAll(".bd-lane-count")).map(
       (el) => el.textContent,
     );
-    // Order: Planned, Working, Testing
+    // Order: Planned, Working, Verification
     expect(counters).toEqual([`1/${ACTIVE_LANE_CAP}`, `2/${ACTIVE_LANE_CAP}`, `0/${ACTIVE_LANE_CAP}`]);
   });
 
@@ -159,7 +159,7 @@ describe("Board rendering", () => {
     render(<Board />);
     pushInit(seed);
     const lanes = Array.from(document.querySelectorAll(".bd-lane"));
-    // Three lanes in order Planned/Working/Testing — only Working is full.
+    // Three lanes in order Planned/Working/Verification — only Working is full.
     expect(lanes[0]?.classList.contains("is-full")).toBe(false);
     expect(lanes[1]?.classList.contains("is-full")).toBe(true);
     expect(lanes[2]?.classList.contains("is-full")).toBe(false);

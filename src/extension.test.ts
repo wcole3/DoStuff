@@ -114,7 +114,7 @@ describe("mergeIssueUpdate — status transitions", () => {
   });
 
   test("Status change to Complete stamps resolvedAt with now()", () => {
-    const prior = makeIssue({ status: "Testing", resolvedAt: null });
+    const prior = makeIssue({ status: "Verification", resolvedAt: null });
     const now = () => "2025-07-04T00:00:00.000Z";
     const next = ok(mergeIssueUpdate(prior, { status: "Complete" }, "user", now));
 

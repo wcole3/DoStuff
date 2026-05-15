@@ -129,14 +129,14 @@ describe("activeLaneOverflow (import-time helper)", () => {
       set.push(makeIssue({
         id: `T-${i}`,
         number: 100 + i,
-        status: "Testing",
+        status: "Verification",
       }));
     }
     const overflow = activeLaneOverflow(set);
     expect(overflow).toEqual(
       expect.arrayContaining([
         { lane: "Working", count: ACTIVE_LANE_CAP + 1 },
-        { lane: "Testing", count: ACTIVE_LANE_CAP + 2 },
+        { lane: "Verification", count: ACTIVE_LANE_CAP + 2 },
       ]),
     );
     // Planned is empty so it must not appear in overflow.
