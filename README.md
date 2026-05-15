@@ -73,7 +73,7 @@ Every tool response includes a `workspace` field (`{ name, rootPath }` or `null`
 Add to your `settings.json` (user or workspace level):
 
 ```json
-"mcp": {
+"dostuff": {
   "servers": {
     "dostuff-ticket": {
       "url": "http://localhost:3947/mcp",
@@ -131,4 +131,3 @@ bun test         # runs src/mcpServer.test.ts
 
 Press **F5** in VSCode to launch an Extension Development Host with the current build. `SMOKE-TEST.md` lists the manual test plan to walk before tagging a release.
 
-The `.mcp.json` file at the repo root is for *Claude Code's* own MCP usage during development of this project — it is unrelated to DoStuff's MCP server. It contains a Context7 API key in plaintext; **do not commit credentials**, and rotate the key before sharing this repo.
