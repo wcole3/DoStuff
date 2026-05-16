@@ -181,7 +181,13 @@ media/styles.css
 media/index.js
 media/index.js.map
 
+#packages
+*.vsix
+
 # ide
 .vscode
 .claude
 .mcp.json
+
+# tmp
+review-the-*
