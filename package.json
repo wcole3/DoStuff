@@ -20,7 +20,7 @@
     "dev": "echo 'Open this directory in VSCode and then run your extension with F5 or `Run and Debug > Run Extension`!'",
     "build": "bun run ./scripts/build-with-esbuild.ts",
     "watch": "bun run ./scripts/watch-with-esbuild.ts",
-    "vsce-package": "bun run vsce package",
+    "vsce-package": "bun run vsce package --no-dependencies",
     "package": "bun run build && bun run vsce-package",
     "clean": "rm -rf ./dist ./media/index.js ./media/index.js.map ./media/styles.css ./media/styles.css.map"
   },
