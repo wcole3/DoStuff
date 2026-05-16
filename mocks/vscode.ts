@@ -289,7 +289,7 @@ export const window: {
 export const workspace = {
   workspaceFolders: undefined as WorkspaceFolder[] | undefined,
   name: undefined as string | undefined,
-  getConfiguration: (_section?: string): WorkspaceConfiguration => ({
+  getConfiguration: (_section?: string, _scope?: unknown): WorkspaceConfiguration => ({
     get: (<T>(_key: string, defaultValue?: T) => defaultValue) as WorkspaceConfiguration["get"],
     update: (..._args: unknown[]) => Promise.resolve(),
     inspect: () => undefined,

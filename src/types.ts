@@ -86,7 +86,12 @@ export type HostToWebview =
   | { type: "issues"; issues: Issue[] }
   | { type: "focusSearch" }
   | { type: "settings"; settings: Settings }
-  | { type: "showNewIssue" };
+  | { type: "showNewIssue" }
+  // Sidebar dragstart broadcast: the board uses this to enter a "pick a
+  // lane" mode (lanes/drawers highlight as click targets) since native
+  // HTML5 drag cannot cross VSCode webview boundaries reliably.
+  | { type: "externalDragStart"; issueId: string }
+  | { type: "externalDragEnd" };
 
 export type WebviewToHost =
   | { type: "ready" }
@@ -96,7 +101,9 @@ export type WebviewToHost =
   | { type: "openBoard" }
   | { type: "importJson" }
   | { type: "exportJson" }
-  | { type: "openSettings" };
+  | { type: "openSettings" }
+  | { type: "externalDragStart"; issueId: string }
+  | { type: "externalDragEnd" };
 
 export interface Settings {
   storagePath: string;

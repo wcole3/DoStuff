@@ -186,6 +186,19 @@ export function readWorkflowPrompt(): string {
   return custom && custom.trim() ? custom : DEFAULT_WORKFLOW_PROMPT;
 }
 
+/**
+ * Resolve the preferred MCP port from the workspace config. Returns 0 (let the
+ * OS pick) when the setting is missing, out of range, or non-integer. Ports
+ * 1–1023 are coerced to 0 to avoid surprises with privileged ports.
+ */
+export function readPreferredPort(cfg: vscode.WorkspaceConfiguration): number {
+  const raw = cfg.get<number>("mcp.port", 0);
+  if (!Number.isInteger(raw)) return 0;
+  if (raw === 0) return 0;
+  if (raw < 1024 || raw > 65535) return 0;
+  return raw;
+}
+
 function isLocalhost(addr: string): boolean {
   return (
     addr === "localhost" ||
@@ -640,18 +653,21 @@ export class DoStuffMcpServer implements vscode.Disposable {
       return;
     }
 
+    const preferredPort = readPreferredPort(cfg);
     const normalizedPath = normalizeWorkspacePath(ws.path);
-    if (this.httpServer && this.startedFor === normalizedPath) {
-      return; // already running for this workspace
+    const desiredIdentity = `${normalizedPath}::${preferredPort}`;
+    if (this.httpServer && this.startedFor === desiredIdentity) {
+      return; // already running for this workspace + preferred port
     }
 
     if (this.httpServer) {
       await this.stop();
-      this.output.appendLine(`Workspace changed -- restarting.`);
+      this.output.appendLine(`Identity changed -- restarting.`);
     }
 
     try {
-      await this.start(ws);
+      await this.start(ws, preferredPort);
+      this.startedFor = desiredIdentity;
       this.output.appendLine(
         `Listening on http://127.0.0.1:${this.currentPort}/mcp for ${ws.path}`,
       );
@@ -662,7 +678,7 @@ export class DoStuffMcpServer implements vscode.Disposable {
     }
   }
 
-  private async start(ws: WorkspaceIdentity): Promise<void> {
+  private async start(ws: WorkspaceIdentity, preferredPort: number): Promise<void> {
     // StreamableHTTPServerTransport in stateless mode (sessionIdGenerator:
     // undefined) cannot be reused across requests — the SDK throws on the
     // second handleRequest call. So we build a fresh McpServer + transport
@@ -676,15 +692,33 @@ export class DoStuffMcpServer implements vscode.Disposable {
     server.headersTimeout = 10_000;
     server.requestTimeout = 30_000;
 
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => resolve());
-    });
+    const tryBind = (p: number): Promise<void> =>
+      new Promise<void>((resolve, reject) => {
+        const onError = (e: Error) => reject(e);
+        server.once("error", onError);
+        server.listen(p, "127.0.0.1", () => {
+          server.removeListener("error", onError);
+          resolve();
+        });
+      });
+
+    try {
+      await tryBind(preferredPort);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (preferredPort !== 0 && code === "EADDRINUSE") {
+        this.output.appendLine(
+          `Pinned port ${preferredPort} is in use -- falling back to an ephemeral port.`,
+        );
+        await tryBind(0);
+      } else {
+        throw e;
+      }
+    }
 
     const addr = server.address() as AddressInfo;
     this.httpServer = server;
     this.currentPort = addr.port;
-    this.startedFor = normalizeWorkspacePath(ws.path);
 
     try {
       pruneRegistry();

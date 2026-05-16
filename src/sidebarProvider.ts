@@ -13,6 +13,16 @@ import { isPriority, isType, type Issue, type Settings, type WebviewToHost } fro
  */
 export type ApplyIssueUpdate = (issue: Issue) => Promise<void>;
 
+/**
+ * Host-side callbacks for cross-webview "drag from sidebar to board" flow.
+ * The sidebar reports start/end; the host opens the board (if needed) and
+ * forwards the signal so the board can highlight lanes as click targets.
+ */
+export interface ExternalDragSignals {
+  onStart: (issueId: string) => void;
+  onEnd: () => void;
+}
+
 const ID_RE = /^DS-\d+$/;
 
 function readSettings(): Settings {
@@ -35,6 +45,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     private readonly extensionUri: vscode.Uri,
     private readonly store: IssueStore,
     private readonly applyUpdate: ApplyIssueUpdate,
+    private readonly externalDrag: ExternalDragSignals = { onStart: () => {}, onEnd: () => {} },
   ) {
     this.output = vscode.window.createOutputChannel("DoStuff Webview");
     this.disposables.push(this.output);
@@ -160,6 +171,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         break;
       case "openSettings":
         vscode.commands.executeCommand("workbench.action.openSettings", "dostuff");
+        break;
+      case "externalDragStart": {
+        const id = (msg as { issueId?: unknown }).issueId;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected externalDragStart: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        this.externalDrag.onStart(id);
+        break;
+      }
+      case "externalDragEnd":
+        this.externalDrag.onEnd();
         break;
       default: {
         const _exhaustive: never = msg;

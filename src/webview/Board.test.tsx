@@ -226,6 +226,54 @@ describe("Drawer search + filter", () => {
   });
 });
 
+describe("Thinking drawer card click semantics", () => {
+  test("plain click opens the detail overlay and does NOT promote", () => {
+    const a = makeIssue({ id: "DS-101", number: 101, title: "Draft idea", status: "Thinking" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement);
+    const card = document.querySelector(".bd-drawer-card") as HTMLElement;
+    fireEvent.click(card);
+
+    expect(document.querySelector(".bd-focus")).not.toBeNull();
+    expect(api.posted.some((m) => m.type === "updateIssue")).toBe(false);
+  });
+
+  test("shift-click promotes to Planned and does NOT open the detail overlay", () => {
+    const a = makeIssue({ id: "DS-102", number: 102, title: "Promote me", status: "Thinking" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement);
+    const card = document.querySelector(".bd-drawer-card") as HTMLElement;
+    fireEvent.click(card, { shiftKey: true });
+
+    expect(document.querySelector(".bd-focus")).toBeNull();
+    const updates = api.posted.filter((m) => m.type === "updateIssue");
+    expect(updates).toHaveLength(1);
+    const issue = (updates[0] as unknown as { issue: Issue }).issue;
+    expect(issue.id).toBe("DS-102");
+    expect(issue.status).toBe("Planned");
+  });
+
+  test("Complete drawer: plain click opens detail (no promote path)", () => {
+    const a = makeIssue({ id: "DS-103", number: 103, title: "Done", status: "Complete" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-right .bd-drawer-head") as HTMLElement);
+    const card = document.querySelector(".bd-drawer-card") as HTMLElement;
+    fireEvent.click(card);
+
+    expect(document.querySelector(".bd-focus")).not.toBeNull();
+    expect(api.posted.some((m) => m.type === "updateIssue")).toBe(false);
+  });
+});
+
 // The "Loading…" empty-state for Board is skipped: the webview store is a
 // module singleton and is `initialized: true` for the remainder of the test
 // process after any earlier test pushed an init message. Asserting against

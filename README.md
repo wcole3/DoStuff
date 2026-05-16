@@ -30,6 +30,10 @@ Thinking drawer  →  Planned  →  Working  →  Verification  →  Complete dr
 
 Drag a card between lanes to change its status. Each active lane (Planned, Working, Verification) is capped at **6 open tickets**; the UI rejects drops that would exceed the cap with a toast.
 
+You can also start a drag in the **sidebar** — the board lights up each lane and drawer with a "Move to *lane*" overlay; click any lane to commit, or press **Esc** to cancel. If the board isn't open, dragging from the sidebar reveals it.
+
+**Thinking drawer**: click a card to view its details (the detail overlay opens just like any other card). **Shift+Click** promotes the draft straight to Planned.
+
 ### Import / export
 
 Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…** from the command palette, or use the cloud icons in the sidebar title bar.
@@ -56,27 +60,36 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | `dostuff.writeStorageGitignore` | boolean | `true` | Write a `.gitignore` inside the storage folder so ticket JSON files stay out of Git even when `.vscode/` is tracked. |
 | `dostuff.autoSave` | boolean | `true` | Persist edits automatically as you type. |
 | `dostuff.mcp.enabled` | boolean | `false` | Run an in-process MCP server that exposes the active ticket queue to local agents. |
+| `dostuff.mcp.port` | number | `0` | Localhost port for this workspace's MCP server. `0` lets the OS pick an ephemeral port each session. Set a fixed value to keep `mcp.json` URLs stable. Easiest set: **DoStuff: Pin MCP Port to Workspace**. Window-scoped. |
 | `dostuff.mcp.workspaceOverride` | string | `""` | Absolute path to advertise in the multi-workspace registry. Leave blank to use the first workspace folder. Window-scoped. |
 | `dostuff.mcp.instructions` | string | (built-in workflow prompt) | System-level workflow prompt served alongside every ticket. Leave blank to use the default. User-level only. |
 
 ## Using the MCP server
 
-DoStuff runs an HTTP MCP server on `127.0.0.1:<port>/mcp`. Each VSCode window binds its **own ephemeral port** (chosen by the OS) and writes a registry entry so agents can discover which port serves which workspace — no port-collision when multiple windows are open. The server is **disabled by default** — enable it with **DoStuff: Toggle MCP Server** or by setting `dostuff.mcp.enabled: true`.
+DoStuff runs an HTTP MCP server on `127.0.0.1:<port>/mcp`. Each VSCode window binds its **own** port and writes a registry entry so agents can discover which port serves which workspace — no port collision when multiple windows are open. The server is **disabled by default** — enable it with **DoStuff: Toggle MCP Server** or by setting `dostuff.mcp.enabled: true`.
 
 Every tool response includes a `workspace` field (`{ name, rootPath }` or `null`) so agents can immediately verify they are connected to the intended project.
 
-Look up the port assigned to a window:
+### Pinning the port (recommended)
+
+By default the OS picks an ephemeral port each session, so any `mcp.json` URL with a hard-coded port breaks at the next restart. To keep the URL stable:
+
+1. Start the MCP server in this workspace (status bar shows `$(plug) DoStuff MCP :<port>`).
+2. Run **DoStuff: Pin MCP Port to Workspace** from the command palette. DoStuff writes the live port to this workspace's settings as `dostuff.mcp.port`.
+3. From now on the server attempts to bind that exact port at every start. If the port is already in use (e.g. another DoStuff window pinned the same number), the server falls back to an ephemeral port and logs a warning to `Output → DoStuff MCP`.
+
+You can also edit `dostuff.mcp.port` (a window-scoped number, 1024–65535) by hand. Set it back to `0` to return to ephemeral.
+
+### Looking up the live port
 
 - **Status bar**: the `$(plug) DoStuff MCP :<port>` indicator shows the live port.
 - **Registry file**: `~/.config/dostuff/instances.json` (Linux/macOS) or `%APPDATA%/dostuff/instances.json` (Windows) lists every running instance. See [Multi-workspace agent discovery](#multi-workspace-agent-discovery) for the entry shape and the recommended pick-by-cwd algorithm.
 
 ### Pointing a client at it
 
-Because the port is ephemeral, prefer clients that can read the registry file (or accept a command-substituted URL). For clients that need a hard-coded URL, set `dostuff.mcp.workspaceOverride` so you know which window owns which workspace, then paste the port shown in the status bar.
+Pin the port (above), then drop it into your client config:
 
 #### VSCode MCP settings (VS Code 1.99+)
-
-Read the port from the status bar (or `instances.json`) and paste it into `settings.json`:
 
 ```json
 "dostuff": {
@@ -92,7 +105,7 @@ Read the port from the status bar (or `instances.json`) and paste it into `setti
 
 #### Claude Code
 
-Same — pull the port from the status bar or the registry and add to `.mcp.json` (or run `claude mcp add`):
+Add an entry to your `.mcp.json` (or run `claude mcp add`):
 
 ```json
 {

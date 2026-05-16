@@ -116,6 +116,11 @@
         "category": "DoStuff"
       },
       {
+        "command": "dostuff.mcp.pinPort",
+        "title": "Pin MCP Port to Workspace",
+        "category": "DoStuff"
+      },
+      {
         "command": "dostuff.openSettings",
         "title": "Settings",
         "category": "DoStuff",
@@ -150,6 +155,9 @@
         },
         {
           "command": "dostuff.mcp.editInstructions"
+        },
+        {
+          "command": "dostuff.mcp.pinPort"
         },
         {
           "command": "dostuff.clearAll"
@@ -231,6 +239,14 @@
           "default": "",
           "scope": "window",
           "description": "Absolute path to advertise in the multi-workspace registry. Leave blank to use the first workspace folder. Useful when agents run from a subdirectory of a different tree."
+        },
+        "dostuff.mcp.port": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 65535,
+          "scope": "window",
+          "markdownDescription": "Localhost port for this workspace's MCP server. `0` (default) lets the OS pick an ephemeral port each session. Set a fixed value (1024–65535) to keep `mcp.json` URLs stable across restarts. Easiest way to set this: run **DoStuff: Pin MCP Port to Workspace** while the server is running. If the chosen port is already in use, the server falls back to an ephemeral one."
         },
         "dostuff.mcp.instructions": {
           "type": "string",

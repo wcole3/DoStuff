@@ -21,7 +21,12 @@ import {
 } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, relTime } from "./IssueDetail";
-import { postUpdateIssue, useIssues } from "./messaging";
+import {
+  clearExternalDragLocal,
+  postUpdateIssue,
+  useExternalDragIssueId,
+  useIssues,
+} from "./messaging";
 
 const ACTIVE_LANES: Status[] = ["Planned", "Working", "Verification"];
 const DRAWER_CARD_HEIGHT = 64;
@@ -121,13 +126,24 @@ interface LaneProps {
   issues: Issue[];
   cap: number;
   dragId: string | null;
+  externalPickId: string | null;
   onDragStart: (e: DragEvent<HTMLDivElement>, issue: Issue) => void;
   onDragEnd: () => void;
   onDropIssue: (id: string, status: Status) => void;
   onOpen: (issue: Issue) => void;
 }
 
-function Lane({ status, issues, cap, dragId, onDragStart, onDragEnd, onDropIssue, onOpen }: LaneProps) {
+function Lane({
+  status,
+  issues,
+  cap,
+  dragId,
+  externalPickId,
+  onDragStart,
+  onDragEnd,
+  onDropIssue,
+  onOpen,
+}: LaneProps) {
   const [dragOver, setDragOver] = useState(false);
   const meta = STATUS_META[status];
   const count = issues.length;
@@ -151,7 +167,7 @@ function Lane({ status, issues, cap, dragId, onDragStart, onDragEnd, onDropIssue
     <div
       className={`bd-lane ${dragOver ? "is-drag-over" : ""} ${isFull ? "is-full" : ""} ${
         dragBlocked ? "is-drag-blocked" : ""
-      }`}
+      } ${externalPickId ? "is-pick-target" : ""}`}
       style={{ ["--lane-accent" as string]: meta.color } as CSSProperties}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -180,6 +196,20 @@ function Lane({ status, issues, cap, dragId, onDragStart, onDragEnd, onDropIssue
           ))
         )}
       </div>
+      {externalPickId && (
+        <button
+          type="button"
+          className="bd-pick-overlay"
+          title={`Click to move ticket here (${status})`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDropIssue(externalPickId, status);
+            clearExternalDragLocal();
+          }}
+        >
+          <span className="bd-pick-overlay-label">Move to {status}</span>
+        </button>
+      )}
     </div>
   );
 }
@@ -200,6 +230,7 @@ const DrawerCardRow = memo(function DrawerCardRow({
 }: ListChildComponentProps<DrawerCardRowData>) {
   const issue = data.issues[index];
   const pri = PRIORITY_META[issue.priority];
+  const canPromote = data.status === "Thinking" && data.onPickToBoard !== undefined;
   return (
     <div style={style}>
       <div
@@ -207,14 +238,17 @@ const DrawerCardRow = memo(function DrawerCardRow({
         draggable
         onDragStart={(e) => data.onDragStart(e, issue)}
         onDragEnd={data.onDragEnd}
-        onClick={() => {
-          if (data.status === "Thinking" && data.onPickToBoard) {
-            data.onPickToBoard(issue.id);
-          } else {
-            data.onOpen(issue);
+        onClick={(e) => {
+          // Thinking drawer: click opens the detail panel; shift-click promotes
+          // straight to Planned. The shift-click shortcut is the only way an
+          // accidental click won't move a draft onto the board.
+          if (canPromote && e.shiftKey) {
+            data.onPickToBoard!(issue.id);
+            return;
           }
+          data.onOpen(issue);
         }}
-        title={data.status === "Thinking" ? "Click to promote to Planned" : "Open"}
+        title={canPromote ? "Click to view details, Shift+Click to promote to Planned" : "Open"}
       >
         <div className="bd-drawer-card-top">
           <Icon name={TYPE_ICON[issue.type]} size={11} style={{ opacity: 0.7 }} />
@@ -235,6 +269,7 @@ interface DrawerProps {
   issues: Issue[];
   side: "left" | "right";
   open: boolean;
+  externalPickId: string | null;
   onToggle: () => void;
   onDropIssue: (id: string, status: Status) => void;
   onOpen: (issue: Issue) => void;
@@ -248,6 +283,7 @@ function Drawer({
   issues,
   side,
   open,
+  externalPickId,
   onToggle,
   onDropIssue,
   onOpen,
@@ -310,17 +346,30 @@ function Drawer({
     [displayedIssues, onOpen, onPickToBoard, status, onDragStart, onDragEnd],
   );
 
+  const headClick = () => {
+    if (externalPickId) {
+      onDropIssue(externalPickId, status);
+      clearExternalDragLocal();
+      return;
+    }
+    onToggle();
+  };
+
   return (
     <div
       className={`bd-drawer bd-drawer-${side} ${dragOver ? "is-drag-over" : ""} ${
         open ? "is-open" : ""
-      }`}
+      } ${externalPickId ? "is-pick-target" : ""}`}
       style={{ ["--drawer-accent" as string]: meta.color } as CSSProperties}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      <button className="bd-drawer-head" onClick={onToggle}>
+      <button
+        className="bd-drawer-head"
+        onClick={headClick}
+        title={externalPickId ? `Click to move ticket to ${status}` : undefined}
+      >
         <span className="bd-drawer-rot">
           <span className="bd-lane-dot" style={{ background: meta.color }} />
           <span>{status}</span>
@@ -356,7 +405,7 @@ function Drawer({
           </div>
           <div className="bd-drawer-help">
             {status === "Thinking"
-              ? "Ideas not yet on the board. Click an issue to promote it to Planned."
+              ? "Ideas not yet on the board. Click an issue to view details; Shift+Click promotes to Planned."
               : "Completed issues. Drop here to mark complete, or open to review."}
           </div>
           {displayedIssues.length === 0 ? (
@@ -382,6 +431,20 @@ function Drawer({
             </div>
           )}
         </div>
+      )}
+      {externalPickId && (
+        <button
+          type="button"
+          className="bd-pick-overlay"
+          title={`Click to move ticket here (${status})`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDropIssue(externalPickId, status);
+            clearExternalDragLocal();
+          }}
+        >
+          <span className="bd-pick-overlay-label">Move to {status}</span>
+        </button>
       )}
     </div>
   );
@@ -416,6 +479,7 @@ function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
 
 export function Board() {
   const { issues, settings, initialized } = useIssues();
+  const externalPickId = useExternalDragIssueId();
   const [dragId, setDragId] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [leftOpen, setLeftOpen] = useState(false);
@@ -439,6 +503,17 @@ export function Board() {
     const exists = issues.some((i) => i.id === dragId);
     if (!exists) setDragId(null);
   }, [issues, dragId]);
+
+  // Esc cancels an in-progress sidebar→board drag (the board has no native
+  // dragend signal for a cross-webview source).
+  useEffect(() => {
+    if (!externalPickId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") clearExternalDragLocal();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [externalPickId]);
 
   const cap = settings?.activeLaneCap ?? ACTIVE_LANE_CAP;
 
@@ -510,6 +585,7 @@ export function Board() {
         status="Thinking"
         side="left"
         open={leftOpen}
+        externalPickId={externalPickId}
         onToggle={() => setLeftOpen((v) => !v)}
         issues={byStatus.Thinking}
         onDropIssue={setStatus}
@@ -527,6 +603,7 @@ export function Board() {
             issues={byStatus[s]}
             cap={cap}
             dragId={dragId}
+            externalPickId={externalPickId}
             onDragStart={onDragStart}
             onDragEnd={onDragEnd}
             onDropIssue={setStatus}
@@ -539,6 +616,7 @@ export function Board() {
         status="Complete"
         side="right"
         open={rightOpen}
+        externalPickId={externalPickId}
         onToggle={() => setRightOpen((v) => !v)}
         issues={byStatus.Complete}
         onDropIssue={setStatus}

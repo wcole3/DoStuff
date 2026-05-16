@@ -1059,10 +1059,12 @@ async function bootServer(
     enabled?: boolean;
     instructions?: string;
     workspaceId?: () => { path: string; name: string } | null;
+    preferredPort?: number;
   } = {},
 ): Promise<{ server: DoStuffMcpServer; port: number }> {
   const cfg: Record<string, unknown> = { "mcp.enabled": opts.enabled ?? true };
   if (opts.instructions !== undefined) cfg["mcp.instructions"] = opts.instructions;
+  if (opts.preferredPort !== undefined) cfg["mcp.port"] = opts.preferredPort;
   setMcpConfig(cfg);
   const server = new DoStuffMcpServer(store, opts.workspaceId ?? makeWorkspaceId());
   await server.reconcile();
@@ -1212,6 +1214,90 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     await local.server.stop();
     expect(loadRegistry().some((e) => e.pid === process.pid)).toBe(false);
     local.server.dispose();
+  });
+
+  test("pinned port honored when free", async () => {
+    // Borrow an OS-assigned free port, then release it so the MCP server can
+    // bind it as a "pinned" port.
+    const probe = http.createServer();
+    await new Promise<void>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.listen(0, "127.0.0.1", () => resolve());
+    });
+    const freePort = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store, { preferredPort: freePort }));
+    expect(server.status.running).toBe(true);
+    expect(server.status.port).toBe(freePort);
+  });
+
+  test("pinned port already in use falls back to ephemeral", async () => {
+    const blocker = http.createServer();
+    await new Promise<void>((resolve, reject) => {
+      blocker.once("error", reject);
+      blocker.listen(0, "127.0.0.1", () => resolve());
+    });
+    const taken = (blocker.address() as { port: number }).port;
+
+    try {
+      const store = await makeStore([]);
+      ({ server, port } = await bootServer(store, { preferredPort: taken }));
+      expect(server.status.running).toBe(true);
+      expect(server.status.port).not.toBe(taken);
+      expect(server.status.port).toBeGreaterThan(0);
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  test("out-of-range pinned port falls back to ephemeral", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store, { preferredPort: 999999 }));
+    expect(server.status.running).toBe(true);
+    expect(server.status.port).toBeGreaterThanOrEqual(1024);
+  });
+
+  test("changing mcp.port at runtime restarts on the new port", async () => {
+    const probe = http.createServer();
+    await new Promise<void>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.listen(0, "127.0.0.1", () => resolve());
+    });
+    const targetPort = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+    const ephemeral = server.status.port;
+    expect(server.status.running).toBe(true);
+
+    setMcpConfig({ "mcp.enabled": true, "mcp.port": targetPort });
+    await server.reconcile();
+    expect(server.status.running).toBe(true);
+    expect(server.status.port).toBe(targetPort);
+    expect(server.status.port).not.toBe(ephemeral);
+  });
+
+  test("readPreferredPort coerces invalid values to 0", async () => {
+    const { readPreferredPort } = await import("./mcpServer");
+    const mkCfg = (value: unknown): vscode.WorkspaceConfiguration =>
+      ({
+        get: <T,>(_key: string, defaultValue?: T): T | undefined =>
+          (value === undefined ? defaultValue : (value as T)),
+        update: () => Promise.resolve(),
+        inspect: () => undefined,
+        has: () => false,
+      }) as unknown as vscode.WorkspaceConfiguration;
+
+    expect(readPreferredPort(mkCfg(0))).toBe(0);
+    expect(readPreferredPort(mkCfg(8080))).toBe(8080);
+    expect(readPreferredPort(mkCfg(1.5))).toBe(0);
+    expect(readPreferredPort(mkCfg(-1))).toBe(0);
+    expect(readPreferredPort(mkCfg(999999))).toBe(0);
+    expect(readPreferredPort(mkCfg(80))).toBe(0); // privileged ports coerced
+    expect(readPreferredPort(mkCfg(undefined))).toBe(0);
   });
 
   test("wire-level smuggled fields cannot mutate locked ticket fields (authoritative)", async () => {

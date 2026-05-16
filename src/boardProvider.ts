@@ -59,6 +59,24 @@ export class BoardPanel {
     BoardPanel.current?.broadcast(issues);
   }
 
+  /**
+   * Returns whether a board panel is currently open. Used by extension.ts to
+   * decide whether to auto-open the board when the sidebar reports a drag.
+   */
+  static isOpen(): boolean {
+    return BoardPanel.current !== undefined;
+  }
+
+  /** Notify the open board that the user is dragging a ticket from the sidebar. */
+  static signalExternalDrag(issueId: string): void {
+    BoardPanel.current?.panel.webview.postMessage({ type: "externalDragStart", issueId });
+  }
+
+  /** Clear the cross-webview "drag in progress" state on the board, if any. */
+  static signalExternalDragEnd(): void {
+    BoardPanel.current?.panel.webview.postMessage({ type: "externalDragEnd" });
+  }
+
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,

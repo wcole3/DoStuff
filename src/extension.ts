@@ -183,7 +183,21 @@ export async function activate(context: vscode.ExtensionContext) {
     await store.upsert(next);
   };
 
-  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate);
+  const externalDrag = {
+    onStart: (issueId: string) => {
+      // Open the board if the user starts a drag with no board panel
+      // visible — without it there'd be nowhere for the lanes to light up.
+      if (!BoardPanel.isOpen()) {
+        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate);
+      }
+      BoardPanel.signalExternalDrag(issueId);
+    },
+    onEnd: () => {
+      BoardPanel.signalExternalDragEnd();
+    },
+  };
+
+  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag);
 
   context.subscriptions.push(
     sidebar,
@@ -393,6 +407,36 @@ export async function activate(context: vscode.ExtensionContext) {
       if (next === undefined) return;
       const toSave = next.trim() === DEFAULT_WORKFLOW_PROMPT.trim() ? "" : next;
       await cfg.update("mcp.instructions", toSave, vscode.ConfigurationTarget.Global);
+    }),
+    vscode.commands.registerCommand("dostuff.mcp.pinPort", async () => {
+      const port = mcp.status.port;
+      if (!port) {
+        vscode.window.showWarningMessage(
+          "DoStuff MCP server is not running -- enable it before pinning.",
+        );
+        return;
+      }
+      if (!vscode.workspace.workspaceFolders?.length) {
+        vscode.window.showWarningMessage(
+          "DoStuff: open a folder first -- there is no workspace to pin the port to.",
+        );
+        return;
+      }
+      // Write at the Workspace scope so the value shows up in the Workspace
+      // tab of the Settings UI (and lands in .vscode/settings.json for a
+      // single-folder workspace, or the .code-workspace settings section for
+      // a multi-root one).
+      try {
+        await vscode.workspace
+          .getConfiguration("dostuff")
+          .update("mcp.port", port, vscode.ConfigurationTarget.Workspace);
+        vscode.window.showInformationMessage(
+          `DoStuff: pinned MCP port ${port} for this workspace.`,
+        );
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`DoStuff: could not pin port (${msg}).`);
+      }
     }),
   );
   await reconcileMcp();
