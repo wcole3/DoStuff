@@ -32,13 +32,14 @@ export class BoardPanel {
     store: IssueStore,
     applyUpdate: ApplyIssueUpdate,
   ) {
-    const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
-
     if (BoardPanel.current) {
-      BoardPanel.current.panel.reveal(column);
+      // Reveal in its current column — don't move the panel if the user has
+      // an editor focused elsewhere.
+      BoardPanel.current.panel.reveal(undefined, false);
       return;
     }
 
+    const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
     const panel = vscode.window.createWebviewPanel(
       BoardPanel.viewType,
       "DoStuff: Board",
