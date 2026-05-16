@@ -1,18 +1,20 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { FixedSizeList, type ListChildComponentProps } from "react-window";
+import { VariableSizeList, type ListChildComponentProps } from "react-window";
 import { STATUSES, type Issue, type Status } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, absTime, relTime } from "./IssueDetail";
 import { useIssues } from "./messaging";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
 
-const ROW_HEIGHT = 56;
+/** Fallback height before a row has reported its measured size. */
+const DEFAULT_ROW_HEIGHT = 56;
 
 interface RowData {
   filtered: Issue[];
   expandedId: string | null;
   onToggle: (id: string) => void;
   onContextMenu: (id: string) => void;
+  setSize: (id: string, height: number) => void;
 }
 
 const Row = memo(function Row({ index, style, data }: ListChildComponentProps<RowData>) {
@@ -20,84 +22,100 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
   const expanded = data.expandedId === issue.id;
   const meta = STATUS_META[issue.status];
   const pri = PRIORITY_META[issue.priority];
+  const innerRef = useRef<HTMLDivElement>(null);
+  const { setSize } = data;
+  const issueId = issue.id;
+
+  useEffect(() => {
+    const el = innerRef.current;
+    if (!el) return;
+    const measure = () => setSize(issueId, el.offsetHeight);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [issueId, setSize, issue.title]);
+
   return (
-    <div
-      className={`ds-row ${expanded ? "is-expanded" : ""}`}
-      style={style}
-      onClick={() => data.onToggle(issue.id)}
-      onContextMenu={(e) => { e.preventDefault(); data.onContextMenu(issue.id); }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          data.onToggle(issue.id);
-        }
-      }}
-      tabIndex={0}
-      role="button"
-      aria-expanded={expanded}
-      aria-label={`Issue ${issue.id}: ${issue.title}`}
-    >
-      <button
-        className="ds-row-chev"
-        onClick={(e) => {
-          e.stopPropagation();
-          data.onToggle(issue.id);
+    <div style={style}>
+      <div
+        ref={innerRef}
+        className={`ds-row ${expanded ? "is-expanded" : ""}`}
+        onClick={() => data.onToggle(issue.id)}
+        onContextMenu={(e) => { e.preventDefault(); data.onContextMenu(issue.id); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            data.onToggle(issue.id);
+          }
         }}
-        title={expanded ? "Collapse" : "Expand"}
-        aria-label={expanded ? "Collapse" : "Expand"}
+        tabIndex={0}
+        role="button"
+        aria-expanded={expanded}
+        aria-label={`Issue ${issue.id}: ${issue.title}`}
       >
-        <Icon name={expanded ? "chevronDown" : "chevronRight"} size={12} />
-      </button>
-      <div className="ds-row-icon" title={issue.type}>
-        <Icon name={TYPE_ICON[issue.type]} size={13} />
-      </div>
-      <div className="ds-row-body">
-        <div className="ds-row-title">{issue.title}</div>
-        <div className="ds-row-meta">
-          <span
-            title={issue.priority}
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              justifyContent: "center",
-              width: 16,
-              height: 16,
-              color: pri.color,
-            }}
-          >
-            <Icon name={pri.icon} size={12} />
-          </span>
-          <span className="ds-row-id" title={issue.id}>
-            #{issue.number}
-          </span>
-          <span className="ds-row-dot">·</span>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 5,
-              fontSize: 10.5,
-              color: "var(--vsc-fg-muted)",
-              textTransform: "uppercase",
-              letterSpacing: ".04em",
-              fontWeight: 500,
-            }}
-          >
+        <button
+          className="ds-row-chev"
+          onClick={(e) => {
+            e.stopPropagation();
+            data.onToggle(issue.id);
+          }}
+          title={expanded ? "Collapse" : "Expand"}
+          aria-label={expanded ? "Collapse" : "Expand"}
+        >
+          <Icon name={expanded ? "chevronDown" : "chevronRight"} size={12} />
+        </button>
+        <div className="ds-row-icon" title={issue.type}>
+          <Icon name={TYPE_ICON[issue.type]} size={13} />
+        </div>
+        <div className="ds-row-body">
+          <div className="ds-row-title">{issue.title}</div>
+          <div className="ds-row-meta">
+            <span
+              title={issue.priority}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 16,
+                height: 16,
+                color: pri.color,
+              }}
+            >
+              <Icon name={pri.icon} size={12} />
+            </span>
+            <span className="ds-row-id" title={issue.id}>
+              #{issue.number}
+            </span>
+            <span className="ds-row-dot">·</span>
             <span
               style={{
-                width: 6,
-                height: 6,
-                borderRadius: 999,
-                background: meta.color,
-                boxShadow: `0 0 0 2px ${meta.color}22`,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                fontSize: 10.5,
+                color: "var(--vsc-fg-muted)",
+                textTransform: "uppercase",
+                letterSpacing: ".04em",
+                fontWeight: 500,
               }}
-            />
-            {meta.label}
-          </span>
-          <span className="ds-row-dot">·</span>
-          <span className="ds-row-date" title={absTime(issue.createdAt)}>
-            {relTime(issue.createdAt)}
-          </span>
+            >
+              <span
+                style={{
+                  width: 6,
+                  height: 6,
+                  borderRadius: 999,
+                  background: meta.color,
+                  boxShadow: `0 0 0 2px ${meta.color}22`,
+                }}
+              />
+              {meta.label}
+            </span>
+            <span className="ds-row-dot">·</span>
+            <span className="ds-row-date" title={absTime(issue.createdAt)}>
+              {relTime(issue.createdAt)}
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -135,6 +153,8 @@ export function Sidebar() {
   const [modal, setModal] = useState<"add" | { kind: "delete"; issue: Issue } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [listRef, listSize] = useParentSize();
+  const vlistRef = useRef<VariableSizeList>(null);
+  const heightByIdRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     const handler = () => setModal("add");
@@ -181,9 +201,26 @@ export function Sidebar() {
     if (issue) setModal({ kind: "delete", issue });
   }, [issues]);
 
+  const setSize = useCallback((id: string, height: number) => {
+    if (heightByIdRef.current.get(id) !== height) {
+      heightByIdRef.current.set(id, height);
+      vlistRef.current?.resetAfterIndex(0);
+    }
+  }, []);
+
+  const getItemSize = useCallback(
+    (index: number) => heightByIdRef.current.get(filtered[index]?.id ?? "") ?? DEFAULT_ROW_HEIGHT,
+    [filtered],
+  );
+
+  // Filter changes shift indices — recompute itemSize for every row.
+  useEffect(() => {
+    vlistRef.current?.resetAfterIndex(0);
+  }, [filtered]);
+
   const rowData = useMemo<RowData>(
-    () => ({ filtered, expandedId, onToggle, onContextMenu }),
-    [filtered, expandedId, onToggle, onContextMenu],
+    () => ({ filtered, expandedId, onToggle, onContextMenu, setSize }),
+    [filtered, expandedId, onToggle, onContextMenu, setSize],
   );
 
   return (
@@ -255,19 +292,21 @@ export function Sidebar() {
               {query ? `No issues match "${query}"` : "No issues yet."}
             </div>
           ) : listSize.height > 0 ? (
-            <FixedSizeList
+            <VariableSizeList
+              ref={vlistRef}
               className="ds-vlist"
               style={{ width: "100%" }}
               height={listSize.height}
               width={listSize.width}
               itemCount={filtered.length}
-              itemSize={ROW_HEIGHT}
+              itemSize={getItemSize}
+              estimatedItemSize={DEFAULT_ROW_HEIGHT}
               itemData={rowData}
               itemKey={(index, data) => data.filtered[index].id}
               overscanCount={4}
             >
               {Row}
-            </FixedSizeList>
+            </VariableSizeList>
           ) : null}
         </div>
 

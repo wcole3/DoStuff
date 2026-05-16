@@ -60,7 +60,7 @@ mock.module("react-window", () => {
     height: number;
     width: number;
     itemCount: number;
-    itemSize: number;
+    itemSize: number | ((index: number) => number);
     itemData: unknown;
     itemKey?: (index: number, data: unknown) => string | number;
     children: React.ComponentType<{
@@ -69,7 +69,7 @@ mock.module("react-window", () => {
       data: unknown;
     }>;
   }
-  function FixedSizeList(props: FakeListProps) {
+  function renderItems(props: FakeListProps): React.ReactNode {
     const { itemCount, itemData, itemKey, children: Row } = props;
     const items: React.ReactNode[] = [];
     for (let i = 0; i < itemCount; i++) {
@@ -84,5 +84,17 @@ mock.module("react-window", () => {
       items,
     );
   }
-  return { FixedSizeList };
+  function FixedSizeList(props: FakeListProps) {
+    return renderItems(props);
+  }
+  // VariableSizeList exposes a `resetAfterIndex` method via ref; provide a
+  // no-op imperative handle so callers using `ref={...}` don't break.
+  const VariableSizeList = React.forwardRef<
+    { resetAfterIndex(index: number, shouldForceUpdate?: boolean): void },
+    FakeListProps & { estimatedItemSize?: number }
+  >(function VariableSizeList(props, ref) {
+    React.useImperativeHandle(ref, () => ({ resetAfterIndex() {} }), []);
+    return renderItems(props);
+  });
+  return { FixedSizeList, VariableSizeList };
 });
