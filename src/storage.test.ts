@@ -8,7 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as vscode from "vscode";
-import { IssueStore, normalize } from "./storage";
+import { GITIGNORE_CONTENT, IssueStore, normalize } from "./storage";
 import type { Issue, IssueType, Priority, Status } from "./types";
 
 // ----- Test helpers ----------------------------------------------------------
@@ -332,7 +332,12 @@ function installVirtualFs(seed: Record<string, string> = {}): { fs: VirtualFs; h
     delete: async (uri: { path: string }) => {
       fs.delete(uri.path);
     },
-    stat: async () => ({ type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 }),
+    stat: async (uri: { path: string }) => {
+      if (!fs.has(uri.path)) {
+        throw Object.assign(new Error("ENOENT"), { code: "FileNotFound" });
+      }
+      return { type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 };
+    },
     readDirectory: async (uri: { path: string }) => {
       const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
       const entries: Array<[string, number]> = [];
@@ -383,6 +388,58 @@ describe("IssueStore (file-backed branch)", () => {
     await store.init();
 
     expect(store.list().map((i) => i.id)).toEqual(["DS-001"]);
+  });
+
+  test("writes .gitignore on first upsert when none present", async () => {
+    const { fs, handles: h } = installVirtualFs({});
+    handles = h;
+
+    const store = new IssueStore(makeContext());
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
+
+    const entry = fs.get("/ws/.vscode/dostuff/.gitignore");
+    expect(entry).toBeDefined();
+    expect(new TextDecoder().decode(entry!.content)).toBe(GITIGNORE_CONTENT);
+  });
+
+  test("does not overwrite a user-edited .gitignore", async () => {
+    const customBody = "# my custom rules\n!keep-me.json\n";
+    const { fs, handles: h } = installVirtualFs({
+      "/ws/.vscode/dostuff/.gitignore": customBody,
+    });
+    handles = h;
+
+    const store = new IssueStore(makeContext());
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
+
+    const entry = fs.get("/ws/.vscode/dostuff/.gitignore");
+    expect(new TextDecoder().decode(entry!.content)).toBe(customBody);
+  });
+
+  test("respects dostuff.writeStorageGitignore=false (no .gitignore written)", async () => {
+    const { fs, handles: h } = installVirtualFs({});
+    handles = h;
+
+    const origGetConfig = vscode.workspace.getConfiguration;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (vscode.workspace as any).getConfiguration = (_section?: string) => ({
+      get: <T>(key: string, defaultValue?: T) =>
+        key === "writeStorageGitignore" ? (false as unknown as T) : (defaultValue as T),
+      update: () => Promise.resolve(),
+      inspect: () => undefined,
+      has: () => false,
+    });
+    try {
+      const store = new IssueStore(makeContext());
+      await store.init();
+      await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
+      expect(fs.has("/ws/.vscode/dostuff/.gitignore")).toBe(false);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (vscode.workspace as any).getConfiguration = origGetConfig;
+    }
   });
 
   test("reload() re-reads from disk after external mutation", async () => {

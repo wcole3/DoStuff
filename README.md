@@ -53,6 +53,7 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `dostuff.storagePath` | string | `.vscode/dostuff` | Folder (relative to workspace root) where issue JSON files are stored. |
+| `dostuff.writeStorageGitignore` | boolean | `true` | Write a `.gitignore` inside the storage folder so ticket JSON files stay out of Git even when `.vscode/` is tracked. |
 | `dostuff.autoSave` | boolean | `true` | Persist edits automatically as you type. |
 | `dostuff.mcp.enabled` | boolean | `false` | Run an in-process MCP server that exposes the active ticket queue to local agents. |
 | `dostuff.mcp.port` | number | `3947` | Localhost port the MCP server listens on. Endpoint is `http://127.0.0.1:<port>/mcp`. |
@@ -154,6 +155,8 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 ## Storage
 
 Tickets are stored as one `<id>.json` file per ticket in `<workspace>/.vscode/dostuff/` (or in VSCode `globalState` if no workspace is open). The folder is configurable via `dostuff.storagePath`. The files are plain JSON — diff-friendly and git-friendly.
+
+On first use, DoStuff writes a nested `.gitignore` inside the storage folder so ticket files are excluded from Git even when `.vscode/` is tracked. The gitignore itself is kept trackable (via `!.gitignore`) so teammates can see why their tickets aren't there. Disable via `dostuff.writeStorageGitignore: false`.
 
 ## Contributing / development
 
