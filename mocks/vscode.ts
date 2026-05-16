@@ -296,6 +296,7 @@ export const workspace = {
     has: () => false,
   }),
   onDidChangeConfiguration: (_cb: (e: ConfigurationChangeEvent) => unknown): Disposable => ({ dispose() {} }),
+  onDidChangeWorkspaceFolders: (_cb: (e: unknown) => unknown): Disposable => ({ dispose() {} }),
   fs: {
     readFile: (_uri: UriLike): Thenable<Uint8Array> => Promise.resolve(new Uint8Array()),
     writeFile: (_uri: UriLike, _content: Uint8Array): Thenable<void> => Promise.resolve(),

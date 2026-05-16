@@ -226,13 +226,11 @@
           "scope": "application",
           "description": "Run an in-process MCP server that exposes the active ticket queue to local agents."
         },
-        "dostuff.mcp.port": {
-          "type": "number",
-          "default": 3947,
-          "minimum": 1024,
-          "maximum": 65535,
-          "scope": "application",
-          "description": "Localhost port the MCP server listens on. Endpoint is http://127.0.0.1:<port>/mcp."
+        "dostuff.mcp.workspaceOverride": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "Absolute path to advertise in the multi-workspace registry. Leave blank to use the first workspace folder. Useful when agents run from a subdirectory of a different tree."
         },
         "dostuff.mcp.instructions": {
           "type": "string",

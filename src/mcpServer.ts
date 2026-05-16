@@ -27,12 +27,19 @@
 //   - update_ticket_progress can only touch tasks[].done and append to record.
 
 import * as http from "http";
+import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { z } from "zod";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { IssueStore } from "./storage";
+import {
+  normalizeWorkspacePath,
+  pruneRegistry,
+  registerEntry,
+  unregisterEntry,
+} from "./mcpRegistry";
 import {
   ACTIVE_LANE_CAP,
   ACTIVE_LANES,
@@ -568,25 +575,34 @@ export async function runUpdateTicketProgress(
 
 // ----- Server lifecycle ------------------------------------------------------
 
+export interface WorkspaceIdentity {
+  path: string;
+  name: string;
+}
+
 export class DoStuffMcpServer implements vscode.Disposable {
   private httpServer: http.Server | null = null;
   private currentPort: number | null = null;
+  private startedFor: string | null = null;
   private readonly output: vscode.OutputChannel;
   // Single-flight mutex: chain every reconcile() onto one promise so
   // concurrent config changes can't race start() against stop() and leak
   // a partially-initialized server.
   private reconcilePromise: Promise<void> = Promise.resolve();
-  private invalidPortNotified = false;
 
-  constructor(private readonly store: IssueStore) {
+  constructor(
+    private readonly store: IssueStore,
+    private readonly workspaceId: () => WorkspaceIdentity | null = () => null,
+  ) {
     this.output = vscode.window.createOutputChannel("DoStuff MCP");
   }
 
   /** Status snapshot for outside readers (e.g. status bar item). */
-  get status(): { running: boolean; port: number | null } {
+  get status(): { running: boolean; port: number | null; workspacePath: string | null } {
     return {
       running: this.httpServer !== null,
       port: this.currentPort,
+      workspacePath: this.startedFor,
     };
   }
 
@@ -604,7 +620,6 @@ export class DoStuffMcpServer implements vscode.Disposable {
   private async doReconcile(): Promise<void> {
     const cfg = vscode.workspace.getConfiguration("dostuff");
     const enabled = cfg.get<boolean>("mcp.enabled", true);
-    const port = cfg.get<number>("mcp.port", 3947);
 
     if (!enabled) {
       if (this.httpServer) {
@@ -614,41 +629,40 @@ export class DoStuffMcpServer implements vscode.Disposable {
       return;
     }
 
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      this.output.appendLine(
-        `Invalid mcp.port ${port}: must be an integer in 1-65535. Server will not start.`,
-      );
-      if (this.httpServer) await this.stop();
-      if (!this.invalidPortNotified) {
-        this.invalidPortNotified = true;
-        vscode.window.showErrorMessage(
-          `DoStuff MCP port ${port} is invalid. Set dostuff.mcp.port to 1-65535.`,
-        );
+    const ws = this.workspaceId();
+    if (!ws) {
+      if (this.httpServer) {
+        await this.stop();
+        this.output.appendLine(`No workspace folder -- server stopped.`);
+      } else {
+        this.output.appendLine(`No workspace folder -- MCP not started.`);
       }
       return;
     }
-    this.invalidPortNotified = false;
 
-    if (this.httpServer && this.currentPort === port) {
-      return; // already running on the right port
+    const normalizedPath = normalizeWorkspacePath(ws.path);
+    if (this.httpServer && this.startedFor === normalizedPath) {
+      return; // already running for this workspace
     }
 
     if (this.httpServer) {
       await this.stop();
-      this.output.appendLine(`Port changed -- restarting.`);
+      this.output.appendLine(`Workspace changed -- restarting.`);
     }
 
     try {
-      await this.start(port);
-      this.output.appendLine(`Listening on http://127.0.0.1:${port}/mcp`);
+      await this.start(ws);
+      this.output.appendLine(
+        `Listening on http://127.0.0.1:${this.currentPort}/mcp for ${ws.path}`,
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      this.output.appendLine(`Failed to start on port ${port}: ${msg}`);
+      this.output.appendLine(`Failed to start: ${msg}`);
       vscode.window.showErrorMessage(`DoStuff MCP server failed to start: ${msg}`);
     }
   }
 
-  private async start(port: number): Promise<void> {
+  private async start(ws: WorkspaceIdentity): Promise<void> {
     // StreamableHTTPServerTransport in stateless mode (sessionIdGenerator:
     // undefined) cannot be reused across requests — the SDK throws on the
     // second handleRequest call. So we build a fresh McpServer + transport
@@ -664,11 +678,28 @@ export class DoStuffMcpServer implements vscode.Disposable {
 
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(port, "127.0.0.1", () => resolve());
+      server.listen(0, "127.0.0.1", () => resolve());
     });
 
+    const addr = server.address() as AddressInfo;
     this.httpServer = server;
-    this.currentPort = port;
+    this.currentPort = addr.port;
+    this.startedFor = normalizeWorkspacePath(ws.path);
+
+    try {
+      pruneRegistry();
+      registerEntry({
+        workspacePath: ws.path,
+        port: addr.port,
+        pid: process.pid,
+        name: ws.name,
+        startedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      this.output.appendLine(
+        `Registry write failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   private async handleHttpRequest(
@@ -777,6 +808,14 @@ export class DoStuffMcpServer implements vscode.Disposable {
     }
     this.httpServer = null;
     this.currentPort = null;
+    this.startedFor = null;
+    try {
+      unregisterEntry(process.pid);
+    } catch (e) {
+      this.output.appendLine(
+        `Registry unregister failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   dispose(): void {

@@ -56,28 +56,33 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | `dostuff.writeStorageGitignore` | boolean | `true` | Write a `.gitignore` inside the storage folder so ticket JSON files stay out of Git even when `.vscode/` is tracked. |
 | `dostuff.autoSave` | boolean | `true` | Persist edits automatically as you type. |
 | `dostuff.mcp.enabled` | boolean | `false` | Run an in-process MCP server that exposes the active ticket queue to local agents. |
-| `dostuff.mcp.port` | number | `3947` | Localhost port the MCP server listens on. Endpoint is `http://127.0.0.1:<port>/mcp`. |
+| `dostuff.mcp.workspaceOverride` | string | `""` | Absolute path to advertise in the multi-workspace registry. Leave blank to use the first workspace folder. Window-scoped. |
 | `dostuff.mcp.instructions` | string | (built-in workflow prompt) | System-level workflow prompt served alongside every ticket. Leave blank to use the default. User-level only. |
 
 ## Using the MCP server
 
-DoStuff runs an HTTP MCP server on `127.0.0.1:<port>` (default `3947`). The endpoint is `/mcp`. It is **disabled by default** — enable it with **DoStuff: Toggle MCP Server** or by setting `dostuff.mcp.enabled: true`.
+DoStuff runs an HTTP MCP server on `127.0.0.1:<port>/mcp`. Each VSCode window binds its **own ephemeral port** (chosen by the OS) and writes a registry entry so agents can discover which port serves which workspace — no port-collision when multiple windows are open. The server is **disabled by default** — enable it with **DoStuff: Toggle MCP Server** or by setting `dostuff.mcp.enabled: true`.
 
 Every tool response includes a `workspace` field (`{ name, rootPath }` or `null`) so agents can immediately verify they are connected to the intended project.
 
-**Multiple workspaces:** only one VSCode window can bind a given port. If you run two workspaces simultaneously with MCP enabled, configure a different `dostuff.mcp.port` in each workspace's settings to avoid the port conflict.
+Look up the port assigned to a window:
+
+- **Status bar**: the `$(plug) DoStuff MCP :<port>` indicator shows the live port.
+- **Registry file**: `~/.config/dostuff/instances.json` (Linux/macOS) or `%APPDATA%/dostuff/instances.json` (Windows) lists every running instance. See [Multi-workspace agent discovery](#multi-workspace-agent-discovery) for the entry shape and the recommended pick-by-cwd algorithm.
 
 ### Pointing a client at it
 
+Because the port is ephemeral, prefer clients that can read the registry file (or accept a command-substituted URL). For clients that need a hard-coded URL, set `dostuff.mcp.workspaceOverride` so you know which window owns which workspace, then paste the port shown in the status bar.
+
 #### VSCode MCP settings (VS Code 1.99+)
 
-Add to your `settings.json` (user or workspace level):
+Read the port from the status bar (or `instances.json`) and paste it into `settings.json`:
 
 ```json
 "dostuff": {
   "servers": {
     "dostuff-ticket": {
-      "url": "http://localhost:3947/mcp",
+      "url": "http://127.0.0.1:<PORT>/mcp",
       "type": "http"
     }
   },
@@ -87,14 +92,14 @@ Add to your `settings.json` (user or workspace level):
 
 #### Claude Code
 
-Add an entry to your `.mcp.json` (or run `claude mcp add`):
+Same — pull the port from the status bar or the registry and add to `.mcp.json` (or run `claude mcp add`):
 
 ```json
 {
   "mcpServers": {
     "dostuff": {
       "type": "streamable-http",
-      "url": "http://127.0.0.1:3947/mcp"
+      "url": "http://127.0.0.1:<PORT>/mcp"
     }
   }
 }
@@ -151,6 +156,24 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 - `dostuff://tickets` — list of active (Planned / Working / Verification) tickets.
 - `dostuff://tickets/{id}` — one active ticket.
 - `dostuff://instructions/workflow` — the workflow prompt.
+
+## Multi-workspace agent discovery
+
+Each VSCode window with DoStuff enabled binds its MCP server to an ephemeral localhost port and registers itself in a user-global file so external agents can discover the right endpoint per workspace.
+
+- Registry file: `~/.config/dostuff/instances.json` on Linux/macOS, `%APPDATA%/dostuff/instances.json` on Windows.
+- Entry shape: `{ "workspacePath": string, "port": number, "pid": number, "name": string, "startedAt": ISO8601 }`. Paths are resolved absolute and lowercased on Windows.
+- Stale entries are pruned automatically on activation (via `process.kill(pid, 0)`) and removed on extension deactivation.
+
+Recommended agent discovery algorithm:
+
+1. Read the registry file. Treat ENOENT and corrupt JSON as an empty list.
+2. Normalize `process.cwd()` the same way (resolve absolute; lowercase on Windows).
+3. Filter entries whose `workspacePath` is a path-prefix of the normalized cwd; pick the longest match.
+4. On a tie, prefer the most recent `startedAt`. If no entry is a prefix and the list has a single entry, fall back to it.
+5. Optionally verify with `process.kill(pid, 0)` before connecting. The MCP endpoint is `http://127.0.0.1:<port>/mcp`.
+
+If the auto-pick is wrong (e.g. you run an agent from a deeply nested cwd that doesn't share a prefix with the workspace root), set `dostuff.mcp.workspaceOverride` on that window to the path you want advertised.
 
 ## Storage
 

@@ -1,5 +1,6 @@
 // Extension entry point — wires up the sidebar provider, board panel, commands, and storage.
 
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { SidebarProvider } from "./sidebarProvider";
@@ -323,12 +324,54 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   // ─── MCP server ───────────────────────────────────────────────────────
-  // mcp-agent fills in DoStuffMcpServer in Wave 3. The stub no-ops cleanly.
-  const mcp = new DoStuffMcpServer(store);
+  // Workspace identity feeds the user-global registry so external agents can
+  // discover which ephemeral port serves which workspace. The override setting
+  // lets the user pin an explicit path when the auto-pick is wrong.
+  const workspaceId = () => {
+    const override = vscode.workspace
+      .getConfiguration("dostuff")
+      .get<string>("mcp.workspaceOverride", "")
+      .trim();
+    if (override) return { path: override, name: path.basename(override) || override };
+    const root = vscode.workspace.workspaceFolders?.[0];
+    if (!root) return null;
+    return { path: root.uri.fsPath, name: root.name };
+  };
+  const mcp = new DoStuffMcpServer(store, workspaceId);
+
+  // Status bar item — reflects MCP enabled/disabled state. Clicking toggles.
+  const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  statusItem.command = "dostuff.mcp.toggle";
+  const refreshStatus = () => {
+    const cfg = vscode.workspace.getConfiguration("dostuff");
+    const enabled = cfg.get<boolean>("mcp.enabled", true);
+    const { port } = mcp.status;
+    if (!enabled) {
+      statusItem.text = `$(circle-slash) DoStuff MCP`;
+      statusItem.tooltip = `MCP server disabled. Click to enable.`;
+    } else if (port) {
+      statusItem.text = `$(plug) DoStuff MCP :${port}`;
+      statusItem.tooltip = `MCP server listening on 127.0.0.1:${port}. Click to disable.`;
+    } else {
+      statusItem.text = `$(plug) DoStuff MCP`;
+      statusItem.tooltip = `MCP server enabled but not listening (no workspace folder?). Click to disable.`;
+    }
+    statusItem.show();
+  };
+  refreshStatus();
+
+  const reconcileMcp = async () => {
+    await mcp.reconcile();
+    refreshStatus();
+  };
   context.subscriptions.push(
     mcp,
+    statusItem,
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("dostuff.mcp")) mcp.reconcile();
+      if (e.affectsConfiguration("dostuff.mcp")) void reconcileMcp();
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void reconcileMcp();
     }),
     vscode.commands.registerCommand("dostuff.mcp.toggle", async () => {
       const cfg = vscode.workspace.getConfiguration("dostuff");
@@ -352,28 +395,7 @@ export async function activate(context: vscode.ExtensionContext) {
       await cfg.update("mcp.instructions", toSave, vscode.ConfigurationTarget.Global);
     }),
   );
-  await mcp.reconcile();
-
-  // Status bar item — reflects MCP enabled/disabled state. Clicking toggles.
-  const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusItem.command = "dostuff.mcp.toggle";
-  const refreshStatus = () => {
-    const cfg = vscode.workspace.getConfiguration("dostuff");
-    const enabled = cfg.get<boolean>("mcp.enabled", true);
-    const port = cfg.get<number>("mcp.port", 3947);
-    statusItem.text = enabled ? `$(plug) DoStuff MCP :${port}` : `$(circle-slash) DoStuff MCP`;
-    statusItem.tooltip = enabled
-      ? `MCP server listening on 127.0.0.1:${port}. Click to disable.`
-      : `MCP server disabled. Click to enable.`;
-    statusItem.show();
-  };
-  refreshStatus();
-  context.subscriptions.push(
-    statusItem,
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("dostuff.mcp")) refreshStatus();
-    }),
-  );
+  await reconcileMcp();
 }
 
 export function deactivate() {}

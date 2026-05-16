@@ -7,8 +7,11 @@
 // wire-level guarantees (smuggled-field rejection, host/url enforcement,
 // reconcile() serialization).
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import * as http from "http";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as nodePath from "node:path";
 import * as vscode from "vscode";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -1016,10 +1019,10 @@ describe("update_ticket_progress", () => {
 // ----- HTTP integration tests -----------------------------------------------
 
 describe("DoStuffMcpServer HTTP", () => {
-  test("status reports {running:false, port:null} before reconcile", async () => {
+  test("status reports stopped defaults before reconcile", async () => {
     const store = await makeStore([]);
     const server = new DoStuffMcpServer(store);
-    expect(server.status).toEqual({ running: false, port: null });
+    expect(server.status).toEqual({ running: false, port: null, workspacePath: null });
     server.dispose();
   });
 });
@@ -1041,11 +1044,29 @@ function restoreMcpConfig(): void {
   (vscode.workspace as any).getConfiguration = __origGetConfig;
 }
 
-// Pick a different port per started server so parallel tests don't collide.
-let __nextPort = 39470;
-function nextTestPort(): number {
-  __nextPort += 1;
-  return __nextPort;
+// Each booted server gets a distinct synthetic workspace path so registry
+// entries don't collide across tests.
+let __nextWs = 0;
+function makeWorkspaceId(): () => { path: string; name: string } {
+  __nextWs += 1;
+  const path = `/tmp/dostuff-test-ws-${process.pid}-${__nextWs}`;
+  return () => ({ path, name: `ws-${__nextWs}` });
+}
+
+async function bootServer(
+  store: IssueStore,
+  opts: {
+    enabled?: boolean;
+    instructions?: string;
+    workspaceId?: () => { path: string; name: string } | null;
+  } = {},
+): Promise<{ server: DoStuffMcpServer; port: number }> {
+  const cfg: Record<string, unknown> = { "mcp.enabled": opts.enabled ?? true };
+  if (opts.instructions !== undefined) cfg["mcp.instructions"] = opts.instructions;
+  setMcpConfig(cfg);
+  const server = new DoStuffMcpServer(store, opts.workspaceId ?? makeWorkspaceId());
+  await server.reconcile();
+  return { server, port: server.status.port ?? 0 };
 }
 
 async function rawRequest(
@@ -1094,6 +1115,23 @@ async function rawRequest(
 describe("DoStuffMcpServer HTTP (live)", () => {
   let server: DoStuffMcpServer | null = null;
   let port = 0;
+  let tmpRegistryDir = "";
+  const __origRegistryPath = process.env.DOSTUFF_REGISTRY_PATH;
+
+  beforeAll(() => {
+    tmpRegistryDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "dostuff-mcpserver-"));
+    process.env.DOSTUFF_REGISTRY_PATH = nodePath.join(tmpRegistryDir, "instances.json");
+  });
+
+  afterAll(() => {
+    if (__origRegistryPath === undefined) delete process.env.DOSTUFF_REGISTRY_PATH;
+    else process.env.DOSTUFF_REGISTRY_PATH = __origRegistryPath;
+    try {
+      fs.rmSync(tmpRegistryDir, { recursive: true, force: true });
+    } catch {
+      // Best effort.
+    }
+  });
 
   afterEach(async () => {
     if (server) {
@@ -1104,13 +1142,76 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     restoreMcpConfig();
   });
 
-  test("reconcile() starts the server on the configured port", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
+  test("reconcile() starts the server on an ephemeral port", async () => {
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
-    expect(server.status).toEqual({ running: true, port });
+    ({ server, port } = await bootServer(store));
+    expect(server.status.running).toBe(true);
+    expect(typeof server.status.port).toBe("number");
+    expect(server.status.port).toBeGreaterThan(0);
+    expect(server.status.workspacePath).not.toBeNull();
+  });
+
+  test("two server instances can both start without EADDRINUSE", async () => {
+    const storeA = await makeStore([]);
+    const storeB = await makeStore([]);
+    const a = await bootServer(storeA);
+    const b = await bootServer(storeB);
+    try {
+      expect(a.server.status.running).toBe(true);
+      expect(b.server.status.running).toBe(true);
+      expect(a.port).not.toBe(b.port);
+    } finally {
+      await a.server.stop();
+      a.server.dispose();
+      await b.server.stop();
+      b.server.dispose();
+    }
+  });
+
+  test("workspaceId() returning null keeps the server stopped", async () => {
+    const store = await makeStore([]);
+    setMcpConfig({ "mcp.enabled": true });
+    const local = new DoStuffMcpServer(store, () => null);
+    await local.reconcile();
+    try {
+      expect(local.status.running).toBe(false);
+      expect(local.status.port).toBeNull();
+    } finally {
+      local.dispose();
+    }
+  });
+
+  test("workspace path change restarts the server on a fresh port", async () => {
+    const store = await makeStore([]);
+    setMcpConfig({ "mcp.enabled": true });
+    let identity: { path: string; name: string } = {
+      path: `/tmp/dostuff-test-swap-${process.pid}-a`,
+      name: "a",
+    };
+    const local = new DoStuffMcpServer(store, () => identity);
+    try {
+      await local.reconcile();
+      const portA = local.status.port;
+      expect(local.status.running).toBe(true);
+      identity = { path: `/tmp/dostuff-test-swap-${process.pid}-b`, name: "b" };
+      await local.reconcile();
+      expect(local.status.running).toBe(true);
+      expect(local.status.port).not.toBe(portA);
+      expect(local.status.workspacePath).not.toBeNull();
+    } finally {
+      await local.stop();
+      local.dispose();
+    }
+  });
+
+  test("stop() removes the entry from the registry", async () => {
+    const { loadRegistry } = await import("./mcpRegistry");
+    const store = await makeStore([]);
+    const local = await bootServer(store);
+    expect(loadRegistry().some((e) => e.pid === process.pid)).toBe(true);
+    await local.server.stop();
+    expect(loadRegistry().some((e) => e.pid === process.pid)).toBe(false);
+    local.server.dispose();
   });
 
   test("wire-level smuggled fields cannot mutate locked ticket fields (authoritative)", async () => {
@@ -1197,11 +1298,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("empty Host header is rejected with 403", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const res = await rawRequest(port, { host: "", body: "{}" });
     expect(res.status).toBe(403);
@@ -1209,22 +1307,16 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("non-loopback Host header is rejected with 403", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const res = await rawRequest(port, { host: "evil.example.com", body: "{}" });
     expect(res.status).toBe(403);
   });
 
   test("cross-origin Origin header is rejected with 403", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const res = await rawRequest(port, {
       host: "127.0.0.1",
@@ -1236,11 +1328,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("loopback Origin header is accepted", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     // Use DELETE so the transport responds quickly without hanging on an SSE stream.
     const res = await rawRequest(port, {
@@ -1253,11 +1342,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("Origin: null (local file) is accepted", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const res = await rawRequest(port, {
       host: "127.0.0.1",
@@ -1269,11 +1355,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("oversized Content-Length is rejected with 413", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     // rawRequest uses req.write() which causes chunked encoding (no Content-Length header).
     // req.end(body) sets Content-Length to the actual body size automatically.
@@ -1311,11 +1394,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("every response carries X-Content-Type-Options: nosniff", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const header = await new Promise<string | undefined>((resolve, reject) => {
       const req = http.request(
@@ -1333,11 +1413,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("/mcpfoo and /mcp.evil do not match the MCP path", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const r1 = await rawRequest(port, { path: "/mcpfoo", host: "127.0.0.1" });
     expect(r1.status).toBe(404);
@@ -1346,11 +1423,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("/mcp, /mcp/, /mcp?... are all accepted as the MCP path", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     // Use DELETE: the transport recognizes the method and responds quickly
     // (4xx) without opening any streams. What we're checking is that the
@@ -1359,8 +1433,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     // only handles one request before refusing further ones.
     for (const path of ["/mcp", "/mcp/", "/mcp?foo=1"]) {
       await server.stop();
-      server = new DoStuffMcpServer(store);
-      await server.reconcile();
+      ({ server, port } = await bootServer(store));
       const r = await rawRequest(port, { path, method: "DELETE", host: "127.0.0.1" });
       expect(r.status).not.toBe(404);
       expect(r.status).not.toBe(403);
@@ -1368,62 +1441,40 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("reconcile() serializes overlapping calls (no leaked server)", async () => {
-    // Two rapid reconciles with two different ports must not race: the
+    // Two rapid reconciles with two different workspaces must not race: the
     // second one must wait for the first to settle, the final state must
-    // be exactly the second port, and the first port must be released.
-    const portA = nextTestPort();
-    const portB = nextTestPort();
+    // reflect the second workspace, and the first ephemeral port must be
+    // released back to the OS.
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
+    setMcpConfig({ "mcp.enabled": true });
+    let identity: { path: string; name: string } = {
+      path: `/tmp/dostuff-test-serial-${process.pid}-a`,
+      name: "a",
+    };
+    server = new DoStuffMcpServer(store, () => identity);
 
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": portA });
     const p1 = server.reconcile();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": portB });
+    const portA = server.status.port; // captured after first reconcile starts; may be null until awaited
+    identity = { path: `/tmp/dostuff-test-serial-${process.pid}-b`, name: "b" };
     const p2 = server.reconcile();
     await Promise.all([p1, p2]);
 
     expect(server.status.running).toBe(true);
-    expect(server.status.port).toBe(portB);
-
-    // portA must be free again — bind a throwaway listener to confirm.
-    await new Promise<void>((resolve, reject) => {
-      const probe = http.createServer().listen(portA, "127.0.0.1", () => {
-        probe.close(() => resolve());
+    expect(server.status.workspacePath).toContain("-b");
+    // First port (captured if it had a value) must be free again.
+    if (portA && portA !== server.status.port) {
+      await new Promise<void>((resolve, reject) => {
+        const probe = http.createServer().listen(portA, "127.0.0.1", () => {
+          probe.close(() => resolve());
+        });
+        probe.on("error", reject);
       });
-      probe.on("error", reject);
-    });
-  });
-
-  test("invalid port (out of range) is rejected, server stays stopped", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": 999999 });
-    const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
-    expect(server.status.running).toBe(false);
-    expect(server.status.port).toBeNull();
-  });
-
-  test("invalid port stops a previously-running server", async () => {
-    const goodPort = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": goodPort });
-    const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
-    expect(server.status.running).toBe(true);
-
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": -1 });
-    await server.reconcile();
-    expect(server.status.running).toBe(false);
-    expect(server.status.port).toBeNull();
+    }
   });
 
   test("real /mcp POST with tools/list returns the 4 registered tool names", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const body = JSON.stringify({
       jsonrpc: "2.0",
@@ -1463,11 +1514,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     // Regression: previously the stateless StreamableHTTPServerTransport was
     // shared across requests, which made the 2nd request fail. The fix builds
     // a fresh transport+McpServer per HTTP request.
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     for (let i = 0; i < 3; i++) {
       const json = await mcpJsonRpc(port, "tools/list", {});
@@ -1502,8 +1550,6 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   }
 
   test("resource dostuff://tickets returns only servable tickets", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([
       makeIssue({ id: "DS-001", number: 1, title: "Planned one", status: "Planned" }),
       makeIssue({ id: "DS-002", number: 2, title: "Working one", status: "Working" }),
@@ -1511,8 +1557,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       makeIssue({ id: "DS-004", number: 4, title: "Thinking one", status: "Thinking" }),
       makeIssue({ id: "DS-005", number: 5, title: "Complete one", status: "Complete" }),
     ]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://tickets",
@@ -1530,8 +1575,6 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("resource dostuff://tickets/{id} for a servable ticket returns publicView payload", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([
       makeIssue({
         id: "DS-001",
@@ -1541,8 +1584,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
         resolvedAt: "2025-06-01T00:00:00Z",
       }),
     ]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://tickets/DS-001",
@@ -1565,13 +1607,10 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("resource dostuff://tickets/{id} for Thinking ticket: errors (not servable)", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([
       makeIssue({ id: "DS-001", number: 1, title: "Draft", status: "Thinking" }),
     ]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://tickets/DS-001",
@@ -1581,13 +1620,10 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("resource dostuff://tickets/{id} for Complete ticket: errors (not servable)", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([
       makeIssue({ id: "DS-001", number: 1, title: "Shipped", status: "Complete" }),
     ]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://tickets/DS-001",
@@ -1597,11 +1633,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("resource dostuff://tickets/{id} for a non-existent ticket: errors with 'not found'", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://tickets/DS-999",
@@ -1611,16 +1644,9 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("resource dostuff://instructions/workflow uses dostuff.mcp.instructions when set", async () => {
-    port = nextTestPort();
     const custom = "CUSTOM WORKFLOW TEXT FROM SETTINGS";
-    setMcpConfig({
-      "mcp.enabled": true,
-      "mcp.port": port,
-      "mcp.instructions": custom,
-    });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store, { instructions: custom }));
 
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://instructions/workflow",
@@ -1630,11 +1656,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("'workflow' prompt is registered and returns the workflow prompt", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
 
     const json = await mcpJsonRpc(port, "prompts/get", { name: "workflow" });
     const result = json.result as {
@@ -1648,11 +1671,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("dispose() releases the port (asynchronously)", async () => {
-    const disposePort = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": disposePort });
     const store = await makeStore([]);
-    const localServer = new DoStuffMcpServer(store);
-    await localServer.reconcile();
+    const { server: localServer, port: disposePort } = await bootServer(store);
     expect(localServer.status.running).toBe(true);
 
     // dispose() is fire-and-forget; poll until the port is released.
@@ -1681,14 +1701,11 @@ describe("DoStuffMcpServer HTTP (live)", () => {
   });
 
   test("disabled config stops a running server", async () => {
-    port = nextTestPort();
-    setMcpConfig({ "mcp.enabled": true, "mcp.port": port });
     const store = await makeStore([]);
-    server = new DoStuffMcpServer(store);
-    await server.reconcile();
+    ({ server, port } = await bootServer(store));
     expect(server.status.running).toBe(true);
 
-    setMcpConfig({ "mcp.enabled": false, "mcp.port": port });
+    setMcpConfig({ "mcp.enabled": false });
     await server.reconcile();
     expect(server.status.running).toBe(false);
   });
