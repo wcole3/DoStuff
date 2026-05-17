@@ -43,8 +43,11 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 - New tickets always start in **Thinking** for human triage.
 - Only humans can promote a ticket from Thinking to Planned. Agents cannot.
 - Tickets move freely between Planned, Working, and Verification.
-- Only humans can move a ticket to **Complete** (via the UI).
+- Only humans can move a ticket to **Complete** or **Closed** (via the UI).
 - Active lanes (Planned, Working, Verification) are each capped at 6 open tickets. This is a workflow throttle: finish or de-scope before starting more work.
+- **Closed** is a "won't do" state. It lives only in the sidebar (no board lane/drawer), is hidden under the **All** filter, and is reachable via its dedicated filter chip.
+- **Tags** are free-form labels (like Jira labels) edited in the issue detail panel. They show as colored chips on sidebar rows and board cards; once a row runs out of space the extras collapse to colored dots. Tag colors are derived from the tag name — no per-tag setup. Both the sidebar search and the board drawer filter match against tag substrings.
+- **Links in descriptions and verify-criteria are clickable.** Bare `http(s)://`, `file:///`, and `mailto:` URLs are detected automatically, along with workspace-relative `./path/to/file` references. External links open in your default browser; file links and relative paths open in VSCode.
 
 ## Keyboard shortcuts
 

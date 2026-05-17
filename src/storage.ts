@@ -6,6 +6,7 @@
 
 import * as vscode from "vscode";
 import {
+  coerceTags,
   isPriority,
   isStatus,
   isType,
@@ -61,6 +62,7 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       record: Array.isArray((issue as any).record) ? (issue as any).record : [],
       statusHistory: Array.isArray(issue.statusHistory) ? issue.statusHistory : [],
       tasks: Array.isArray(issue.tasks) ? issue.tasks : [],
+      tags: coerceTags((issue as any).tags),
       resolvedAt: issue.resolvedAt ?? null,
     },
     coerced,
@@ -231,25 +233,30 @@ export class IssueStore {
     try {
       entries = await vscode.workspace.fs.readDirectory(dir);
     } catch { return []; }
-    const out: Issue[] = [];
-    for (const [name, kind] of entries) {
-      if (kind !== vscode.FileType.File || !name.endsWith(".json")) continue;
-      try {
-        const buf = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, name));
-        const txt = new TextDecoder().decode(buf);
-        const obj = JSON.parse(txt) as Issue;
-        if (obj && obj.id && obj.title) {
-          const { issue, coerced } = normalize(obj);
-          if (coerced.length) {
-            this.appendLog(`Coerced fields on ${issue.id} (${name}): ${coerced.join(", ")}`);
+
+    const decoder = new TextDecoder();
+    // Read every ticket JSON concurrently; per-file readFile is the dominant
+    // cost on cold start and the FS provider handles parallel reads fine.
+    const loaded = await Promise.all(
+      entries
+        .filter(([name, kind]) => kind === vscode.FileType.File && name.endsWith(".json"))
+        .map(async ([name]): Promise<Issue | null> => {
+          try {
+            const buf = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(dir, name));
+            const obj = JSON.parse(decoder.decode(buf)) as Issue;
+            if (!obj || !obj.id || !obj.title) return null;
+            const { issue, coerced } = normalize(obj);
+            if (coerced.length) {
+              this.appendLog(`Coerced fields on ${issue.id} (${name}): ${coerced.join(", ")}`);
+            }
+            return issue;
+          } catch (e) {
+            this.appendLog(`Failed to parse ${name}: ${(e as Error).message}`);
+            return null;
           }
-          out.push(issue);
-        }
-      } catch (e) {
-        this.appendLog(`Failed to parse ${name}: ${(e as Error).message}`);
-      }
-    }
-    return out;
+        }),
+    );
+    return loaded.filter((i): i is Issue => i !== null);
   }
 
   private async writeFile(issue: Issue): Promise<void> {

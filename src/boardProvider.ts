@@ -31,6 +31,7 @@ export class BoardPanel {
     extensionUri: vscode.Uri,
     store: IssueStore,
     applyUpdate: ApplyIssueUpdate,
+    openLink: (url: string) => void | Promise<void> = () => {},
   ) {
     if (BoardPanel.current) {
       // Reveal in its current column — don't move the panel if the user has
@@ -51,7 +52,7 @@ export class BoardPanel {
       }
     );
 
-    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate);
+    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate, openLink);
   }
 
   /** Re-broadcast current truth to the live board panel, if any. */
@@ -82,6 +83,7 @@ export class BoardPanel {
     extensionUri: vscode.Uri,
     private readonly store: IssueStore,
     private readonly applyUpdate: ApplyIssueUpdate,
+    private readonly openLink: (url: string) => void | Promise<void> = () => {},
   ) {
     this.panel = panel;
     this.panel.iconPath = vscode.Uri.joinPath(extensionUri, "media", "icon.svg");
@@ -143,6 +145,15 @@ export class BoardPanel {
       case "exportJson":
         vscode.commands.executeCommand("dostuff.exportJson");
         break;
+      case "openLink": {
+        const url = (msg as { url?: unknown }).url;
+        if (typeof url !== "string" || url.length === 0 || url.length > 4096) {
+          this.output.appendLine(`Rejected openLink: bad url`);
+          break;
+        }
+        await this.openLink(url);
+        break;
+      }
       // The board view ignores message types only the sidebar handles
       // (e.g. "createIssue", "openBoard", "openSettings"). Log + drop.
       default: {

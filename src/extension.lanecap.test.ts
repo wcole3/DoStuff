@@ -46,6 +46,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     status: overrides.status ?? ("Planned" as Status),
     description: overrides.description ?? "",
     tasks: overrides.tasks ?? [],
+    tags: overrides.tags ?? [],
     verifyCriteria: overrides.verifyCriteria ?? "",
     createdAt: at,
     resolvedAt: overrides.resolvedAt ?? null,

@@ -5,10 +5,12 @@ import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
-import { DEFAULT_WORKFLOW_PROMPT, DoStuffMcpServer } from "./mcpServer";
+import { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
+import type { DoStuffMcpServer } from "./mcpServer";
 import {
   ACTIVE_LANE_CAP,
   canMoveToActiveLane,
+  coerceTags,
   isPriority,
   isStatus,
   isType,
@@ -56,6 +58,7 @@ export function mergeIssueUpdate(
     description:    typeof incoming.description === "string" ? incoming.description : prior.description,
     verifyCriteria: typeof incoming.verifyCriteria === "string" ? incoming.verifyCriteria : prior.verifyCriteria,
     tasks:          Array.isArray(incoming.tasks) ? incoming.tasks : prior.tasks,
+    tags:           Array.isArray(incoming.tags) ? coerceTags(incoming.tags) : prior.tags,
     type:           incoming.type ?? prior.type,
     priority:       incoming.priority ?? prior.priority,
     status:         incoming.status ?? prior.status,
@@ -110,6 +113,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       description: typeof e.description === "string" ? e.description : "",
       verifyCriteria: typeof e.verifyCriteria === "string" ? e.verifyCriteria : "",
       tasks: Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [],
+      tags: coerceTags(e.tags),
       createdAt: e.createdAt,
       resolvedAt: typeof e.resolvedAt === "string" ? e.resolvedAt : null,
       statusHistory: Array.isArray(e.statusHistory)
@@ -132,9 +136,14 @@ export function activeLaneOverflow(set: Issue[], cap = ACTIVE_LANE_CAP): Array<{
   return out;
 }
 
-export async function activate(context: vscode.ExtensionContext) {
+export function activate(context: vscode.ExtensionContext) {
   const store = new IssueStore(context);
-  await store.init();
+  // Hydrate the store in the background. The webview shows its "Loading…"
+  // state until the first store.onChange fires; awaiting here would gate
+  // every other activation step on disk I/O for ticket files.
+  void store.init().catch((e) => {
+    console.error("[DoStuff] store.init failed:", e);
+  });
 
   /**
    * Host-side issue update handler. Single chokepoint for any path that
@@ -188,7 +197,7 @@ export async function activate(context: vscode.ExtensionContext) {
       // Open the board if the user starts a drag with no board panel
       // visible — without it there'd be nowhere for the lanes to light up.
       if (!BoardPanel.isOpen()) {
-        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate);
+        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink);
       }
       BoardPanel.signalExternalDrag(issueId);
     },
@@ -197,7 +206,53 @@ export async function activate(context: vscode.ExtensionContext) {
     },
   };
 
-  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag);
+  /**
+   * Open a description link. Web URLs route to the system browser via
+   * `openExternal`. File-scoped URLs and workspace-relative paths open a
+   * document in VSCode. Everything else is rejected to avoid exotic URI
+   * schemes triggering side effects.
+   */
+  const openLink = async (url: string): Promise<void> => {
+    const trimmed = url.trim();
+    if (!trimmed) return;
+    let parsed: vscode.Uri;
+    try {
+      // Workspace-relative shorthand like "./docs/x.md" or "/abs/file.md".
+      if (trimmed.startsWith("./") || trimmed.startsWith("../") || trimmed.startsWith("/")) {
+        const root = vscode.workspace.workspaceFolders?.[0];
+        const base = root?.uri;
+        const target = trimmed.startsWith("/")
+          ? vscode.Uri.file(trimmed)
+          : base
+            ? vscode.Uri.joinPath(base, ...trimmed.split("/").filter(Boolean))
+            : null;
+        if (!target) {
+          vscode.window.showWarningMessage(
+            "DoStuff: cannot resolve relative link without an open workspace folder.",
+          );
+          return;
+        }
+        await vscode.commands.executeCommand("vscode.open", target);
+        return;
+      }
+      parsed = vscode.Uri.parse(trimmed, true);
+    } catch {
+      vscode.window.showWarningMessage(`DoStuff: not a valid link: ${trimmed}`);
+      return;
+    }
+    const scheme = parsed.scheme.toLowerCase();
+    if (scheme === "http" || scheme === "https" || scheme === "mailto") {
+      await vscode.env.openExternal(parsed);
+      return;
+    }
+    if (scheme === "file" || scheme === "vscode") {
+      await vscode.commands.executeCommand("vscode.open", parsed);
+      return;
+    }
+    vscode.window.showWarningMessage(`DoStuff: link scheme "${scheme}" is not supported.`);
+  };
+
+  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink);
 
   context.subscriptions.push(
     sidebar,
@@ -206,7 +261,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("dostuff.openBoard", () => {
-      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate);
+      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink);
     }),
 
     vscode.commands.registerCommand("dostuff.newIssue", () => {
@@ -351,7 +406,23 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!root) return null;
     return { path: root.uri.fsPath, name: root.name };
   };
-  const mcp = new DoStuffMcpServer(store, workspaceId);
+  // Lazy-construct the MCP server so the heavy SDK + zod module isn't
+  // parsed during activate(). First call to reconcileMcp() awaits the
+  // dynamic import; subsequent calls reuse the cached instance.
+  let mcp: DoStuffMcpServer | null = null;
+  let mcpLoadPromise: Promise<DoStuffMcpServer> | null = null;
+  const ensureMcp = (): Promise<DoStuffMcpServer> => {
+    if (mcp) return Promise.resolve(mcp);
+    if (!mcpLoadPromise) {
+      mcpLoadPromise = import("./mcpServer").then((m) => {
+        const instance = new m.DoStuffMcpServer(store, workspaceId);
+        mcp = instance;
+        context.subscriptions.push(instance);
+        return instance;
+      });
+    }
+    return mcpLoadPromise;
+  };
 
   // Status bar item — reflects MCP enabled/disabled state. Clicking toggles.
   const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -359,7 +430,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const refreshStatus = () => {
     const cfg = vscode.workspace.getConfiguration("dostuff");
     const enabled = cfg.get<boolean>("mcp.enabled", true);
-    const { port } = mcp.status;
+    const port = mcp?.status.port ?? null;
     if (!enabled) {
       statusItem.text = `$(circle-slash) DoStuff MCP`;
       statusItem.tooltip = `MCP server disabled. Click to enable.`;
@@ -375,11 +446,11 @@ export async function activate(context: vscode.ExtensionContext) {
   refreshStatus();
 
   const reconcileMcp = async () => {
-    await mcp.reconcile();
+    const instance = await ensureMcp();
+    await instance.reconcile();
     refreshStatus();
   };
   context.subscriptions.push(
-    mcp,
     statusItem,
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("dostuff.mcp")) void reconcileMcp();
@@ -409,7 +480,7 @@ export async function activate(context: vscode.ExtensionContext) {
       await cfg.update("mcp.instructions", toSave, vscode.ConfigurationTarget.Global);
     }),
     vscode.commands.registerCommand("dostuff.mcp.pinPort", async () => {
-      const port = mcp.status.port;
+      const port = mcp?.status.port ?? null;
       if (!port) {
         vscode.window.showWarningMessage(
           "DoStuff MCP server is not running -- enable it before pinning.",
@@ -439,7 +510,9 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }),
   );
-  await reconcileMcp();
+  // Fire-and-forget so the extension is marked active before the MCP SDK
+  // dynamic import + port bind + registry write resolve (~50–200 ms).
+  void reconcileMcp();
 }
 
 export function deactivate() {}

@@ -206,6 +206,26 @@ describe("Drawer search + filter", () => {
     expect(screen.queryByText("Beta task")).toBeNull();
   });
 
+  test("thinking drawer cards render tag chips when the ticket has tags", () => {
+    const tagged = makeIssue({
+      id: "DS-050",
+      title: "Idea with tags",
+      status: "Thinking",
+      tags: ["frontend"],
+    });
+    render(<Board />);
+    pushInit([tagged]);
+
+    const drawerBtn = document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement;
+    fireEvent.click(drawerBtn);
+
+    const card = document.querySelector(".bd-drawer-card") as HTMLElement;
+    expect(card).not.toBeNull();
+    const chip = card.querySelector(".ds-tag-chip");
+    expect(chip).not.toBeNull();
+    expect(chip!.textContent).toBe("frontend");
+  });
+
   test("closing the Thinking drawer resets filter query", () => {
     const a = makeIssue({ id: "DS-011", title: "Gamma issue", status: "Thinking" });
     render(<Board />);

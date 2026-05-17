@@ -86,6 +86,101 @@ describe("Sidebar", () => {
     expect(screen.queryByText("Shipped already")).not.toBeNull();
   });
 
+  test("Closed tickets hidden by default under the 'All' filter", () => {
+    const planned = makeIssue({ id: "DS-001", title: "Plan me", status: "Planned" });
+    const closed = makeIssue({ id: "DS-002", title: "Wont do this", status: "Closed" });
+    render(<Sidebar />);
+    pushInit([planned, closed]);
+
+    expect(screen.queryByText("Plan me")).not.toBeNull();
+    expect(screen.queryByText("Wont do this")).toBeNull();
+  });
+
+  test("type filter dropdown narrows to one issue type", async () => {
+    const bug = makeIssue({ id: "DS-001", title: "Squash it", status: "Planned", type: "Bug" });
+    const feature = makeIssue({
+      id: "DS-002",
+      title: "Ship it",
+      status: "Planned",
+      type: "Feature",
+    });
+    render(<Sidebar />);
+    pushInit([bug, feature]);
+
+    const typeSelect = screen.getByTitle("Filter by type") as HTMLSelectElement;
+    await userEvent.selectOptions(typeSelect, "Bug");
+
+    expect(screen.queryByText("Squash it")).not.toBeNull();
+    expect(screen.queryByText("Ship it")).toBeNull();
+  });
+
+  test("priority filter dropdown narrows to one priority", async () => {
+    const crit = makeIssue({
+      id: "DS-001",
+      title: "Urgent thing",
+      status: "Planned",
+      priority: "Critical",
+    });
+    const low = makeIssue({
+      id: "DS-002",
+      title: "Nice to have",
+      status: "Planned",
+      priority: "Low",
+    });
+    render(<Sidebar />);
+    pushInit([crit, low]);
+
+    const prioSelect = screen.getByTitle("Filter by priority") as HTMLSelectElement;
+    await userEvent.selectOptions(prioSelect, "Critical");
+
+    expect(screen.queryByText("Urgent thing")).not.toBeNull();
+    expect(screen.queryByText("Nice to have")).toBeNull();
+  });
+
+  test("alphabetical sort orders by title", async () => {
+    const c = makeIssue({ id: "DS-001", title: "Charlie", status: "Planned" });
+    const a = makeIssue({ id: "DS-002", title: "Alpha", status: "Planned" });
+    const b = makeIssue({ id: "DS-003", title: "Bravo", status: "Planned" });
+    render(<Sidebar />);
+    pushInit([c, a, b]);
+
+    const sortSelect = screen.getByTitle("Sort order") as HTMLSelectElement;
+    await userEvent.selectOptions(sortSelect, "alphabetical");
+
+    const titles = screen
+      .getAllByText(/^(Alpha|Bravo|Charlie)$/)
+      .map((el) => el.textContent);
+    expect(titles).toEqual(["Alpha", "Bravo", "Charlie"]);
+  });
+
+  test("search matches against tag substrings", async () => {
+    const a = makeIssue({ id: "DS-001", title: "First", status: "Planned", tags: ["frontend"] });
+    const b = makeIssue({ id: "DS-002", title: "Second", status: "Planned", tags: ["api"] });
+    render(<Sidebar />);
+    pushInit([a, b]);
+
+    const input = screen.getByPlaceholderText(/search issues/i);
+    await userEvent.type(input, "front");
+    expect(screen.queryByText("First")).not.toBeNull();
+    expect(screen.queryByText("Second")).toBeNull();
+  });
+
+  test("clicking the 'Closed' status chip reveals only Closed tickets", async () => {
+    const planned = makeIssue({ id: "DS-001", title: "Plan me", status: "Planned" });
+    const closed = makeIssue({ id: "DS-002", title: "Wont do this", status: "Closed" });
+    render(<Sidebar />);
+    pushInit([planned, closed]);
+
+    expect(screen.queryByText("Wont do this")).toBeNull();
+    const chip = screen
+      .getAllByRole("button")
+      .find((b) => /^Closed\s*\d+$/.test(b.textContent ?? ""))!;
+    await userEvent.click(chip);
+
+    expect(screen.queryByText("Wont do this")).not.toBeNull();
+    expect(screen.queryByText("Plan me")).toBeNull();
+  });
+
   test("clicking the 'Planned' status chip filters to Planned only", async () => {
     const planned = makeIssue({ id: "DS-001", title: "Plan me", status: "Planned" });
     const working = makeIssue({ id: "DS-002", title: "Crank on it", status: "Working" });

@@ -3,7 +3,7 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import { isPriority, isType, type Issue, type Settings, type WebviewToHost } from "./types";
+import { coerceTags, isPriority, isType, type Issue, type Settings, type WebviewToHost } from "./types";
 
 /**
  * Host-supplied handler for "updateIssue" messages. Owns the statusHistory
@@ -46,6 +46,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     private readonly store: IssueStore,
     private readonly applyUpdate: ApplyIssueUpdate,
     private readonly externalDrag: ExternalDragSignals = { onStart: () => {}, onEnd: () => {} },
+    private readonly openLink: (url: string) => void | Promise<void> = () => {},
   ) {
     this.output = vscode.window.createOutputChannel("DoStuff Webview");
     this.disposables.push(this.output);
@@ -134,6 +135,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           description: typeof partial.description === "string" ? partial.description : "",
           verifyCriteria: typeof partial.verifyCriteria === "string" ? partial.verifyCriteria : "",
           tasks: Array.isArray(partial.tasks) ? partial.tasks : [],
+          tags: coerceTags((partial as { tags?: unknown }).tags),
           createdAt: now,
           resolvedAt: null,
           statusHistory: [{ status, at: now, by: "user" }],
@@ -184,6 +186,15 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
       case "externalDragEnd":
         this.externalDrag.onEnd();
         break;
+      case "openLink": {
+        const url = (msg as { url?: unknown }).url;
+        if (typeof url !== "string" || url.length === 0 || url.length > 4096) {
+          this.output.appendLine(`Rejected openLink: bad url`);
+          break;
+        }
+        await this.openLink(url);
+        break;
+      }
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;

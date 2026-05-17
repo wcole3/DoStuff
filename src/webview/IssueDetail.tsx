@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   PRIORITIES,
   STATUSES,
@@ -10,7 +10,79 @@ import {
   type Status,
 } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
-import { newTaskId, postDeleteIssue, postUpdateIssue, useIssues } from "./messaging";
+import {
+  newTaskId,
+  postDeleteIssue,
+  postOpenLink,
+  postUpdateIssue,
+  useIssues,
+} from "./messaging";
+import { TagEditor } from "./Tags";
+
+// Match http(s)/file/mailto URLs and workspace-relative paths starting with
+// ./ or ../ (must include a non-whitespace tail). Captured group is the URL
+// itself; trailing punctuation is stripped at render time.
+const LINK_RE =
+  /\b(?:https?:\/\/|file:\/\/\/|mailto:)\S+|(?:^|\s)(\.{1,2}\/[\w./~-]+)/g;
+
+/**
+ * Linkify a text body. Splits on URLs and returns alternating text + anchor
+ * segments. Clicking an anchor posts an `openLink` message to the host, which
+ * routes to vscode.env.openExternal for http(s) and vscode.open for files.
+ */
+export function LinkedText({ text }: { text: string }): JSX.Element {
+  const segments: Array<{ kind: "text" | "link"; value: string }> = [];
+  let lastIndex = 0;
+  LINK_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = LINK_RE.exec(text)) !== null) {
+    const raw = match[0];
+    // For the relative-path branch the capture group is offset by a leading
+    // whitespace; the visible link is in match[1]. Adjust the start index so
+    // the leading whitespace falls into the text segment.
+    const linkText = match[1] ?? raw;
+    const linkStart = match[1] !== undefined ? match.index + raw.length - linkText.length : match.index;
+    if (linkStart > lastIndex) {
+      segments.push({ kind: "text", value: text.slice(lastIndex, linkStart) });
+    }
+    // Strip a single trailing punctuation char so URLs in prose don't trail with `,` or `.`.
+    let url = linkText;
+    let trailing = "";
+    while (url.length > 1 && /[),.;:!?]/.test(url[url.length - 1])) {
+      trailing = url[url.length - 1] + trailing;
+      url = url.slice(0, -1);
+    }
+    segments.push({ kind: "link", value: url });
+    if (trailing) segments.push({ kind: "text", value: trailing });
+    lastIndex = match.index + raw.length;
+  }
+  if (lastIndex < text.length) {
+    segments.push({ kind: "text", value: text.slice(lastIndex) });
+  }
+  if (segments.length === 0) return <>{text}</>;
+  return (
+    <>
+      {segments.map((seg, i) =>
+        seg.kind === "link" ? (
+          <a
+            key={i}
+            href={seg.value}
+            className="ds-d-link"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              postOpenLink(seg.value);
+            }}
+          >
+            {seg.value}
+          </a>
+        ) : (
+          <span key={i}>{seg.value}</span>
+        ),
+      )}
+    </>
+  );
+}
 
 export function relTime(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -44,6 +116,22 @@ interface IssueDetailProps {
 
 export function IssueDetail({ issue }: IssueDetailProps) {
   const { issues } = useIssues();
+  // Unique tags across every ticket in the store, sorted for stable
+  // datalist ordering. Cheap O(N tags) and recomputes only when the issue
+  // list shifts. Used as TagEditor autocomplete suggestions.
+  const tagSuggestions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const i of issues) {
+      for (const t of i.tags) {
+        const key = t.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(t);
+      }
+    }
+    return out.sort((a, b) => a.localeCompare(b));
+  }, [issues]);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingDesc, setEditingDesc] = useState(false);
   const [editingVerify, setEditingVerify] = useState(false);
@@ -85,6 +173,7 @@ export function IssueDetail({ issue }: IssueDetailProps) {
 
   const setPriority = (p: Priority) => postUpdateIssue({ ...issue, priority: p });
   const setType = (t: IssueType) => postUpdateIssue({ ...issue, type: t });
+  const setTags = (tags: string[]) => postUpdateIssue({ ...issue, tags });
 
   const toggleTask = (taskId: string) => {
     postUpdateIssue({
@@ -210,6 +299,11 @@ export function IssueDetail({ issue }: IssueDetailProps) {
       </div>
 
       <div>
+        <div className="ds-d-section-h">Tags</div>
+        <TagEditor tags={issue.tags} onChange={setTags} suggestions={tagSuggestions} />
+      </div>
+
+      <div>
         <div className="ds-d-section-h">Description</div>
         {editingDesc ? (
           <textarea
@@ -222,7 +316,11 @@ export function IssueDetail({ issue }: IssueDetailProps) {
           />
         ) : (
           <div className="ds-d-prose" onClick={() => setEditingDesc(true)} title="Click to edit">
-            {issue.description || <span style={{ opacity: 0.4 }}>No description. Click to add.</span>}
+            {issue.description ? (
+              <LinkedText text={issue.description} />
+            ) : (
+              <span style={{ opacity: 0.4 }}>No description. Click to add.</span>
+            )}
           </div>
         )}
       </div>
@@ -280,7 +378,11 @@ export function IssueDetail({ issue }: IssueDetailProps) {
             onClick={() => setEditingVerify(true)}
             title="Click to edit"
           >
-            {issue.verifyCriteria || <span style={{ opacity: 0.4 }}>No criteria yet. Click to add.</span>}
+            {issue.verifyCriteria ? (
+              <LinkedText text={issue.verifyCriteria} />
+            ) : (
+              <span style={{ opacity: 0.4 }}>No criteria yet. Click to add.</span>
+            )}
           </div>
         )}
       </div>

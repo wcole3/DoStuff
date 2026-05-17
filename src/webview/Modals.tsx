@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   PRIORITIES,
   TYPES,
@@ -8,7 +8,8 @@ import {
   type Task,
 } from "../types";
 import { Icon } from "./Icons";
-import { newTaskId, postCreateIssue, postDeleteIssue } from "./messaging";
+import { newTaskId, postCreateIssue, postDeleteIssue, useIssues } from "./messaging";
+import { TagEditor } from "./Tags";
 
 interface ModalProps {
   title: string;
@@ -49,13 +50,32 @@ interface AddIssueModalProps {
 }
 
 export function AddIssueModal({ onClose }: AddIssueModalProps) {
+  const { issues } = useIssues();
   const [title, setTitle] = useState("");
   const [type, setType] = useState<IssueType>("Bug");
   const [priority, setPriority] = useState<Priority>("Regular");
   const [description, setDescription] = useState("");
   const [verifyCriteria, setVerifyCriteria] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [tags, setTags] = useState<string[]>([]);
   const newTaskInputRef = useRef<HTMLInputElement>(null);
+
+  // Unique tags across every ticket, sorted alphabetically — feeds the
+  // TagEditor datalist so the user picks an existing tag instead of
+  // typo-introducing a near-duplicate.
+  const tagSuggestions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const i of issues) {
+      for (const t of i.tags) {
+        const key = t.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(t);
+      }
+    }
+    return out.sort((a, b) => a.localeCompare(b));
+  }, [issues]);
 
   const addTask = () => {
     setTasks((prev) => [...prev, { id: newTaskId(), text: "", done: false }]);
@@ -79,6 +99,7 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
       verifyCriteria,
       status: "Thinking",
       tasks: tasks.filter((t) => t.text.trim()).map((t) => ({ ...t, text: t.text.trim() })),
+      tags,
     });
     onClose();
   };
@@ -147,6 +168,10 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
               ))}
             </select>
           </label>
+        </div>
+        <div className="ds-form-row">
+          <span>Tags</span>
+          <TagEditor tags={tags} onChange={setTags} suggestions={tagSuggestions} />
         </div>
         <label className="ds-form-row">
           <span>Description</span>

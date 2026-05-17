@@ -178,6 +178,10 @@ export function postExternalDragEnd(): void {
   vscodeApi.postMessage({ type: "externalDragEnd" });
 }
 
+export function postOpenLink(url: string): void {
+  vscodeApi.postMessage({ type: "openLink", url });
+}
+
 /**
  * Clear the local "external drag in progress" state without a host
  * round-trip. Used by the board after committing a move so the lane pick

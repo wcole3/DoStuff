@@ -1,10 +1,20 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { FixedSizeList, type ListChildComponentProps } from "react-window";
-import { STATUSES, type Issue, type Status } from "../types";
+import {
+  PRIORITIES,
+  STATUSES,
+  TYPES,
+  type Issue,
+  type IssueType,
+  type Priority,
+  type Status,
+} from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, absTime, relTime } from "./IssueDetail";
+import { TagStrip } from "./Tags";
 import { postExternalDragEnd, postExternalDragStart, useIssues } from "./messaging";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
+import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
 
 /**
  * Fixed slot size per row. Sized to fit a two-line title plus the meta line
@@ -115,6 +125,12 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
             <span className="ds-row-date" title={absTime(issue.createdAt)}>
               {relTime(issue.createdAt)}
             </span>
+            {issue.tags.length > 0 && (
+              <>
+                <span className="ds-row-dot">·</span>
+                <TagStrip tags={issue.tags} />
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -149,6 +165,9 @@ export function Sidebar() {
   const [query, setQuery] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("All");
+  const [typeFilter, setTypeFilter] = useState<IssueType | "All">("All");
+  const [priorityFilter, setPriorityFilter] = useState<Priority | "All">("All");
+  const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT);
   const [showCompleted, setShowCompleted] = useState(false);
   const [modal, setModal] = useState<"add" | { kind: "delete"; issue: Issue } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -162,12 +181,17 @@ export function Sidebar() {
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return issues
+    const matched = issues
       .filter((i) => {
         if (statusFilter !== "All") return i.status === statusFilter;
+        // "All" hides Closed entirely (only visible by selecting the Closed
+        // chip) and hides Complete unless the user has opted in.
+        if (i.status === "Closed") return false;
         if (i.status === "Complete") return showCompleted;
         return VISIBLE_BY_DEFAULT.includes(i.status);
       })
+      .filter((i) => typeFilter === "All" || i.type === typeFilter)
+      .filter((i) => priorityFilter === "All" || i.priority === priorityFilter)
       .filter((i) => {
         if (!q) return true;
         return (
@@ -176,11 +200,12 @@ export function Sidebar() {
           i.description.toLowerCase().includes(q) ||
           i.type.toLowerCase().includes(q) ||
           i.priority.toLowerCase().includes(q) ||
-          i.status.toLowerCase().includes(q)
+          i.status.toLowerCase().includes(q) ||
+          i.tags.some((t) => t.toLowerCase().includes(q))
         );
-      })
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  }, [issues, query, statusFilter, showCompleted]);
+      });
+    return sortIssues(matched, sortKey);
+  }, [issues, query, statusFilter, typeFilter, priorityFilter, sortKey, showCompleted]);
 
   const expandedIssue = expandedId ? issues.find((i) => i.id === expandedId) ?? null : null;
 
@@ -262,6 +287,47 @@ export function Sidebar() {
           />
           Show completed
         </label>
+      </div>
+
+      <div className="ds-sb-controls">
+        <select
+          className="ds-sb-select"
+          value={typeFilter}
+          onChange={(e) => setTypeFilter(e.target.value as IssueType | "All")}
+          title="Filter by type"
+        >
+          <option value="All">All types</option>
+          {TYPES.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+        <select
+          className="ds-sb-select"
+          value={priorityFilter}
+          onChange={(e) => setPriorityFilter(e.target.value as Priority | "All")}
+          title="Filter by priority"
+        >
+          <option value="All">All priorities</option>
+          {PRIORITIES.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+        <select
+          className="ds-sb-select ds-sb-sort"
+          value={sortKey}
+          onChange={(e) => setSortKey(e.target.value as SortKey)}
+          title="Sort order"
+        >
+          {SORT_KEYS.map((k) => (
+            <option key={k} value={k}>
+              {SORT_LABELS[k]}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="ds-sb-list-wrap">

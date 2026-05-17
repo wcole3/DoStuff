@@ -7,7 +7,7 @@ export function isActiveLane(s: string): s is ActiveLane {
   return (ACTIVE_LANES as readonly string[]).includes(s);
 }
 
-export const STATUSES   = ["Thinking", "Planned", "Working", "Verification", "Complete"] as const;
+export const STATUSES   = ["Thinking", "Planned", "Working", "Verification", "Complete", "Closed"] as const;
 export const PRIORITIES = ["Critical", "High", "Regular", "Low"] as const;
 export const TYPES      = ["Bug", "Feature", "Refactor", "Chore", "Spike"] as const;
 
@@ -72,6 +72,9 @@ export interface Issue {
   statusHistory: StatusEvent[];
   /** Append-only progress log. Populated by the MCP server's update_ticket_progress tool. */
   record: RecordEntry[];
+  /** Free-form labels for cross-cutting categorization (like Jira labels).
+   *  Each tag's display color is derived deterministically from its name. */
+  tags: string[];
 }
 
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
@@ -103,7 +106,8 @@ export type WebviewToHost =
   | { type: "exportJson" }
   | { type: "openSettings" }
   | { type: "externalDragStart"; issueId: string }
-  | { type: "externalDragEnd" };
+  | { type: "externalDragEnd" }
+  | { type: "openLink"; url: string };
 
 export interface Settings {
   storagePath: string;
@@ -120,6 +124,42 @@ export interface Settings {
  *  - The issue identified by `movingIssueId` is excluded from the count so an
  *    in-place save of an already-located ticket isn't blocked by itself.
  */
+/**
+ * Cap on the number of distinct chips rendered inline next to a ticket. Any
+ * additional tags collapse to colored dots so the row height stays predictable.
+ */
+export const MAX_INLINE_TAG_CHIPS = 2;
+
+/**
+ * Normalise a raw tag string for display + matching. Trims whitespace, collapses
+ * internal runs, and drops empties. Returns the empty string when the input
+ * isn't usable as a tag.
+ */
+export function normalizeTag(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Coerce arbitrary input (string or array) into a deduplicated, normalised tag
+ * list. Used by import, the MCP `create_ticket` handler, and the storage
+ * normaliser so all entry points end up with the same shape.
+ */
+export function coerceTags(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of input) {
+    if (typeof raw !== "string") continue;
+    const tag = normalizeTag(raw);
+    if (!tag) continue;
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+  }
+  return out;
+}
+
 export function canMoveToActiveLane(
   currentIssues: Issue[],
   targetStatus: Status,

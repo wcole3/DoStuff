@@ -212,4 +212,5 @@ export const STATUS_META: Record<Status, { color: string; label: string }> = {
   Working: { color: "#dcdcaa", label: "Working" },
   Verification: { color: "#c586c0", label: "Verification" },
   Complete: { color: "#89d185", label: "Complete" },
+  Closed: { color: "#777777", label: "Closed" },
 };

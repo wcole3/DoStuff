@@ -62,6 +62,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     status: overrides.status ?? ("Planned" as Status),
     description: overrides.description ?? "",
     tasks: overrides.tasks ?? [],
+    tags: overrides.tags ?? [],
     verifyCriteria: overrides.verifyCriteria ?? "",
     createdAt: at,
     resolvedAt: overrides.resolvedAt ?? null,
@@ -97,7 +98,24 @@ describe("normalize", () => {
     expect(issue.record).toEqual([]);
     expect(issue.statusHistory).toEqual([]);
     expect(issue.tasks).toEqual([]);
+    expect(issue.tags).toEqual([]);
     expect(issue.resolvedAt).toBeNull();
+  });
+
+  test("tags are normalized: trimmed, deduplicated, non-string entries dropped", () => {
+    const partial = {
+      id: "DS-099",
+      title: "tag-haver",
+      type: "Bug",
+      priority: "High",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      tags: ["  alpha ", "alpha", "Alpha", "beta", 42, "", "  "],
+    } as unknown as Issue;
+    const { issue } = normalize(partial);
+    expect(issue.tags).toEqual(["alpha", "beta"]);
   });
 
   test("invalid status is coerced to 'Thinking' and logged in coerced[]", () => {

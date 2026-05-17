@@ -19,6 +19,9 @@ export const extensionConfig: BuildOptions = {
   },
   logLevel: "info",
   sourcemap: true,
+  minify: true,
+  treeShaking: true,
+  legalComments: "none",
 };
 
 export const webviewConfig: BuildOptions = {
@@ -40,4 +43,6 @@ export const webviewConfig: BuildOptions = {
   logLevel: "info",
   sourcemap: "linked",
   legalComments: "none",
+  minify: true,
+  treeShaking: true,
 };

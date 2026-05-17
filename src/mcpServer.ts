@@ -36,7 +36,6 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { IssueStore } from "./storage";
 import {
   normalizeWorkspacePath,
-  pruneRegistry,
   registerEntry,
   unregisterEntry,
 } from "./mcpRegistry";
@@ -46,38 +45,16 @@ import {
   AGENT_SERVABLE_STATUSES,
   AGENT_WRITABLE_STATUSES,
   canMoveToActiveLane,
+  coerceTags,
   type Issue,
   type RecordEntry,
   type Status,
 } from "./types";
 
-// we want to be very terse in this prompt to keep context small
-export const DEFAULT_WORKFLOW_PROMPT = `\
-You are an engineering agent working through the DoStuff issue queue.
-
-Workflow contract:
-  1. Tickets are addressed by number (e.g. "42") or id ("DS-042").
-     Use \`get_ticket\` to fetch one by number, id, or a substring of its title
-     i.e. "get ticket 42 and begin work" or "start on the OAuth ticket".
-  2. Tickets have descriptions and verify criteria written by the human. Read before
-     starting.  Some tickets have subtasks to help you plan.
-  3. Read \`dostuff://tickets\` to discover work. Only Planned / Working / Verification
-     tickets are visible -- Thinking tickets are drafts the human is still shaping,
-     and Complete tickets are done.
-  4. When you start a ticket, call \`update_ticket_status\` to move it to "Working".
-     When you believe it's ready for verification, move it to "Verification".
-  5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
-     decides. If your verification fails, move it back to "Working".
-  6. Active lanes (Planned, Working, Verification) are capped at ${ACTIVE_LANE_CAP} tickets each.
-     Moves that would exceed the cap are rejected.
-  7. As you make progress, call \`update_ticket_progress\` to tick tasks off and
-     append a short note to the ticket's record. Be terse and factual.
-  8. If you discover follow-up work, call \`create_ticket\` to file it. New
-     tickets land in "Thinking" for the human to triage.
-
-You may NOT modify a ticket's title, description, priority, type, or verify
-criteria via the MCP server. If something is wrong with those, file a new
-ticket instead.`;
+// The default workflow prompt lives in its own small module so the extension
+// host can import it without dragging the full MCP SDK + zod into its bundle.
+export { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
+import { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
 
 // ----- Tool result helpers ---------------------------------------------------
 
@@ -103,11 +80,12 @@ const NEW_TICKET_INPUT = {
   priority: z.enum(["Critical", "High", "Regular", "Low"]).default("Regular"),
   verifyCriteria: z.string().max(10_000).optional().default(""),
   tasks: z.array(z.string().min(1).max(500)).optional().default([]),
+  tags: z.array(z.string().max(64)).optional().default([]),
 };
 
 const STATUS_INPUT = {
   id: z.string().regex(/^DS-\d+$/, "Expected an id like DS-001"),
-  status: z.enum(["Thinking", "Planned", "Working", "Verification", "Complete"] as const),
+  status: z.enum(["Thinking", "Planned", "Working", "Verification", "Complete", "Closed"] as const),
   note: z.string().max(2_000).optional(),
 };
 
@@ -142,7 +120,7 @@ const LIST_ISSUES_INPUT = {
     .optional()
     .describe("Narrow to one priority level."),
   status: z
-    .enum(["Thinking", "Planned", "Working", "Verification", "Complete"])
+    .enum(["Thinking", "Planned", "Working", "Verification", "Complete", "Closed"])
     .optional()
     .describe("Narrow to one status. Omit to list all statuses."),
 };
@@ -169,6 +147,7 @@ export function publicView(issue: Issue) {
     status: issue.status,
     description: issue.description,
     verifyCriteria: issue.verifyCriteria,
+    tags: issue.tags,
     tasks: issue.tasks.map((t) => ({ id: t.id, text: t.text, done: t.done })),
     record: issue.record.map((r) => ({
       at: r.at,
@@ -406,6 +385,7 @@ export async function runCreateTicket(
       text,
       done: false,
     })),
+    tags: coerceTags(validated.tags ?? []),
     createdAt: now,
     resolvedAt: null,
     statusHistory: [{ status: "Thinking", at: now, by: "agent" }],
@@ -478,6 +458,11 @@ export async function runUpdateTicketStatus(
     if (issue.status === "Complete") {
       return ToolResultErr(
         `Ticket ${issue.id} is Complete and cannot be re-opened by an agent.`,
+      );
+    }
+    if (issue.status === "Closed") {
+      return ToolResultErr(
+        `Ticket ${issue.id} is Closed and cannot be re-opened by an agent.`,
       );
     }
     return ToolResultErr(
@@ -721,7 +706,8 @@ export class DoStuffMcpServer implements vscode.Disposable {
     this.currentPort = addr.port;
 
     try {
-      pruneRegistry();
+      // registerEntry already filters dead PIDs as part of its read-modify-
+      // write cycle, so an explicit pruneRegistry() call here is redundant.
       registerEntry({
         workspacePath: ws.path,
         port: addr.port,

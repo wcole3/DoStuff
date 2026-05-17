@@ -131,4 +131,85 @@ describe("IssueDetail", () => {
     expect(msg).toBeDefined();
     expect(msg!.issue.title).toBe("New shiny title");
   });
+
+  test("description renders http(s) URLs and file:// URLs as clickable links that post openLink", async () => {
+    const issue = makeIssue({
+      id: "DS-007",
+      status: "Planned",
+      description:
+        "See https://google.com for details, and the spec at file:///tmp/spec.md is canonical.",
+    });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    const anchors = Array.from(
+      document.querySelectorAll(".ds-d-link"),
+    ) as HTMLAnchorElement[];
+    expect(anchors.map((a) => a.getAttribute("href"))).toEqual([
+      "https://google.com",
+      "file:///tmp/spec.md",
+    ]);
+
+    await userEvent.click(anchors[0]);
+    const opened = api.posted.find((m) => m.type === "openLink") as
+      | { type: "openLink"; url: string }
+      | undefined;
+    expect(opened).toBeDefined();
+    expect(opened!.url).toBe("https://google.com");
+  });
+
+  test("tag editor exposes datalist suggestions sourced from other issues, excluding tags already applied", () => {
+    const current = makeIssue({
+      id: "DS-100",
+      status: "Planned",
+      tags: ["frontend"],
+    });
+    const otherA = makeIssue({
+      id: "DS-101",
+      status: "Planned",
+      tags: ["frontend", "backend"],
+    });
+    const otherB = makeIssue({
+      id: "DS-102",
+      status: "Planned",
+      tags: ["infra"],
+    });
+    pushInit([current, otherA, otherB]);
+    render(<IssueDetail issue={current} />);
+
+    const input = document.querySelector(".ds-tag-edit-input") as HTMLInputElement;
+    expect(input).not.toBeNull();
+    const listId = input.getAttribute("list");
+    expect(listId).not.toBeNull();
+    const datalist = document.getElementById(listId!) as HTMLDataListElement | null;
+    expect(datalist).not.toBeNull();
+    const optionValues = Array.from(datalist!.querySelectorAll("option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    // Sorted alphabetically and excludes the already-applied "frontend".
+    expect(optionValues).toEqual(["backend", "infra"]);
+  });
+
+  test("tag editor omits the list attribute when no suggestions remain", () => {
+    const onlyOne = makeIssue({ id: "DS-200", status: "Planned", tags: ["solo"] });
+    pushInit([onlyOne]);
+    render(<IssueDetail issue={onlyOne} />);
+    const input = document.querySelector(".ds-tag-edit-input") as HTMLInputElement;
+    expect(input.getAttribute("list")).toBeNull();
+    expect(document.querySelector("datalist")).toBeNull();
+  });
+
+  test("relative ./path links are recognised in the description body", () => {
+    const issue = makeIssue({
+      id: "DS-008",
+      status: "Planned",
+      description: "Refer to ./docs/overview.md before starting.",
+    });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+    const anchors = Array.from(
+      document.querySelectorAll(".ds-d-link"),
+    ) as HTMLAnchorElement[];
+    expect(anchors.map((a) => a.getAttribute("href"))).toEqual(["./docs/overview.md"]);
+  });
 });

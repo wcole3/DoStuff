@@ -47,7 +47,7 @@ function makeUri(scheme: string, path: string): UriLike {
 
 export const Uri = {
   file(path: string): UriLike { return makeUri("file", path); },
-  parse(value: string): UriLike {
+  parse(value: string, _strict?: boolean): UriLike {
     const colon = value.indexOf(":");
     const scheme = colon >= 0 ? value.slice(0, colon) : "file";
     const path = colon >= 0 ? value.slice(colon + 1).replace(/^\/+/, "/") : value;
@@ -227,6 +227,10 @@ export interface ExtensionContext {
 export const commands = {
   registerCommand: (..._args: unknown[]): Disposable => ({ dispose() {} }),
   executeCommand: <T = unknown>(..._args: unknown[]): Thenable<T | undefined> => Promise.resolve(undefined),
+};
+
+export const env = {
+  openExternal: (_uri: UriLike): Thenable<boolean> => Promise.resolve(true),
 };
 
 export const window: {

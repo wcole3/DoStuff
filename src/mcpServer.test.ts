@@ -82,6 +82,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     status: overrides.status ?? ("Planned" as Status),
     description: overrides.description ?? "",
     tasks: overrides.tasks ?? [],
+    tags: overrides.tags ?? [],
     verifyCriteria: overrides.verifyCriteria ?? "",
     createdAt: at,
     resolvedAt: overrides.resolvedAt ?? null,
@@ -621,6 +622,18 @@ describe("create_ticket", () => {
     expect(store.get("DS-999")).toBeUndefined();
   });
 
+  test("create_ticket accepts tags; non-string/blank/dupe entries are dropped", async () => {
+    const store = await makeStore([]);
+    const res = await runCreateTicket(store, {
+      title: "Tagged",
+      tags: ["  alpha ", "Alpha", "", "beta"] as string[],
+    } as Parameters<typeof runCreateTicket>[1]);
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { id: string };
+    const persisted = store.get(body.id)!;
+    expect(persisted.tags).toEqual(["alpha", "beta"]);
+  });
+
   test("description: undefined is filled as empty string by zod default", async () => {
     const store = await makeStore([]);
     const res = await runCreateTicket(store, {
@@ -672,6 +685,24 @@ describe("update_ticket_status", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("Complete");
     expect(store.get("DS-001")!.status).toBe("Complete");
+  });
+
+  test("Closed -> Planned: rejected (terminal)", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Closed" })]);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Planned" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Closed");
+    expect(store.get("DS-001")!.status).toBe("Closed");
+  });
+
+  test("Planned -> Closed: rejected (only humans close)", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Planned" })]);
+    const res = await runUpdateTicketStatus(store, {
+      id: "DS-001",
+      status: "Closed" as Status,
+    });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
   test("Planned -> Thinking: rejected with actionable message explaining the human-triage rule", async () => {

@@ -21,6 +21,8 @@ import {
 } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, relTime } from "./IssueDetail";
+import { TagStrip } from "./Tags";
+import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
 import {
   clearExternalDragLocal,
   postUpdateIssue,
@@ -29,7 +31,10 @@ import {
 } from "./messaging";
 
 const ACTIVE_LANES: Status[] = ["Planned", "Working", "Verification"];
-const DRAWER_CARD_HEIGHT = 64;
+// Fits the top meta row, the two-line title clamp, padding, and one row of
+// tag chips/dots when the ticket carries any tags. Keep in sync with the
+// .bd-drawer-card padding and .bd-drawer-card-title min-height in styles.css.
+const DRAWER_CARD_HEIGHT = 80;
 const TOAST_TTL_MS = 3000;
 
 const PRI_ORDER: Record<string, number> = { Critical: 0, High: 1, Regular: 2, Low: 3 };
@@ -108,6 +113,7 @@ const BoardCard = memo(function BoardCard({
         </span>
       </div>
       <div className="bd-card-title">{issue.title}</div>
+      {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={3} />}
       <div className="bd-card-foot">
         {issue.tasks.length > 0 && (
           <span className="bd-card-tasks" title="Tasks done / total">
@@ -259,6 +265,7 @@ const DrawerCardRow = memo(function DrawerCardRow({
           <Icon name={pri.icon} size={11} style={{ color: pri.color }} />
         </div>
         <div className="bd-drawer-card-title">{issue.title}</div>
+        {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={1} />}
       </div>
     </div>
   );
@@ -295,6 +302,7 @@ function Drawer({
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<IssueType | "All">("All");
   const [priorityFilter, setPriorityFilter] = useState<Priority | "All">("All");
+  const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT);
   const meta = STATUS_META[status];
   const listWrapRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -304,6 +312,7 @@ function Drawer({
       setQuery("");
       setTypeFilter("All");
       setPriorityFilter("All");
+      setSortKey(DEFAULT_SORT);
     }
   }, [open]);
 
@@ -320,13 +329,20 @@ function Drawer({
 
   const displayedIssues = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return issues.filter((i) => {
+    const matched = issues.filter((i) => {
       if (typeFilter !== "All" && i.type !== typeFilter) return false;
       if (priorityFilter !== "All" && i.priority !== priorityFilter) return false;
-      if (q && !i.title.toLowerCase().includes(q) && !i.id.toLowerCase().includes(q)) return false;
+      if (
+        q &&
+        !i.title.toLowerCase().includes(q) &&
+        !i.id.toLowerCase().includes(q) &&
+        !i.tags.some((t) => t.toLowerCase().includes(q))
+      )
+        return false;
       return true;
     });
-  }, [issues, query, typeFilter, priorityFilter]);
+    return sortIssues(matched, sortKey);
+  }, [issues, query, typeFilter, priorityFilter, sortKey]);
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -401,6 +417,18 @@ function Drawer({
             >
               <option value="All">All priorities</option>
               {PRIORITIES.map((p) => <option key={p} value={p}>{p}</option>)}
+            </select>
+            <select
+              className="bd-drawer-search-select"
+              value={sortKey}
+              onChange={(e) => setSortKey(e.target.value as SortKey)}
+              title="Sort order"
+            >
+              {SORT_KEYS.map((k) => (
+                <option key={k} value={k}>
+                  {SORT_LABELS[k]}
+                </option>
+              ))}
             </select>
           </div>
           <div className="bd-drawer-help">
@@ -559,12 +587,16 @@ export function Board() {
   }, []);
 
   const byStatus = useMemo(() => {
+    // Closed tickets exist in the store but are never rendered on the board
+    // (per the workflow rules: Closed lives only in the sidebar). The bucket
+    // is present to satisfy the Record<Status, Issue[]> shape.
     const map: Record<Status, Issue[]> = {
       Thinking: [],
       Planned: [],
       Working: [],
       Verification: [],
       Complete: [],
+      Closed: [],
     };
     for (const i of issues) map[i.status].push(i);
     (Object.keys(map) as Status[]).forEach((s) => {
