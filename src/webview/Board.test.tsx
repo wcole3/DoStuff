@@ -226,6 +226,57 @@ describe("Drawer search + filter", () => {
     expect(chip!.textContent).toBe("frontend");
   });
 
+  test("every drawer card carries a `.bd-drawer-card-tags` slot regardless of tag presence (DS-009 regression)", () => {
+    // Mixed dataset: untagged + tagged cards must share identical structure
+    // so each FixedSizeList slot is occupied uniformly and no inter-card
+    // gaps appear. Catches the bug where conditional `<TagStrip>` rendering
+    // left untagged cards short.
+    const a = makeIssue({ id: "DS-060", title: "Untagged idea", status: "Thinking" });
+    const b = makeIssue({
+      id: "DS-061",
+      title: "Tagged idea",
+      status: "Thinking",
+      tags: ["polish"],
+    });
+    render(<Board />);
+    pushInit([a, b]);
+
+    const drawerBtn = document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement;
+    fireEvent.click(drawerBtn);
+
+    const cards = Array.from(document.querySelectorAll(".bd-drawer-card"));
+    expect(cards.length).toBe(2);
+    for (const card of cards) {
+      expect(card.querySelector(".bd-drawer-card-tags")).not.toBeNull();
+    }
+    // Tagged card has a chip; untagged card has none — but the slot exists either way.
+    const taggedCard = cards.find((c) => c.textContent?.includes("Tagged idea"))!;
+    const untaggedCard = cards.find((c) => c.textContent?.includes("Untagged idea"))!;
+    expect(taggedCard.querySelector(".ds-tag-chip")).not.toBeNull();
+    expect(untaggedCard.querySelector(".ds-tag-chip")).toBeNull();
+  });
+
+  test("complete drawer cards also reserve the tag slot (DS-009 regression, right drawer)", () => {
+    const a = makeIssue({ id: "DS-070", title: "Shipped no tags", status: "Complete" });
+    const b = makeIssue({
+      id: "DS-071",
+      title: "Shipped with tags",
+      status: "Complete",
+      tags: ["v2"],
+    });
+    render(<Board />);
+    pushInit([a, b]);
+
+    const drawerBtn = document.querySelector(".bd-drawer-right .bd-drawer-head") as HTMLElement;
+    fireEvent.click(drawerBtn);
+
+    const cards = Array.from(document.querySelectorAll(".bd-drawer-card"));
+    expect(cards.length).toBe(2);
+    for (const card of cards) {
+      expect(card.querySelector(".bd-drawer-card-tags")).not.toBeNull();
+    }
+  });
+
   test("closing the Thinking drawer resets filter query", () => {
     const a = makeIssue({ id: "DS-011", title: "Gamma issue", status: "Thinking" });
     render(<Board />);

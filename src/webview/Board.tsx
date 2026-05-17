@@ -31,10 +31,11 @@ import {
 } from "./messaging";
 
 const ACTIVE_LANES: Status[] = ["Planned", "Working", "Verification"];
-// Fits the top meta row, the two-line title clamp, padding, and one row of
-// tag chips/dots when the ticket carries any tags. Keep in sync with the
-// .bd-drawer-card padding and .bd-drawer-card-title min-height in styles.css.
-const DRAWER_CARD_HEIGHT = 80;
+// Fits the top meta row, the two-line title clamp, the always-present tag
+// slot (16px min-height per `.bd-drawer-card-tags`), card padding (7px top
+// + 7px bottom), three 5px flex gaps, and the 6px inter-card margin. Pad a
+// few px so a chip with a 1px border never gets clipped.
+const DRAWER_CARD_HEIGHT = 96;
 const TOAST_TTL_MS = 3000;
 
 const PRI_ORDER: Record<string, number> = { Critical: 0, High: 1, Regular: 2, Low: 3 };
@@ -265,7 +266,13 @@ const DrawerCardRow = memo(function DrawerCardRow({
           <Icon name={pri.icon} size={11} style={{ color: pri.color }} />
         </div>
         <div className="bd-drawer-card-title">{issue.title}</div>
-        {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={1} />}
+        {/* Always render the tag slot — even when empty — so every card
+            occupies the same vertical space inside its FixedSizeList row.
+            Without this, tagged + untagged cards drift vertically and gaps
+            appear between siblings (DS-009). */}
+        <div className="bd-drawer-card-tags">
+          {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={1} />}
+        </div>
       </div>
     </div>
   );

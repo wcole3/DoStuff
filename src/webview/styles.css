@@ -822,6 +822,11 @@ button { font: inherit; color: inherit; }
   cursor: grab;
   margin: 0 0 6px;
   box-sizing: border-box;
+  /* Fill the FixedSizeList slot exactly (minus the 6px bottom margin used
+     for inter-card gap). Pairs with `min-height` on every inner row to keep
+     vertical spacing identical between tagged + untagged cards (DS-009). */
+  height: calc(100% - 6px);
+  overflow: hidden;
 }
 .bd-drawer-card:hover { background: var(--vsc-hover); border-color: var(--vsc-fg-dim); }
 .bd-drawer-card-top {
@@ -836,8 +841,15 @@ button { font: inherit; color: inherit; }
      slot — otherwise short cards leave visible gaps between siblings. */
   min-height: calc(12px * 1.35 * 2);
 }
-/* Tag strip inside drawer cards sits tight under the clamped title. */
-.bd-drawer-card .ds-tag-row { margin-top: 1px; }
+/* Tag slot is always rendered (even if empty) so card height stays uniform
+   between tagged + untagged tickets. Reserve room for a single chip
+   (`.ds-tag-chip` = 14px content + 2px border = 16px). */
+.bd-drawer-card-tags {
+  display: flex;
+  align-items: center;
+  min-height: 16px;
+}
+.bd-drawer-card-tags .ds-tag-row { margin: 0; }
 
 /* Board focus overlay */
 .bd-focus-backdrop {
