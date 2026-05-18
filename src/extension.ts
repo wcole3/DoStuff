@@ -1,6 +1,7 @@
 // Extension entry point — wires up the sidebar provider, board panel, commands, and storage.
 
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { SidebarProvider } from "./sidebarProvider";
@@ -9,11 +10,14 @@ import { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
 import {
   ACTIVE_LANE_CAP,
+  MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
+  coerceAttachments,
   coerceTags,
   isPriority,
   isStatus,
   isType,
+  type Attachment,
   type Issue,
   type Status,
   type StatusEvent,
@@ -21,6 +25,32 @@ import {
 
 
 export type UpdateBy = "user" | "agent";
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  svg: "image/svg+xml",
+  ico: "image/x-icon",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  md: "text/markdown",
+  json: "application/json",
+  zip: "application/zip",
+  tar: "application/x-tar",
+  gz: "application/gzip",
+};
+
+/** Best-effort mimeType inference from a filename. Falls back to octet-stream. */
+export function inferMimeType(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  if (dot < 0) return "application/octet-stream";
+  const ext = filename.slice(dot + 1).toLowerCase();
+  return MIME_BY_EXT[ext] ?? "application/octet-stream";
+}
 
 /**
  * Pure merge of a webview-submitted partial update onto a persisted issue.
@@ -52,6 +82,28 @@ export function mergeIssueUpdate(
     return { error: `Invalid type: ${JSON.stringify(incoming.type)}` };
   }
 
+  // Attachments are reconciled against `prior` so the webview can only ever
+  // reorder or remove existing entries — never introduce new attachment
+  // metadata. The host-side upload helper appends new entries directly to
+  // the persisted issue *after* this merge runs.
+  let attachments = prior.attachments;
+  if (Array.isArray(incoming.attachments)) {
+    const priorById = new Map(prior.attachments.map((a) => [a.id, a]));
+    const seen = new Set<string>();
+    const next: typeof prior.attachments = [];
+    for (const entry of incoming.attachments) {
+      if (!entry || typeof entry !== "object") continue;
+      const id = (entry as { id?: unknown }).id;
+      if (typeof id !== "string") continue;
+      const known = priorById.get(id);
+      if (!known) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      next.push(known);
+    }
+    attachments = next;
+  }
+
   const next: Issue = {
     ...prior,
     title:          typeof incoming.title === "string" ? incoming.title : prior.title,
@@ -59,6 +111,7 @@ export function mergeIssueUpdate(
     verifyCriteria: typeof incoming.verifyCriteria === "string" ? incoming.verifyCriteria : prior.verifyCriteria,
     tasks:          Array.isArray(incoming.tasks) ? incoming.tasks : prior.tasks,
     tags:           Array.isArray(incoming.tags) ? coerceTags(incoming.tags) : prior.tags,
+    attachments,
     type:           incoming.type ?? prior.type,
     priority:       incoming.priority ?? prior.priority,
     status:         incoming.status ?? prior.status,
@@ -114,6 +167,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       verifyCriteria: typeof e.verifyCriteria === "string" ? e.verifyCriteria : "",
       tasks: Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [],
       tags: coerceTags(e.tags),
+      attachments: coerceAttachments(e.attachments),
       createdAt: e.createdAt,
       resolvedAt: typeof e.resolvedAt === "string" ? e.resolvedAt : null,
       statusHistory: Array.isArray(e.statusHistory)
@@ -192,12 +246,118 @@ export function activate(context: vscode.ExtensionContext) {
     await store.upsert(next);
   };
 
+  /**
+   * Append a new attachment to an issue. Single chokepoint for both the file-
+   * picker (`pickAttachment`) and drag-drop (`addAttachmentBytes`) paths.
+   *  - Rejects when no workspace folder is open (writes would have nowhere to land).
+   *  - Enforces the 10 MB cap before touching disk.
+   *  - Mints a fresh attachmentId via `crypto.randomUUID` so duplicate filenames
+   *    coexist as distinct entries.
+   *  - Writes bytes via the store, appends metadata, persists through `upsert`.
+   */
+  const appendAttachment = async (
+    issueId: string,
+    name: string,
+    mimeType: string,
+    bytes: Uint8Array,
+  ): Promise<void> => {
+    const prior = store.get(issueId);
+    if (!prior) {
+      vscode.window.showWarningMessage(`DoStuff: No ticket with id ${issueId}.`);
+      return;
+    }
+    if (!vscode.workspace.workspaceFolders?.length) {
+      vscode.window.showWarningMessage(
+        "DoStuff: open a folder first — attachments need a workspace to live in.",
+      );
+      return;
+    }
+    if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+      vscode.window.showWarningMessage(
+        `DoStuff: "${name}" is larger than the 10 MB attachment cap.`,
+      );
+      return;
+    }
+    const attachmentId = randomUUID().replace(/-/g, "");
+    const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+    try {
+      const written = await store.writeAttachment(issueId, attachmentId, ext, bytes);
+      if (!written) {
+        vscode.window.showWarningMessage("DoStuff: attachment write failed (no workspace).");
+        return;
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      vscode.window.showErrorMessage(`DoStuff: attachment write failed (${msg}).`);
+      return;
+    }
+    const next: Issue = {
+      ...prior,
+      attachments: [
+        ...prior.attachments,
+        {
+          id: attachmentId,
+          name,
+          mimeType: mimeType || "application/octet-stream",
+          sizeBytes: bytes.byteLength,
+          addedAt: new Date().toISOString(),
+        } satisfies Attachment,
+      ],
+    };
+    await store.upsert(next);
+  };
+
+  const attachmentHandlers = {
+    onPick: async (issueId: string) => {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectMany: true,
+        openLabel: "Attach to ticket",
+      });
+      if (!uris?.length) return;
+      for (const uri of uris) {
+        let bytes: Uint8Array;
+        try {
+          bytes = await vscode.workspace.fs.readFile(uri);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          vscode.window.showErrorMessage(`DoStuff: could not read ${uri.fsPath} (${msg}).`);
+          continue;
+        }
+        const segments = uri.path.split("/");
+        const name = segments[segments.length - 1] || "attachment";
+        const mimeType = inferMimeType(name);
+        await appendAttachment(issueId, name, mimeType, bytes);
+      }
+    },
+    onAddBytes: async (issueId: string, name: string, mimeType: string, bytes: Uint8Array) => {
+      await appendAttachment(issueId, name, mimeType, bytes);
+    },
+    onDelete: async (issueId: string, attachmentId: string) => {
+      const prior = store.get(issueId);
+      if (!prior) return;
+      const next: Issue = {
+        ...prior,
+        attachments: prior.attachments.filter((a) => a.id !== attachmentId),
+      };
+      await store.upsert(next);
+      await store.deleteAttachmentFile(issueId, attachmentId);
+    },
+    onOpen: async (issueId: string, attachmentId: string) => {
+      const uri = await store.findAttachmentUri(issueId, attachmentId);
+      if (!uri) {
+        vscode.window.showWarningMessage("DoStuff: attachment file is missing.");
+        return;
+      }
+      await vscode.commands.executeCommand("vscode.open", uri);
+    },
+  };
+
   const externalDrag = {
     onStart: (issueId: string) => {
       // Open the board if the user starts a drag with no board panel
       // visible — without it there'd be nowhere for the lanes to light up.
       if (!BoardPanel.isOpen()) {
-        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink);
+        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
       }
       BoardPanel.signalExternalDrag(issueId);
     },
@@ -252,7 +412,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.showWarningMessage(`DoStuff: link scheme "${scheme}" is not supported.`);
   };
 
-  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink);
+  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink, attachmentHandlers);
 
   context.subscriptions.push(
     sidebar,
@@ -261,7 +421,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("dostuff.openBoard", () => {
-      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink);
+      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
     }),
 
     vscode.commands.registerCommand("dostuff.newIssue", () => {

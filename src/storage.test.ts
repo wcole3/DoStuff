@@ -69,6 +69,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     statusHistory:
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
+    attachments: overrides.attachments ?? [],
   };
 }
 
@@ -347,25 +348,43 @@ function installVirtualFs(seed: Record<string, string> = {}): { fs: VirtualFs; h
       fs.set(uri.path, { content });
     },
     createDirectory: async () => {},
-    delete: async (uri: { path: string }) => {
-      fs.delete(uri.path);
+    delete: async (uri: { path: string }, options?: { recursive?: boolean }) => {
+      if (options?.recursive) {
+        const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
+        for (const key of Array.from(fs.keys())) {
+          if (key === uri.path || key.startsWith(prefix)) fs.delete(key);
+        }
+      } else {
+        fs.delete(uri.path);
+      }
     },
     stat: async (uri: { path: string }) => {
-      if (!fs.has(uri.path)) {
-        throw Object.assign(new Error("ENOENT"), { code: "FileNotFound" });
+      if (fs.has(uri.path)) {
+        return { type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 };
       }
-      return { type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 };
+      const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
+      for (const key of fs.keys()) {
+        if (key.startsWith(prefix)) {
+          return { type: vscode.FileType.Directory, ctime: 0, mtime: 0, size: 0 };
+        }
+      }
+      throw Object.assign(new Error("ENOENT"), { code: "FileNotFound" });
     },
     readDirectory: async (uri: { path: string }) => {
       const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
-      const entries: Array<[string, number]> = [];
+      const seen = new Map<string, number>();
       for (const key of fs.keys()) {
         if (!key.startsWith(prefix)) continue;
         const tail = key.slice(prefix.length);
-        if (tail.includes("/")) continue; // nested — not direct child
-        entries.push([tail, vscode.FileType.File]);
+        const slash = tail.indexOf("/");
+        if (slash < 0) {
+          seen.set(tail, vscode.FileType.File);
+        } else {
+          const segment = tail.slice(0, slash);
+          if (!seen.has(segment)) seen.set(segment, vscode.FileType.Directory);
+        }
       }
-      return entries;
+      return Array.from(seen.entries());
     },
   };
 
@@ -488,5 +507,104 @@ describe("IssueStore (file-backed branch)", () => {
     expect(store.get("DS-001")?.title).toBe("renamed externally");
     expect(store.get("DS-002")?.title).toBe("added externally");
     expect(store.list()).toHaveLength(2);
+  });
+});
+
+// ----- attachments ----------------------------------------------------------
+
+describe("IssueStore attachments", () => {
+  let handles: FsHandles | null = null;
+
+  afterEach(() => {
+    if (handles) {
+      restoreFs(handles);
+      handles = null;
+    }
+  });
+
+  test("writeAttachment puts bytes at <storagePath>/attachments/<issueId>/<attId><ext>", async () => {
+    const { fs, handles: h } = installVirtualFs();
+    handles = h;
+    const store = new IssueStore(makeContext());
+    await store.init();
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const written = await store.writeAttachment("DS-001", "abc", ".png", bytes);
+    expect(written).toBe(true);
+    const entry = fs.get("/ws/.vscode/dostuff/attachments/DS-001/abc.png");
+    expect(entry).toBeDefined();
+    expect(Array.from(entry!.content)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("readAttachment round-trips the bytes", async () => {
+    const { handles: h } = installVirtualFs();
+    handles = h;
+    const store = new IssueStore(makeContext());
+    await store.init();
+    const bytes = new Uint8Array([9, 8, 7]);
+    await store.writeAttachment("DS-002", "att2", ".pdf", bytes);
+    const out = await store.readAttachment("DS-002", "att2");
+    expect(Array.from(out)).toEqual([9, 8, 7]);
+  });
+
+  test("readAttachment on a missing file rejects", async () => {
+    const { handles: h } = installVirtualFs();
+    handles = h;
+    const store = new IssueStore(makeContext());
+    await store.init();
+    await expect(store.readAttachment("DS-001", "missing")).rejects.toThrow();
+  });
+
+  test("remove(id) prunes the per-issue attachment folder", async () => {
+    const { fs, handles: h } = installVirtualFs();
+    handles = h;
+    const store = new IssueStore(makeContext());
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001" }));
+    await store.writeAttachment("DS-001", "att1", ".png", new Uint8Array([1]));
+    await store.writeAttachment("DS-001", "att2", ".pdf", new Uint8Array([2]));
+    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeDefined();
+
+    await store.remove("DS-001");
+
+    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeUndefined();
+    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/att2.pdf")).toBeUndefined();
+  });
+
+  test("deleteAttachmentFile removes a single file without touching siblings", async () => {
+    const { fs, handles: h } = installVirtualFs();
+    handles = h;
+    const store = new IssueStore(makeContext());
+    await store.init();
+    await store.writeAttachment("DS-001", "keep", ".png", new Uint8Array([1]));
+    await store.writeAttachment("DS-001", "drop", ".pdf", new Uint8Array([2]));
+    await store.deleteAttachmentFile("DS-001", "drop");
+    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/keep.png")).toBeDefined();
+    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/drop.pdf")).toBeUndefined();
+  });
+
+  test("normalize() on a legacy issue without `attachments` returns []", () => {
+    // Cast through unknown to drop the field from the literal.
+    const legacy = makeIssue({ id: "DS-001" }) as unknown as Record<string, unknown>;
+    delete legacy.attachments;
+    const { issue } = normalize(legacy as unknown as Issue);
+    expect(issue.attachments).toEqual([]);
+  });
+
+  test("normalize() on an issue whose attachments reference missing files still loads", () => {
+    const stale = makeIssue({
+      id: "DS-001",
+      attachments: [
+        {
+          id: "gone",
+          name: "ghost.png",
+          mimeType: "image/png",
+          sizeBytes: 42,
+          addedAt: "2026-05-18T00:00:00.000Z",
+        },
+      ],
+    });
+    const { issue } = normalize(stale);
+    expect(issue.attachments).toHaveLength(1);
+    expect(issue.attachments[0]!.id).toBe("gone");
   });
 });

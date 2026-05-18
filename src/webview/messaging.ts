@@ -170,6 +170,34 @@ export function postOpenSettings(): void {
   vscodeApi.postMessage({ type: "openSettings" });
 }
 
+export function postPickAttachment(issueId: string): void {
+  vscodeApi.postMessage({ type: "pickAttachment", issueId });
+}
+
+export function postAddAttachmentBytes(
+  issueId: string,
+  name: string,
+  mimeType: string,
+  bytes: Uint8Array,
+): void {
+  vscodeApi.postMessage({
+    type: "addAttachmentBytes",
+    issueId,
+    name,
+    mimeType,
+    // JSON-serialise via a plain number[]; the host re-wraps as Uint8Array.
+    bytes: Array.from(bytes),
+  });
+}
+
+export function postDeleteAttachment(issueId: string, attachmentId: string): void {
+  vscodeApi.postMessage({ type: "deleteAttachment", issueId, attachmentId });
+}
+
+export function postOpenAttachment(issueId: string, attachmentId: string): void {
+  vscodeApi.postMessage({ type: "openAttachment", issueId, attachmentId });
+}
+
 export function postExternalDragStart(issueId: string): void {
   vscodeApi.postMessage({ type: "externalDragStart", issueId });
 }

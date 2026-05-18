@@ -39,6 +39,7 @@ export function makeIssue(overrides: Partial<Issue> = {}): Issue {
     statusHistory:
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
+    attachments: overrides.attachments ?? [],
   };
 }
 
@@ -96,7 +97,12 @@ export function restoreVsCodeApi(): void {
   // would force a fresh resolveApi() that throws if hit too early.
 }
 
-const defaultSettings: Settings = { storagePath: ".vscode/dostuff", autoSave: true, activeLaneCap: 6 };
+const defaultSettings: Settings = {
+  storagePath: ".vscode/dostuff",
+  autoSave: true,
+  activeLaneCap: 6,
+  attachmentsBaseUri: null,
+};
 
 /**
  * Push an `init`-shaped message into the webview store. messaging.ts's

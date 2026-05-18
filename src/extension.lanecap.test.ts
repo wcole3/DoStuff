@@ -53,6 +53,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     statusHistory:
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
+    attachments: overrides.attachments ?? [],
   };
 }
 

@@ -52,6 +52,26 @@ export interface RecordEntry {
   text: string;
 }
 
+/**
+ * File or image attached to an issue. The bytes live on disk under
+ * `<storagePath>/attachments/<issueId>/<attachmentId><ext>`; this struct
+ * carries only metadata. See `IssueStore.writeAttachment` for the writer.
+ */
+export interface Attachment {
+  /** Host-minted nanoid-ish; unique per workspace. */
+  id: string;
+  /** Original filename for display only — never used to construct disk paths. */
+  name: string;
+  /** Best-effort sniff from the original extension. */
+  mimeType: string;
+  sizeBytes: number;
+  /** ISO 8601 */
+  addedAt: string;
+}
+
+/** Hard cap on a single attachment, enforced at the host upload edge and at MCP read. */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
+
 export interface Issue {
   id: string;
   /** Short, human-readable, monotonically-increasing reference number.
@@ -75,6 +95,9 @@ export interface Issue {
   /** Free-form labels for cross-cutting categorization (like Jira labels).
    *  Each tag's display color is derived deterministically from its name. */
   tags: string[];
+  /** Files & images attached to this issue. The bytes are stored on disk
+   *  alongside the ticket JSON; this list carries only metadata. */
+  attachments: Attachment[];
 }
 
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
@@ -98,7 +121,7 @@ export type HostToWebview =
 
 export type WebviewToHost =
   | { type: "ready" }
-  | { type: "createIssue"; partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record"> & { tasks?: Task[] } }
+  | { type: "createIssue"; partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments"> & { tasks?: Task[] } }
   | { type: "updateIssue"; issue: Issue }
   | { type: "deleteIssue"; id: string }
   | { type: "openBoard" }
@@ -107,12 +130,30 @@ export type WebviewToHost =
   | { type: "openSettings" }
   | { type: "externalDragStart"; issueId: string }
   | { type: "externalDragEnd" }
-  | { type: "openLink"; url: string };
+  | { type: "openLink"; url: string }
+  // Webview-initiated upload via the host file picker. Host opens a
+  // `showOpenDialog` and reads bytes itself — keeps large files off the
+  // webview IPC channel.
+  | { type: "pickAttachment"; issueId: string }
+  // Drag-drop upload: webview already has the bytes (from DataTransfer.files)
+  // and ships them to the host. Bounded by `MAX_ATTACHMENT_BYTES` at both
+  // ends.
+  | { type: "addAttachmentBytes"; issueId: string; name: string; mimeType: string; bytes: number[] }
+  | { type: "deleteAttachment"; issueId: string; attachmentId: string }
+  // Open a non-image attachment in VSCode via its on-disk URI.
+  | { type: "openAttachment"; issueId: string; attachmentId: string };
 
 export interface Settings {
   storagePath: string;
   autoSave: boolean;
   activeLaneCap: number;
+  /**
+   * Resolved base URL for attachment binaries on disk, in webview-addressable
+   * form (`vscode-webview-resource://…`). The webview composes per-attachment
+   * URLs as `${attachmentsBaseUri}/<issueId>/<attachmentId><ext>`. `null` when
+   * no workspace folder is open (attachments disabled).
+   */
+  attachmentsBaseUri: string | null;
 }
 
 /**
@@ -158,6 +199,37 @@ export function coerceTags(input: unknown): string[] {
     out.push(tag);
   }
   return out;
+}
+
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/;
+
+/**
+ * Validate + dedupe a raw `attachments` value into a clean `Attachment[]`.
+ * Used by storage normalisation, import validation, and the `mergeIssueUpdate`
+ * reconciliation step. Drops malformed entries; never throws.
+ */
+export function coerceAttachments(input: unknown): Attachment[] {
+  if (!Array.isArray(input)) return [];
+  const byId = new Map<string, Attachment>();
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const id = typeof r.id === "string" && r.id.length > 0 ? r.id : null;
+    const name = typeof r.name === "string" && r.name.length > 0 ? r.name : null;
+    const mimeType = typeof r.mimeType === "string" && r.mimeType.length > 0 ? r.mimeType : null;
+    const sizeBytes =
+      typeof r.sizeBytes === "number" && Number.isFinite(r.sizeBytes) && r.sizeBytes >= 0
+        ? r.sizeBytes
+        : null;
+    const addedAt = typeof r.addedAt === "string" && ISO_RE.test(r.addedAt) ? r.addedAt : null;
+    if (id === null || name === null || mimeType === null || sizeBytes === null || addedAt === null) {
+      continue;
+    }
+    // Last write wins so the host-side reconciliation in mergeIssueUpdate can
+    // overwrite a metadata-only update.
+    byId.set(id, { id, name, mimeType, sizeBytes, addedAt });
+  }
+  return Array.from(byId.values());
 }
 
 export function canMoveToActiveLane(

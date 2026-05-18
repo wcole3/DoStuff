@@ -34,6 +34,10 @@ You can also start a drag in the **sidebar** — the board lights up each lane a
 
 **Thinking drawer**: click a card to view its details (the detail overlay opens just like any other card). **Shift+Click** promotes the draft straight to Planned.
 
+### Attachments
+
+Each ticket has an Attachments strip in its detail panel. Drop one or more files onto it, or hit the **+** to pick via the OS dialog. Image attachments render as thumbnails — click to view full-size in an overlay (Esc closes). Non-images open in VSCode via the system handler. Attachments are capped at 10 MB each. Binaries live alongside ticket JSON in `<storagePath>/attachments/<issueId>/`, so the existing `.gitignore` keeps them out of Git automatically. Deleting a ticket also removes its attachments. Attachments are exposed to MCP clients through `get_ticket`'s `attachments[]` field; agents fetch the bytes by reading the resource `dostuff://attachments/{ticketId}/{attachmentId}`. Export/import JSON includes the metadata but not the bytes — re-upload after an import if you need them.
+
 ### Import / export
 
 Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…** from the command palette, or use the cloud icons in the sidebar title bar.

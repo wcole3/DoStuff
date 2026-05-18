@@ -44,6 +44,7 @@ import {
   ACTIVE_LANES,
   AGENT_SERVABLE_STATUSES,
   AGENT_WRITABLE_STATUSES,
+  MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
   coerceTags,
   type Issue,
@@ -154,6 +155,14 @@ export function publicView(issue: Issue) {
       author: r.author,
       source: r.source,
       text: r.text,
+    })),
+    attachments: issue.attachments.map((a) => ({
+      id: a.id,
+      name: a.name,
+      mimeType: a.mimeType,
+      sizeBytes: a.sizeBytes,
+      addedAt: a.addedAt,
+      uri: `dostuff://attachments/${issue.id}/${a.id}`,
     })),
     createdAt: issue.createdAt,
   };
@@ -386,6 +395,7 @@ export async function runCreateTicket(
       done: false,
     })),
     tags: coerceTags(validated.tags ?? []),
+    attachments: [],
     createdAt: now,
     resolvedAt: null,
     statusHistory: [{ status: "Thinking", at: now, by: "agent" }],
@@ -945,6 +955,55 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
         },
       ],
     }),
+  );
+
+  // Attachment binaries are served as base64 BlobResourceContents. Agents
+  // discover the URIs by reading a ticket via `get_ticket` or the `ticket`
+  // resource, which lists `attachments[i].uri` in the JSON payload.
+  mcp.registerResource(
+    "attachment",
+    new ResourceTemplate("dostuff://attachments/{ticketId}/{attachmentId}", { list: undefined }),
+    {
+      title: "DoStuff attachment",
+      description: "Binary content (image, PDF, etc.) attached to a ticket.",
+    },
+    async (uri, variables) => {
+      const ticketRaw = variables.ticketId;
+      const attachmentRaw = variables.attachmentId;
+      const ticketId = Array.isArray(ticketRaw) ? String(ticketRaw[0] ?? "") : String(ticketRaw ?? "");
+      const attachmentId = Array.isArray(attachmentRaw)
+        ? String(attachmentRaw[0] ?? "")
+        : String(attachmentRaw ?? "");
+      const issue = store.get(ticketId);
+      if (!issue) {
+        throw new Error(`Ticket ${ticketId} not found`);
+      }
+      const meta = issue.attachments.find((a) => a.id === attachmentId);
+      if (!meta) {
+        throw new Error(`Attachment ${attachmentId} not found on ticket ${ticketId}`);
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = await store.readAttachment(ticketId, attachmentId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        throw new Error(`Attachment file missing: ${msg}`);
+      }
+      if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+        throw new Error(
+          `Attachment ${attachmentId} exceeds the 10 MB cap (${bytes.byteLength} bytes).`,
+        );
+      }
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: meta.mimeType,
+            blob: Buffer.from(bytes).toString("base64"),
+          },
+        ],
+      };
+    },
   );
 }
 

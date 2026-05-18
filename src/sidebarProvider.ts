@@ -23,14 +23,45 @@ export interface ExternalDragSignals {
   onEnd: () => void;
 }
 
+/**
+ * Host-side callbacks for attachment lifecycle. The webview is never trusted
+ * to mint or hand off bytes directly to the on-disk store — every operation
+ * funnels through one of these callbacks.
+ */
+export interface AttachmentHandlers {
+  /** Webview requested a file-picker dialog for the given ticket. */
+  onPick: (issueId: string) => void | Promise<void>;
+  /** Drag-drop carried bytes from the webview; host validates + writes. */
+  onAddBytes: (
+    issueId: string,
+    name: string,
+    mimeType: string,
+    bytes: Uint8Array,
+  ) => void | Promise<void>;
+  onDelete: (issueId: string, attachmentId: string) => void | Promise<void>;
+  /** Open the attachment in VSCode (image preview / system handler). */
+  onOpen: (issueId: string, attachmentId: string) => void | Promise<void>;
+}
+
+const NO_OP_ATTACHMENTS: AttachmentHandlers = {
+  onPick: () => {},
+  onAddBytes: () => {},
+  onDelete: () => {},
+  onOpen: () => {},
+};
+
 const ID_RE = /^DS-\d+$/;
 
-function readSettings(): Settings {
+function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
   const cfg = vscode.workspace.getConfiguration("dostuff");
+  const attachmentsDir = store.attachmentsDir();
   return {
     storagePath:    cfg.get<string>("storagePath", ".vscode/dostuff"),
     autoSave:       cfg.get<boolean>("autoSave", true),
     activeLaneCap:  cfg.get<number>("activeLaneCap", 6),
+    attachmentsBaseUri: attachmentsDir
+      ? webview.asWebviewUri(attachmentsDir).toString()
+      : null,
   };
 }
 
@@ -47,6 +78,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     private readonly applyUpdate: ApplyIssueUpdate,
     private readonly externalDrag: ExternalDragSignals = { onStart: () => {}, onEnd: () => {} },
     private readonly openLink: (url: string) => void | Promise<void> = () => {},
+    private readonly attachments: AttachmentHandlers = NO_OP_ATTACHMENTS,
   ) {
     this.output = vscode.window.createOutputChannel("DoStuff Webview");
     this.disposables.push(this.output);
@@ -66,9 +98,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   ): void {
     this.view = webviewView;
 
+    const localRoots: vscode.Uri[] = [vscode.Uri.joinPath(this.extensionUri, "media")];
+    const attachmentsDir = this.store.attachmentsDir();
+    if (attachmentsDir) localRoots.push(attachmentsDir);
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
+      localResourceRoots: localRoots,
     };
 
     webviewView.webview.html = getWebviewHtml({
@@ -104,11 +139,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   private async handleMessage(msg: WebviewToHost) {
     switch (msg.type) {
       case "ready":
-        this.view?.webview.postMessage({
-          type: "init",
-          issues: this.store.list(),
-          settings: readSettings(),
-        });
+        if (this.view) {
+          this.view.webview.postMessage({
+            type: "init",
+            issues: this.store.list(),
+            settings: readSettings(this.view.webview, this.store),
+          });
+        }
         break;
       case "createIssue": {
         const partial = msg.partial;
@@ -136,6 +173,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           verifyCriteria: typeof partial.verifyCriteria === "string" ? partial.verifyCriteria : "",
           tasks: Array.isArray(partial.tasks) ? partial.tasks : [],
           tags: coerceTags((partial as { tags?: unknown }).tags),
+          attachments: [],
           createdAt: now,
           resolvedAt: null,
           statusHistory: [{ status, at: now, by: "user" }],
@@ -193,6 +231,68 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           break;
         }
         await this.openLink(url);
+        break;
+      }
+      case "pickAttachment": {
+        const id = (msg as { issueId?: unknown }).issueId;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected pickAttachment: bad id`);
+          break;
+        }
+        await this.attachments.onPick(id);
+        break;
+      }
+      case "addAttachmentBytes": {
+        const m = msg as {
+          issueId?: unknown;
+          name?: unknown;
+          mimeType?: unknown;
+          bytes?: unknown;
+        };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.name !== "string" ||
+          typeof m.mimeType !== "string" ||
+          !Array.isArray(m.bytes)
+        ) {
+          this.output.appendLine(`Rejected addAttachmentBytes: bad payload`);
+          break;
+        }
+        await this.attachments.onAddBytes(
+          m.issueId,
+          m.name,
+          m.mimeType,
+          new Uint8Array(m.bytes as number[]),
+        );
+        break;
+      }
+      case "deleteAttachment": {
+        const m = msg as { issueId?: unknown; attachmentId?: unknown };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.attachmentId !== "string" ||
+          m.attachmentId.length === 0
+        ) {
+          this.output.appendLine(`Rejected deleteAttachment: bad payload`);
+          break;
+        }
+        await this.attachments.onDelete(m.issueId, m.attachmentId);
+        break;
+      }
+      case "openAttachment": {
+        const m = msg as { issueId?: unknown; attachmentId?: unknown };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.attachmentId !== "string" ||
+          m.attachmentId.length === 0
+        ) {
+          this.output.appendLine(`Rejected openAttachment: bad payload`);
+          break;
+        }
+        await this.attachments.onOpen(m.issueId, m.attachmentId);
         break;
       }
       default: {

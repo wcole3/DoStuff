@@ -30,6 +30,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     statusHistory:
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
+    attachments: overrides.attachments ?? [],
   };
 }
 
@@ -261,5 +262,122 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
     expect(next.createdAt).toBe(prior.createdAt);
     expect(next.record).toBe(prior.record);
     expect(next.title).toBe("renamed");
+  });
+});
+
+describe("mergeIssueUpdate attachments allow-list", () => {
+  test("incoming.attachments adding a new id is dropped (webview can't mint attachments)", () => {
+    const prior = makeIssue({
+      attachments: [
+        {
+          id: "a1",
+          name: "exists.png",
+          mimeType: "image/png",
+          sizeBytes: 10,
+          addedAt: "2026-05-18T00:00:00.000Z",
+        },
+      ],
+    });
+    const incoming: Partial<Issue> = {
+      attachments: [
+        prior.attachments[0]!,
+        {
+          id: "smuggled",
+          name: "evil.png",
+          mimeType: "image/png",
+          sizeBytes: 999,
+          addedAt: "2026-05-18T00:00:00.000Z",
+        },
+      ],
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+    expect(next.attachments).toHaveLength(1);
+    expect(next.attachments[0]!.id).toBe("a1");
+  });
+
+  test("incoming.attachments reordering existing entries is accepted", () => {
+    const a1 = {
+      id: "a1",
+      name: "first.png",
+      mimeType: "image/png",
+      sizeBytes: 10,
+      addedAt: "2026-05-18T00:00:00.000Z",
+    };
+    const a2 = {
+      id: "a2",
+      name: "second.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 20,
+      addedAt: "2026-05-18T00:00:01.000Z",
+    };
+    const prior = makeIssue({ attachments: [a1, a2] });
+    const incoming: Partial<Issue> = { attachments: [a2, a1] };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+    expect(next.attachments.map((a) => a.id)).toEqual(["a2", "a1"]);
+  });
+
+  test("incoming.attachments removing an existing entry is accepted", () => {
+    const a1 = {
+      id: "a1",
+      name: "first.png",
+      mimeType: "image/png",
+      sizeBytes: 10,
+      addedAt: "2026-05-18T00:00:00.000Z",
+    };
+    const a2 = {
+      id: "a2",
+      name: "second.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 20,
+      addedAt: "2026-05-18T00:00:01.000Z",
+    };
+    const prior = makeIssue({ attachments: [a1, a2] });
+    const incoming: Partial<Issue> = { attachments: [a1] };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+    expect(next.attachments).toHaveLength(1);
+    expect(next.attachments[0]!.id).toBe("a1");
+  });
+
+  test("attachment metadata is taken from prior (webview can't rewrite size/name)", () => {
+    const prior = makeIssue({
+      attachments: [
+        {
+          id: "a1",
+          name: "real.png",
+          mimeType: "image/png",
+          sizeBytes: 100,
+          addedAt: "2026-05-18T00:00:00.000Z",
+        },
+      ],
+    });
+    const incoming: Partial<Issue> = {
+      attachments: [
+        {
+          id: "a1",
+          name: "FAKE.png",
+          mimeType: "image/jpeg",
+          sizeBytes: 999_999_999,
+          addedAt: "1970-01-01T00:00:00.000Z",
+        },
+      ],
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+    expect(next.attachments[0]).toEqual(prior.attachments[0]!);
+  });
+
+  test("attachments default to prior when not provided", () => {
+    const prior = makeIssue({
+      attachments: [
+        {
+          id: "a1",
+          name: "keep.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+          addedAt: "2026-05-18T00:00:00.000Z",
+        },
+      ],
+    });
+    const next = ok(mergeIssueUpdate(prior, { title: "rename only" }, "user"));
+    expect(next.attachments).toBe(prior.attachments);
   });
 });

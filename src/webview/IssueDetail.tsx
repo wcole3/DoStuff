@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type DragEvent } from "react";
 import {
+  MAX_ATTACHMENT_BYTES,
   PRIORITIES,
   STATUSES,
   TYPES,
   canMoveToActiveLane,
+  type Attachment,
   type Issue,
   type IssueType,
   type Priority,
@@ -12,8 +14,12 @@ import {
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import {
   newTaskId,
+  postAddAttachmentBytes,
+  postDeleteAttachment,
   postDeleteIssue,
+  postOpenAttachment,
   postOpenLink,
+  postPickAttachment,
   postUpdateIssue,
   useIssues,
 } from "./messaging";
@@ -115,7 +121,7 @@ interface IssueDetailProps {
 }
 
 export function IssueDetail({ issue }: IssueDetailProps) {
-  const { issues } = useIssues();
+  const { issues, settings } = useIssues();
   // Unique tags across every ticket in the store, sorted for stable
   // datalist ordering. Cheap O(N tags) and recomputes only when the issue
   // list shifts. Used as TagEditor autocomplete suggestions.
@@ -303,6 +309,11 @@ export function IssueDetail({ issue }: IssueDetailProps) {
         <TagEditor tags={issue.tags} onChange={setTags} suggestions={tagSuggestions} />
       </div>
 
+      <AttachmentsSection
+        issue={issue}
+        attachmentsBaseUri={settings?.attachmentsBaseUri ?? null}
+      />
+
       <div>
         <div className="ds-d-section-h">Description</div>
         {editingDesc ? (
@@ -435,6 +446,186 @@ export function IssueDetail({ issue }: IssueDetailProps) {
               </span>
             </div>
           ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function isImageMime(mimeType: string): boolean {
+  return mimeType.startsWith("image/");
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+interface AttachmentsSectionProps {
+  issue: Issue;
+  attachmentsBaseUri: string | null;
+}
+
+function AttachmentsSection({ issue, attachmentsBaseUri }: AttachmentsSectionProps) {
+  const [viewing, setViewing] = useState<Attachment | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const disabled = attachmentsBaseUri === null;
+
+  const uriFor = (att: Attachment): string | null => {
+    if (!attachmentsBaseUri) return null;
+    const dot = att.name.lastIndexOf(".");
+    const ext = dot >= 0 ? att.name.slice(dot) : "";
+    return `${attachmentsBaseUri}/${issue.id}/${att.id}${ext}`;
+  };
+
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    if (!dragOver) setDragOver(true);
+  };
+  const handleDragLeave = () => setDragOver(false);
+  const handleDrop = async (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (disabled) return;
+    const files = Array.from(e.dataTransfer.files ?? []);
+    for (const f of files) {
+      if (f.size > MAX_ATTACHMENT_BYTES) {
+        // Host shows a toast for size violations from its end too; this
+        // short-circuit prevents an obvious round-trip for files dropped
+        // straight into the webview.
+        continue;
+      }
+      const buf = await f.arrayBuffer();
+      postAddAttachmentBytes(
+        issue.id,
+        f.name,
+        f.type || "application/octet-stream",
+        new Uint8Array(buf),
+      );
+    }
+  };
+
+  return (
+    <div>
+      <div className="ds-d-section-h">
+        Attachments
+        <span style={{ opacity: 0.5, fontWeight: 400, marginLeft: 6 }}>
+          {issue.attachments.length}
+        </span>
+        <button
+          className="ds-d-add-task"
+          onClick={() => postPickAttachment(issue.id)}
+          title={disabled ? "Open a folder to attach files" : "Attach a file"}
+          aria-label="Attach a file"
+          disabled={disabled}
+        >
+          <Icon name="plus" size={12} />
+        </button>
+      </div>
+      <div
+        className={`ds-attachments ${dragOver ? "is-drag-over" : ""} ${disabled ? "is-disabled" : ""}`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
+        {issue.attachments.length === 0 ? (
+          <div className="ds-att-empty">
+            {disabled
+              ? "Open a workspace folder to attach files."
+              : "Drop files here or click + to attach."}
+          </div>
+        ) : (
+          issue.attachments.map((att) => {
+            const url = uriFor(att);
+            const image = isImageMime(att.mimeType);
+            return (
+              <div key={att.id} className={`ds-att-chip ${image ? "is-image" : ""}`}>
+                <button
+                  type="button"
+                  className="ds-att-chip-main"
+                  onClick={() => {
+                    if (image) setViewing(att);
+                    else postOpenAttachment(issue.id, att.id);
+                  }}
+                  title={image ? "View image" : "Open file"}
+                >
+                  {image && url ? (
+                    <img
+                      className="ds-att-thumb"
+                      src={url}
+                      alt={att.name}
+                      loading="lazy"
+                    />
+                  ) : (
+                    <span className="ds-att-icon" aria-hidden="true">
+                      <Icon name="files" size={14} />
+                    </span>
+                  )}
+                  <span className="ds-att-meta">
+                    <span className="ds-att-name" title={att.name}>{att.name}</span>
+                    <span className="ds-att-size">{formatBytes(att.sizeBytes)}</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className="ds-att-delete"
+                  onClick={() => postDeleteAttachment(issue.id, att.id)}
+                  title="Delete attachment"
+                  aria-label="Delete attachment"
+                >
+                  <Icon name="close" size={10} />
+                </button>
+              </div>
+            );
+          })
+        )}
+      </div>
+      {viewing && (
+        <ImageOverlay
+          attachment={viewing}
+          src={uriFor(viewing)}
+          onClose={() => setViewing(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+interface ImageOverlayProps {
+  attachment: Attachment;
+  src: string | null;
+  onClose: () => void;
+}
+
+function ImageOverlay({ attachment, src, onClose }: ImageOverlayProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="ds-att-overlay" onClick={onClose}>
+      <div className="ds-att-overlay-frame" onClick={(e) => e.stopPropagation()}>
+        <button
+          className="ds-att-overlay-close"
+          onClick={onClose}
+          aria-label="Close image preview"
+        >
+          <Icon name="close" size={12} />
+        </button>
+        {src ? (
+          <img className="ds-att-overlay-img" src={src} alt={attachment.name} />
+        ) : (
+          <div className="ds-att-overlay-missing">Attachment file is missing.</div>
+        )}
+        <div className="ds-att-overlay-caption">
+          <span>{attachment.name}</span>
+          <span className="ds-att-overlay-size">{formatBytes(attachment.sizeBytes)}</span>
         </div>
       </div>
     </div>

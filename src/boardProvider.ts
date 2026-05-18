@@ -5,17 +5,21 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import type { ApplyIssueUpdate } from "./sidebarProvider";
+import type { ApplyIssueUpdate, AttachmentHandlers } from "./sidebarProvider";
 import type { Issue, Settings, WebviewToHost } from "./types";
 
 const ID_RE = /^DS-\d+$/;
 
-function readSettings(): Settings {
+function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
   const cfg = vscode.workspace.getConfiguration("dostuff");
+  const attachmentsDir = store.attachmentsDir();
   return {
     storagePath:    cfg.get<string>("storagePath", ".vscode/dostuff"),
     autoSave:       cfg.get<boolean>("autoSave", true),
     activeLaneCap:  cfg.get<number>("activeLaneCap", 6),
+    attachmentsBaseUri: attachmentsDir
+      ? webview.asWebviewUri(attachmentsDir).toString()
+      : null,
   };
 }
 
@@ -32,6 +36,12 @@ export class BoardPanel {
     store: IssueStore,
     applyUpdate: ApplyIssueUpdate,
     openLink: (url: string) => void | Promise<void> = () => {},
+    attachments: AttachmentHandlers = {
+      onPick: () => {},
+      onAddBytes: () => {},
+      onDelete: () => {},
+      onOpen: () => {},
+    },
   ) {
     if (BoardPanel.current) {
       // Reveal in its current column — don't move the panel if the user has
@@ -41,6 +51,9 @@ export class BoardPanel {
     }
 
     const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+    const localRoots: vscode.Uri[] = [vscode.Uri.joinPath(extensionUri, "media")];
+    const attachmentsDir = store.attachmentsDir();
+    if (attachmentsDir) localRoots.push(attachmentsDir);
     const panel = vscode.window.createWebviewPanel(
       BoardPanel.viewType,
       "DoStuff: Board",
@@ -48,11 +61,11 @@ export class BoardPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(extensionUri, "media")],
+        localResourceRoots: localRoots,
       }
     );
 
-    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate, openLink);
+    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate, openLink, attachments);
   }
 
   /** Re-broadcast current truth to the live board panel, if any. */
@@ -84,6 +97,12 @@ export class BoardPanel {
     private readonly store: IssueStore,
     private readonly applyUpdate: ApplyIssueUpdate,
     private readonly openLink: (url: string) => void | Promise<void> = () => {},
+    private readonly attachments: AttachmentHandlers = {
+      onPick: () => {},
+      onAddBytes: () => {},
+      onDelete: () => {},
+      onOpen: () => {},
+    },
   ) {
     this.panel = panel;
     this.panel.iconPath = vscode.Uri.joinPath(extensionUri, "media", "icon.svg");
@@ -118,7 +137,7 @@ export class BoardPanel {
         this.panel.webview.postMessage({
           type: "init",
           issues: this.store.list(),
-          settings: readSettings(),
+          settings: readSettings(this.panel.webview, this.store),
         });
         break;
       case "updateIssue": {
@@ -152,6 +171,68 @@ export class BoardPanel {
           break;
         }
         await this.openLink(url);
+        break;
+      }
+      case "pickAttachment": {
+        const id = (msg as { issueId?: unknown }).issueId;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected pickAttachment: bad id`);
+          break;
+        }
+        await this.attachments.onPick(id);
+        break;
+      }
+      case "addAttachmentBytes": {
+        const m = msg as {
+          issueId?: unknown;
+          name?: unknown;
+          mimeType?: unknown;
+          bytes?: unknown;
+        };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.name !== "string" ||
+          typeof m.mimeType !== "string" ||
+          !Array.isArray(m.bytes)
+        ) {
+          this.output.appendLine(`Rejected addAttachmentBytes: bad payload`);
+          break;
+        }
+        await this.attachments.onAddBytes(
+          m.issueId,
+          m.name,
+          m.mimeType,
+          new Uint8Array(m.bytes as number[]),
+        );
+        break;
+      }
+      case "deleteAttachment": {
+        const m = msg as { issueId?: unknown; attachmentId?: unknown };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.attachmentId !== "string" ||
+          m.attachmentId.length === 0
+        ) {
+          this.output.appendLine(`Rejected deleteAttachment: bad payload`);
+          break;
+        }
+        await this.attachments.onDelete(m.issueId, m.attachmentId);
+        break;
+      }
+      case "openAttachment": {
+        const m = msg as { issueId?: unknown; attachmentId?: unknown };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.attachmentId !== "string" ||
+          m.attachmentId.length === 0
+        ) {
+          this.output.appendLine(`Rejected openAttachment: bad payload`);
+          break;
+        }
+        await this.attachments.onOpen(m.issueId, m.attachmentId);
         break;
       }
       // The board view ignores message types only the sidebar handles

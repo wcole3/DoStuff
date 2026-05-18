@@ -89,6 +89,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     statusHistory:
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
+    attachments: overrides.attachments ?? [],
   };
 }
 
@@ -1770,6 +1771,166 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     });
     const contents = (json.result as { contents: Array<{ text: string }> }).contents;
     expect(contents[0].text).toBe(custom);
+  });
+
+  test("get_ticket payload includes attachments with dostuff://attachments/<id>/<att> uris", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        title: "With image",
+        status: "Working",
+        attachments: [
+          {
+            id: "abc",
+            name: "hero.png",
+            mimeType: "image/png",
+            sizeBytes: 1234,
+            addedAt: "2026-05-18T00:00:00.000Z",
+          },
+        ],
+      }),
+    ]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "tools/call", {
+      name: "get_ticket",
+      arguments: { query: "1" },
+    });
+    const result = json.result as {
+      content: Array<{ type: string; text: string }>;
+    };
+    const body = JSON.parse(result.content[0].text) as {
+      ticket: { attachments: Array<Record<string, unknown>> };
+    };
+    expect(body.ticket.attachments).toHaveLength(1);
+    expect(body.ticket.attachments[0]).toEqual({
+      id: "abc",
+      name: "hero.png",
+      mimeType: "image/png",
+      sizeBytes: 1234,
+      addedAt: "2026-05-18T00:00:00.000Z",
+      uri: "dostuff://attachments/DS-001/abc",
+    });
+  });
+
+  test("publicView always includes an attachments array (defaults to [])", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, status: "Planned" }),
+    ]);
+    ({ server, port } = await bootServer(store));
+    const json = await mcpJsonRpc(port, "resources/read", {
+      uri: "dostuff://tickets/DS-001",
+    });
+    const contents = (json.result as { contents: Array<{ text: string }> }).contents;
+    const payload = JSON.parse(contents[0].text) as {
+      ticket: { attachments: unknown[] };
+    };
+    expect(Array.isArray(payload.ticket.attachments)).toBe(true);
+    expect(payload.ticket.attachments).toHaveLength(0);
+  });
+
+  test("attachment resource returns BlobResourceContents with the bytes", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Working",
+        attachments: [
+          {
+            id: "abc",
+            name: "hero.png",
+            mimeType: "image/png",
+            sizeBytes: 4,
+            addedAt: "2026-05-18T00:00:00.000Z",
+          },
+        ],
+      }),
+    ]);
+    // Override the disk reader so the resource handler can serve bytes
+    // without a real workspace fs.
+    (store as unknown as { readAttachment: (issueId: string, attId: string) => Promise<Uint8Array> })
+      .readAttachment = async () => new Uint8Array([1, 2, 3, 4]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "resources/read", {
+      uri: "dostuff://attachments/DS-001/abc",
+    });
+    expect(json.error).toBeUndefined();
+    const contents = (json.result as { contents: Array<{ uri: string; mimeType: string; blob: string }> })
+      .contents;
+    expect(contents).toHaveLength(1);
+    expect(contents[0].uri).toBe("dostuff://attachments/DS-001/abc");
+    expect(contents[0].mimeType).toBe("image/png");
+    expect(contents[0].blob).toBe(Buffer.from([1, 2, 3, 4]).toString("base64"));
+  });
+
+  test("attachment resource: unknown attachment id returns an error", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, status: "Working" }),
+    ]);
+    ({ server, port } = await bootServer(store));
+    const json = await mcpJsonRpc(port, "resources/read", {
+      uri: "dostuff://attachments/DS-001/ghost",
+    });
+    expect(json.error).toBeDefined();
+    expect(json.error!.message.toLowerCase()).toContain("not found");
+  });
+
+  test("attachment resource: missing on-disk file returns an error", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Working",
+        attachments: [
+          {
+            id: "abc",
+            name: "ghost.png",
+            mimeType: "image/png",
+            sizeBytes: 1,
+            addedAt: "2026-05-18T00:00:00.000Z",
+          },
+        ],
+      }),
+    ]);
+    (store as unknown as { readAttachment: () => Promise<Uint8Array> }).readAttachment =
+      async () => {
+        throw new Error("file gone");
+      };
+    ({ server, port } = await bootServer(store));
+    const json = await mcpJsonRpc(port, "resources/read", {
+      uri: "dostuff://attachments/DS-001/abc",
+    });
+    expect(json.error).toBeDefined();
+    expect(json.error!.message.toLowerCase()).toContain("missing");
+  });
+
+  test("attachment resource: oversize file is rejected", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Working",
+        attachments: [
+          {
+            id: "huge",
+            name: "huge.bin",
+            mimeType: "application/octet-stream",
+            sizeBytes: 1,
+            addedAt: "2026-05-18T00:00:00.000Z",
+          },
+        ],
+      }),
+    ]);
+    (store as unknown as { readAttachment: () => Promise<Uint8Array> }).readAttachment =
+      async () => new Uint8Array(10 * 1024 * 1024 + 1); // 10 MB + 1
+    ({ server, port } = await bootServer(store));
+    const json = await mcpJsonRpc(port, "resources/read", {
+      uri: "dostuff://attachments/DS-001/huge",
+    });
+    expect(json.error).toBeDefined();
+    expect(json.error!.message.toLowerCase()).toContain("10 mb");
   });
 
   test("'workflow' prompt is registered and returns the workflow prompt", async () => {

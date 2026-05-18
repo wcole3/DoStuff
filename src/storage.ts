@@ -6,6 +6,7 @@
 
 import * as vscode from "vscode";
 import {
+  coerceAttachments,
   coerceTags,
   isPriority,
   isStatus,
@@ -63,6 +64,7 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       statusHistory: Array.isArray(issue.statusHistory) ? issue.statusHistory : [],
       tasks: Array.isArray(issue.tasks) ? issue.tasks : [],
       tags: coerceTags((issue as any).tags),
+      attachments: coerceAttachments((issue as any).attachments),
       resolvedAt: issue.resolvedAt ?? null,
     },
     coerced,
@@ -127,6 +129,7 @@ export class IssueStore {
   async remove(id: string): Promise<void> {
     this.cache = this.cache.filter((i) => i.id !== id);
     await this.deleteOne(id);
+    await this.deleteIssueAttachments(id);
     this.emitter.fire(this.cache);
   }
 
@@ -196,6 +199,10 @@ export class IssueStore {
       storagePath:   c.get<string>("storagePath", ".vscode/dostuff"),
       autoSave:      c.get<boolean>("autoSave", true),
       activeLaneCap: c.get<number>("activeLaneCap", 6),
+      // Internal getter — not broadcast to the webview, so the URI does not
+      // need to be resolved here. The providers compute it from the live
+      // webview reference instead.
+      attachmentsBaseUri: null,
     };
   }
 
@@ -203,6 +210,98 @@ export class IssueStore {
     const root = vscode.workspace.workspaceFolders?.[0];
     if (!root) return null;
     return vscode.Uri.joinPath(root.uri, this.settings.storagePath);
+  }
+
+  /** Root of all attachment binaries: `<storagePath>/attachments`. */
+  attachmentsDir(): vscode.Uri | null {
+    const folder = this.folderUri();
+    if (!folder) return null;
+    return vscode.Uri.joinPath(folder, "attachments");
+  }
+
+  // ─── attachments ────────────────────────────────────────────────────────
+
+  private attachmentFileUri(issueId: string, attachmentId: string, ext: string): vscode.Uri | null {
+    const root = this.attachmentsDir();
+    if (!root) return null;
+    return vscode.Uri.joinPath(root, issueId, `${attachmentId}${ext}`);
+  }
+
+  /**
+   * Write attachment bytes to `<storagePath>/attachments/<issueId>/<attId><ext>`.
+   * Returns false if no workspace folder is open. Throws on I/O failure.
+   */
+  async writeAttachment(
+    issueId: string,
+    attachmentId: string,
+    ext: string,
+    bytes: Uint8Array,
+  ): Promise<boolean> {
+    const root = this.attachmentsDir();
+    if (!root) return false;
+    const dir = vscode.Uri.joinPath(root, issueId);
+    try { await vscode.workspace.fs.createDirectory(dir); } catch {}
+    const file = vscode.Uri.joinPath(dir, `${attachmentId}${ext}`);
+    await vscode.workspace.fs.writeFile(file, bytes);
+    return true;
+  }
+
+  /**
+   * Resolve the on-disk URI of an attachment by enumerating the issue's folder.
+   * The on-disk filename is `<attachmentId><ext>`; we don't store the extension
+   * in metadata because the host already knows it from the original filename.
+   */
+  async findAttachmentUri(issueId: string, attachmentId: string): Promise<vscode.Uri | null> {
+    const root = this.attachmentsDir();
+    if (!root) return null;
+    const dir = vscode.Uri.joinPath(root, issueId);
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(dir);
+    } catch {
+      return null;
+    }
+    for (const [name, kind] of entries) {
+      if (kind !== vscode.FileType.File) continue;
+      const dot = name.indexOf(".");
+      const baseName = dot >= 0 ? name.slice(0, dot) : name;
+      if (baseName === attachmentId) {
+        return vscode.Uri.joinPath(dir, name);
+      }
+    }
+    return null;
+  }
+
+  /** Read attachment bytes. Throws when the file is missing. */
+  async readAttachment(issueId: string, attachmentId: string): Promise<Uint8Array> {
+    const uri = await this.findAttachmentUri(issueId, attachmentId);
+    if (!uri) throw new Error(`Attachment file not found for ${issueId}/${attachmentId}`);
+    return vscode.workspace.fs.readFile(uri);
+  }
+
+  /** Remove a single attachment file. No-op when the file doesn't exist. */
+  async deleteAttachmentFile(issueId: string, attachmentId: string): Promise<void> {
+    const uri = await this.findAttachmentUri(issueId, attachmentId);
+    if (!uri) return;
+    try { await vscode.workspace.fs.delete(uri); } catch {}
+  }
+
+  /** Remove an issue's entire attachments folder. Called from `remove(id)`. */
+  private async deleteIssueAttachments(issueId: string): Promise<void> {
+    const root = this.attachmentsDir();
+    if (!root) return;
+    const dir = vscode.Uri.joinPath(root, issueId);
+    try {
+      await vscode.workspace.fs.delete(dir, { recursive: true, useTrash: false });
+    } catch {}
+  }
+
+  private async wipeAttachmentsRoot(): Promise<void> {
+    const root = this.attachmentsDir();
+    if (!root) return;
+    try {
+      await vscode.workspace.fs.delete(root, { recursive: true, useTrash: false });
+    } catch {}
   }
 
   // ─── JSON-file backend ──────────────────────────────────────────────────
@@ -334,6 +433,7 @@ export class IssueStore {
   private async wipe(): Promise<void> {
     if (this.folderUri()) {
       await this.wipeFiles();
+      await this.wipeAttachmentsRoot();
     } else {
       await this.ctx.globalState.update(STATE_KEY_FALLBACK, []);
     }

@@ -5,7 +5,7 @@
   "license": "MIT",
   "icon": "media/dostuff-icon-sm.png",
   "description": "Simple software issue board with an MCP server for agent integration",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "main": "./dist/extension.cjs",
   "module": "index.ts",
   "type": "module",
