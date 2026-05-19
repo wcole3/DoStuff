@@ -83,6 +83,57 @@ describe("IssueDetail", () => {
     expect(api.posted.find((m) => m.type === "updateIssue")).toBeUndefined();
   });
 
+  test("task text edits buffer locally and only post one updateIssue on blur", async () => {
+    // Regression: keystroke-per-postMessage caused dropped chars at high WPM
+    // because the controlled <input value={task.text}> snapped back to the
+    // pre-roundtrip value before the next keystroke. TaskRow now buffers the
+    // draft locally and commits on blur, mirroring title/desc/verify.
+    const issue = makeIssue({
+      id: "DS-001",
+      status: "Working",
+      tasks: [{ id: "t1", text: "", done: false }],
+    });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    const input = document.querySelector(".ds-task-text") as HTMLInputElement;
+    expect(input).not.toBeNull();
+
+    // Type a multi-character string. None of these keystrokes should post.
+    await userEvent.type(input, "write more tests");
+    expect(api.posted.find((m) => m.type === "updateIssue")).toBeUndefined();
+    expect(input.value).toBe("write more tests");
+
+    fireEvent.blur(input);
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue") as Array<{
+      type: "updateIssue";
+      issue: Issue;
+    }>;
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.issue.tasks[0]!.text).toBe("write more tests");
+  });
+
+  test("task text edits commit on Enter and don't post per keystroke", async () => {
+    const issue = makeIssue({
+      id: "DS-001",
+      status: "Working",
+      tasks: [{ id: "t1", text: "", done: false }],
+    });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    const input = document.querySelector(".ds-task-text") as HTMLInputElement;
+    await userEvent.type(input, "hello{Enter}");
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue") as Array<{
+      type: "updateIssue";
+      issue: Issue;
+    }>;
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.issue.tasks[0]!.text).toBe("hello");
+  });
+
   test("toggling a task checkbox posts updateIssue with the task flipped", async () => {
     const issue = makeIssue({
       id: "DS-001",

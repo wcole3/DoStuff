@@ -10,6 +10,7 @@ import {
   type IssueType,
   type Priority,
   type Status,
+  type Task,
 } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import {
@@ -306,7 +307,7 @@ export function IssueDetail({ issue }: IssueDetailProps) {
 
       <div>
         <div className="ds-d-section-h">Tags</div>
-        <TagEditor tags={issue.tags} onChange={setTags} suggestions={tagSuggestions} />
+        <TagEditor key={issue.id} tags={issue.tags} onChange={setTags} suggestions={tagSuggestions} />
       </div>
 
       <AttachmentsSection
@@ -348,25 +349,13 @@ export function IssueDetail({ issue }: IssueDetailProps) {
         </div>
         <div className="ds-d-tasks">
           {issue.tasks.map((task) => (
-            <div className={`ds-task ${task.done ? "is-done" : ""}`} key={task.id}>
-              <button
-                className="ds-task-check"
-                onClick={() => toggleTask(task.id)}
-                aria-checked={task.done}
-                role="checkbox"
-              >
-                {task.done && <Icon name="check" size={10} />}
-              </button>
-              <input
-                className="ds-task-text"
-                value={task.text}
-                placeholder="Task description"
-                onChange={(e) => updateTaskText(task.id, e.target.value)}
-              />
-              <button className="ds-task-rm" onClick={() => removeTask(task.id)} title="Remove" aria-label="Remove task">
-                <Icon name="close" size={9} />
-              </button>
-            </div>
+            <TaskRow
+              key={task.id}
+              task={task}
+              onToggle={() => toggleTask(task.id)}
+              onCommitText={(text) => updateTaskText(task.id, text)}
+              onRemove={() => removeTask(task.id)}
+            />
           ))}
           {issue.tasks.length === 0 && <div className="ds-d-empty">No tasks yet.</div>}
         </div>
@@ -628,6 +617,69 @@ function ImageOverlay({ attachment, src, onClose }: ImageOverlayProps) {
           <span className="ds-att-overlay-size">{formatBytes(attachment.sizeBytes)}</span>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Single task row. Holds the input's text in local state and only posts an
+ * `updateIssue` on blur / Enter, so fast typists don't lose characters to the
+ * controlled-input ↔ host-roundtrip race that bit the original keystroke-per-
+ * postMessage design. Mirrors how title / description / verify-criteria
+ * already buffer their drafts.
+ */
+function TaskRow({
+  task,
+  onToggle,
+  onCommitText,
+  onRemove,
+}: {
+  task: Task;
+  onToggle: () => void;
+  onCommitText: (text: string) => void;
+  onRemove: () => void;
+}) {
+  const [draft, setDraft] = useState(task.text);
+  // Sync from props when the task's text changes externally (e.g. an MCP
+  // agent rewrites it). Last-external-write wins, same trade-off as the
+  // title / description editors above.
+  useEffect(() => { setDraft(task.text); }, [task.text]);
+
+  const commit = () => {
+    if (draft !== task.text) onCommitText(draft);
+  };
+
+  return (
+    <div className={`ds-task ${task.done ? "is-done" : ""}`}>
+      <button
+        className="ds-task-check"
+        onClick={onToggle}
+        aria-checked={task.done}
+        role="checkbox"
+      >
+        {task.done && <Icon name="check" size={10} />}
+      </button>
+      <input
+        className="ds-task-text"
+        value={draft}
+        placeholder="Task description"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            (e.currentTarget as HTMLInputElement).blur();
+          }
+        }}
+      />
+      <button
+        className="ds-task-rm"
+        onClick={onRemove}
+        title="Remove"
+        aria-label="Remove task"
+      >
+        <Icon name="close" size={9} />
+      </button>
     </div>
   );
 }

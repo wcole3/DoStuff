@@ -68,53 +68,80 @@ interface TagEditorProps {
   placeholder?: string;
 }
 
-/** Inline editor: existing chips with close buttons + input that adds on Enter or comma. */
+/**
+ * Inline editor: existing chips with close buttons + input that adds on Enter
+ * or comma.
+ *
+ * Holds a local mirror of the tag list so two rapid commits (Enter, Enter)
+ * don't both read the same in-flight `tags` prop and lose the first one.
+ * Without this, `onChange` in IssueDetail is `postUpdateIssue` — a pure
+ * outbound message that doesn't mutate webview state, so the prop only
+ * updates after the host round-trips back. SQLite write latency widens the
+ * window. The mirror commits locally first and posts second, so a follow-up
+ * commit reads the already-updated local list.
+ *
+ * Trade-off (intentional): once mounted, prop updates are NOT adopted — the
+ * mirror keeps whatever the user has committed locally. We can't reliably
+ * distinguish a late-arriving echo of our own earlier commit from an
+ * external mid-edit update, so we keep the local copy as authoritative.
+ * Callers MUST pass `key={issue.id}` (or similar entity key) so switching
+ * tickets gives a fresh local state. Mirrors the title / desc / verify
+ * pattern at the other extreme: those clobber on every prop change, this
+ * never does.
+ */
 export function TagEditor({
   tags,
   onChange,
   suggestions,
   placeholder = "Add tag…",
 }: TagEditorProps) {
+  const [localTags, setLocalTags] = useState(tags);
   const [draft, setDraft] = useState("");
   // useId() returns colon-bearing strings like `:r1:`; sanitise so the id is
   // a valid CSS selector (some test environments / older browsers choke on
   // colons in element ids).
   const listId = `tag-suggest-${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
-  const applied = useMemo(() => new Set(tags.map((t) => t.toLowerCase())), [tags]);
+
+  const applied = useMemo(() => new Set(localTags.map((t) => t.toLowerCase())), [localTags]);
   const filteredSuggestions = useMemo(
     () => (suggestions ?? []).filter((s) => !applied.has(s.toLowerCase())),
     [suggestions, applied],
   );
 
+  const emit = (next: string[]) => {
+    setLocalTags(next);
+    onChange(next);
+  };
+
   const commit = (raw: string) => {
     const next = normalizeTag(raw);
     if (!next) return;
     const lower = next.toLowerCase();
-    if (tags.some((t) => t.toLowerCase() === lower)) {
+    if (localTags.some((t) => t.toLowerCase() === lower)) {
       setDraft("");
       return;
     }
-    onChange([...tags, next]);
+    emit([...localTags, next]);
     setDraft("");
   };
 
   const remove = (tag: string) => {
-    onChange(tags.filter((t) => t !== tag));
+    emit(localTags.filter((t) => t !== tag));
   };
 
   const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter" || e.key === ",") {
       e.preventDefault();
       commit(draft);
-    } else if (e.key === "Backspace" && draft === "" && tags.length) {
+    } else if (e.key === "Backspace" && draft === "" && localTags.length) {
       e.preventDefault();
-      onChange(tags.slice(0, -1));
+      emit(localTags.slice(0, -1));
     }
   };
 
   return (
     <div className="ds-tag-edit">
-      {tags.map((tag) => (
+      {localTags.map((tag) => (
         <span
           key={tag}
           className="ds-tag-chip ds-tag-chip-edit"
@@ -151,3 +178,4 @@ export function TagEditor({
     </div>
   );
 }
+
