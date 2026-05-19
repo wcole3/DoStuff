@@ -309,6 +309,8 @@ export const workspace = {
     stat: (_uri: UriLike): Thenable<{ type: number; ctime: number; mtime: number; size: number }> =>
       Promise.resolve({ type: FileType.File, ctime: 0, mtime: 0, size: 0 }),
     readDirectory: (_uri: UriLike): Thenable<Array<[string, FileType]>> => Promise.resolve([]),
+    rename: (_source: UriLike, _target: UriLike, _options?: { overwrite?: boolean }): Thenable<void> =>
+      Promise.resolve(),
   },
   openTextDocument: (..._args: unknown[]) => Promise.resolve(undefined),
 };

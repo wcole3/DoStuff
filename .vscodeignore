@@ -5,6 +5,7 @@
 # Whitelist what you need (sourcemaps excluded — dev-only, bloat the vsix)
 !.vscodeignore
 !dist/*.cjs
+!dist/*.wasm
 !media/*.js
 !media/*.css
 !media/*.svg

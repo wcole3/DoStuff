@@ -2,14 +2,23 @@
 //
 // Strategy: by default the mock `vscode.workspace.workspaceFolders` is
 // `undefined`, so the store falls back to `globalState`. That lets us exercise
-// init/upsert/list/get/remove/replaceAll/onChange/reload without touching disk.
-// A small in-memory FS shim is installed (and restored per test) when we need
-// to exercise the file-backed branch (corrupt JSON, reload-from-disk).
+// init/upsert/list/get/remove/replaceAll/onChange/reload without any SQLite or
+// disk work. A small in-memory FS shim is installed (and restored per test)
+// when we need to exercise the SQLite-backed branch — those tests pass the
+// real `sql-wasm.wasm` bytes from node_modules into the store so it runs the
+// actual SQL engine end-to-end.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { GITIGNORE_CONTENT, IssueStore, normalize } from "./storage";
 import type { Issue, IssueType, Priority, Status } from "./types";
+
+// Real sql.js WASM bytes for the SQLite-backed branch. Loaded once.
+const WASM_BINARY = fs.readFileSync(
+  path.join(import.meta.dir, "..", "node_modules", "sql.js", "dist", "sql-wasm.wasm"),
+);
 
 // ----- Test helpers ----------------------------------------------------------
 
@@ -45,6 +54,10 @@ function makeContext(globalStateSeed: Record<string, unknown> = {}): vscode.Exte
     },
     asAbsolutePath: (p: string) => `/tmp/dostuff-test/${p}`,
   } as unknown as vscode.ExtensionContext;
+}
+
+function makeSqlStore(ctx: vscode.ExtensionContext): IssueStore {
+  return new IssueStore(ctx, { wasmBinary: WASM_BINARY });
 }
 
 let issueCounter = 0;
@@ -210,7 +223,7 @@ describe("nextNumber", () => {
   });
 });
 
-// ----- list / get / upsert / remove ------------------------------------------
+// ----- list / get / upsert / remove (globalState fallback) -------------------
 
 describe("IssueStore CRUD (globalState backed)", () => {
   test("upsert then list — sorted by createdAt desc", async () => {
@@ -306,12 +319,12 @@ describe("IssueStore CRUD (globalState backed)", () => {
   });
 });
 
-// ----- file-backed branch coverage -------------------------------------------
+// ----- SQLite-backed branch coverage -----------------------------------------
 //
-// The default `workspace.workspaceFolders` is undefined so the store uses
-// globalState. To cover the file-backed code paths (corrupt JSON, reload) we
-// install a tiny in-memory FS over `vscode.workspace.fs` and pretend there's
-// a workspace folder. Restored after each test.
+// To exercise the SQLite-backed code paths we install a tiny in-memory FS over
+// `vscode.workspace.fs` and pretend there's a workspace folder. The store gets
+// the real sql.js WASM bytes so it runs the actual SQL engine end-to-end
+// against the virtual FS. Restored after each test.
 
 interface FsEntry { content: Uint8Array }
 type VirtualFs = Map<string, FsEntry>;
@@ -321,10 +334,11 @@ interface FsHandles {
   origFs: typeof vscode.workspace.fs;
 }
 
-function installVirtualFs(seed: Record<string, string> = {}): { fs: VirtualFs; handles: FsHandles } {
-  const fs: VirtualFs = new Map();
-  for (const [path, body] of Object.entries(seed)) {
-    fs.set(path, { content: new TextEncoder().encode(body) });
+function installVirtualFs(seed: Record<string, string | Uint8Array> = {}): { fs: VirtualFs; handles: FsHandles } {
+  const virtualFs: VirtualFs = new Map();
+  for (const [p, body] of Object.entries(seed)) {
+    const content = typeof body === "string" ? new TextEncoder().encode(body) : body;
+    virtualFs.set(p, { content });
   }
 
   const handles: FsHandles = {
@@ -340,30 +354,30 @@ function installVirtualFs(seed: Record<string, string> = {}): { fs: VirtualFs; h
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (vscode.workspace as any).fs = {
     readFile: async (uri: { path: string }) => {
-      const entry = fs.get(uri.path);
+      const entry = virtualFs.get(uri.path);
       if (!entry) throw Object.assign(new Error("ENOENT"), { code: "FileNotFound" });
       return entry.content;
     },
     writeFile: async (uri: { path: string }, content: Uint8Array) => {
-      fs.set(uri.path, { content });
+      virtualFs.set(uri.path, { content });
     },
     createDirectory: async () => {},
     delete: async (uri: { path: string }, options?: { recursive?: boolean }) => {
       if (options?.recursive) {
         const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
-        for (const key of Array.from(fs.keys())) {
-          if (key === uri.path || key.startsWith(prefix)) fs.delete(key);
+        for (const key of Array.from(virtualFs.keys())) {
+          if (key === uri.path || key.startsWith(prefix)) virtualFs.delete(key);
         }
       } else {
-        fs.delete(uri.path);
+        virtualFs.delete(uri.path);
       }
     },
     stat: async (uri: { path: string }) => {
-      if (fs.has(uri.path)) {
+      if (virtualFs.has(uri.path)) {
         return { type: vscode.FileType.File, ctime: 0, mtime: 0, size: 0 };
       }
       const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
-      for (const key of fs.keys()) {
+      for (const key of virtualFs.keys()) {
         if (key.startsWith(prefix)) {
           return { type: vscode.FileType.Directory, ctime: 0, mtime: 0, size: 0 };
         }
@@ -373,7 +387,7 @@ function installVirtualFs(seed: Record<string, string> = {}): { fs: VirtualFs; h
     readDirectory: async (uri: { path: string }) => {
       const prefix = uri.path.endsWith("/") ? uri.path : uri.path + "/";
       const seen = new Map<string, number>();
-      for (const key of fs.keys()) {
+      for (const key of virtualFs.keys()) {
         if (!key.startsWith(prefix)) continue;
         const tail = key.slice(prefix.length);
         const slash = tail.indexOf("/");
@@ -386,9 +400,19 @@ function installVirtualFs(seed: Record<string, string> = {}): { fs: VirtualFs; h
       }
       return Array.from(seen.entries());
     },
+    rename: async (
+      source: { path: string },
+      target: { path: string },
+      _options?: { overwrite?: boolean },
+    ) => {
+      const entry = virtualFs.get(source.path);
+      if (!entry) throw Object.assign(new Error("ENOENT"), { code: "FileNotFound" });
+      virtualFs.set(target.path, entry);
+      virtualFs.delete(source.path);
+    },
   };
 
-  return { fs, handles };
+  return { fs: virtualFs, handles };
 }
 
 function restoreFs(handles: FsHandles) {
@@ -398,7 +422,7 @@ function restoreFs(handles: FsHandles) {
   (vscode.workspace as any).fs = handles.origFs;
 }
 
-describe("IssueStore (file-backed branch)", () => {
+describe("IssueStore (SQLite-backed branch)", () => {
   let handles: FsHandles | null = null;
 
   afterEach(() => {
@@ -408,7 +432,66 @@ describe("IssueStore (file-backed branch)", () => {
     }
   });
 
-  test("corrupt JSON file is skipped; other issues still load", async () => {
+  test("first init creates dostuff.db; round-trips upsert across store instances", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    const issue = makeIssue({
+      id: "DS-077",
+      number: 77,
+      title: "persist me",
+      tags: ["alpha", "beta"],
+      tasks: [{ id: "t1", text: "first", done: false }],
+    });
+    await a.upsert(issue);
+    a.dispose();
+
+    expect(vfs.get("/ws/.vscode/dostuff/dostuff.db")).toBeDefined();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    const loaded = b.get("DS-077");
+    expect(loaded?.title).toBe("persist me");
+    expect(loaded?.tags).toEqual(["alpha", "beta"]);
+    expect(loaded?.tasks).toEqual([{ id: "t1", text: "first", done: false }]);
+    b.dispose();
+  });
+
+  test("migrates pre-existing JSON tickets into the DB and moves them to legacy-json-backup/", async () => {
+    const goodIssue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      title: "good",
+      status: "Planned",
+    });
+    const legacyIssue = makeIssue({
+      id: "DS-002",
+      number: 2,
+      title: "legacy",
+      status: "Planned",
+    });
+    const { fs: vfs, handles: h } = installVirtualFs({
+      "/ws/.vscode/dostuff/DS-001.json": JSON.stringify(goodIssue),
+      "/ws/.vscode/dostuff/DS-002.json": JSON.stringify(legacyIssue),
+    });
+    handles = h;
+
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    expect(store.list().map((i) => i.id).sort()).toEqual(["DS-001", "DS-002"]);
+    expect(vfs.get("/ws/.vscode/dostuff/dostuff.db")).toBeDefined();
+    expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-001.json")).toBeDefined();
+    expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-002.json")).toBeDefined();
+    expect(vfs.get("/ws/.vscode/dostuff/DS-001.json")).toBeUndefined();
+    expect(vfs.get("/ws/.vscode/dostuff/DS-002.json")).toBeUndefined();
+    store.dispose();
+  });
+
+  test("corrupt JSON file is logged and skipped during migration; valid files still imported", async () => {
     const goodIssue = makeIssue({
       id: "DS-001",
       number: 1,
@@ -421,42 +504,117 @@ describe("IssueStore (file-backed branch)", () => {
     });
     handles = h;
 
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
 
     expect(store.list().map((i) => i.id)).toEqual(["DS-001"]);
+    store.dispose();
   });
 
-  test("writes .gitignore on first upsert when none present", async () => {
-    const { fs, handles: h } = installVirtualFs({});
+  test("idempotent: second init against an existing dostuff.db doesn't re-migrate", async () => {
+    const goodIssue = makeIssue({ id: "DS-001", number: 1, title: "first" });
+    const { fs: vfs, handles: h } = installVirtualFs({
+      "/ws/.vscode/dostuff/DS-001.json": JSON.stringify(goodIssue),
+    });
     handles = h;
 
-    const store = new IssueStore(makeContext());
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    a.dispose();
+
+    // After first init: db exists, json file moved to backup.
+    expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-001.json")).toBeDefined();
+    expect(vfs.get("/ws/.vscode/dostuff/DS-001.json")).toBeUndefined();
+
+    // Plant a sentinel into the backup folder — if migration ran a second time
+    // it would overwrite the json on disk (or fail to find it). Track count.
+    const backupBefore = Array.from(vfs.keys()).filter((k) =>
+      k.startsWith("/ws/.vscode/dostuff/legacy-json-backup/")
+    ).length;
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.list().map((i) => i.id)).toEqual(["DS-001"]);
+    b.dispose();
+
+    const backupAfter = Array.from(vfs.keys()).filter((k) =>
+      k.startsWith("/ws/.vscode/dostuff/legacy-json-backup/")
+    ).length;
+    expect(backupAfter).toBe(backupBefore);
+  });
+
+  test("remove(id) cascades and clears all child rows for that issue", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+
+    const richIssue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      title: "rich",
+      tasks: [
+        { id: "t1", text: "first", done: false },
+        { id: "t2", text: "second", done: true },
+      ],
+      tags: ["alpha", "beta"],
+      statusHistory: [
+        { status: "Thinking", at: "2025-01-01T00:00:00.000Z", by: "user" },
+        { status: "Planned", at: "2025-01-02T00:00:00.000Z", by: "user" },
+      ],
+      record: [{ at: "2025-01-01T00:00:00.000Z", author: "user", text: "first note" }],
+    });
+    await a.upsert(richIssue);
+
+    const other = makeIssue({ id: "DS-002", number: 2, title: "other", tags: ["alpha"] });
+    await a.upsert(other);
+
+    await a.remove("DS-001");
+    a.dispose();
+
+    // Re-open and confirm DS-001 is fully gone but DS-002's "alpha" tag survives.
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-001")).toBeUndefined();
+    expect(b.get("DS-002")?.tags).toEqual(["alpha"]);
+    b.dispose();
+  });
+
+  test("writes .gitignore on init when none present", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs({});
+    handles = h;
+
+    const store = makeSqlStore(makeContext());
     await store.init();
     await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
 
-    const entry = fs.get("/ws/.vscode/dostuff/.gitignore");
+    const entry = vfs.get("/ws/.vscode/dostuff/.gitignore");
     expect(entry).toBeDefined();
     expect(new TextDecoder().decode(entry!.content)).toBe(GITIGNORE_CONTENT);
+    store.dispose();
   });
 
   test("does not overwrite a user-edited .gitignore", async () => {
     const customBody = "# my custom rules\n!keep-me.json\n";
-    const { fs, handles: h } = installVirtualFs({
+    const { fs: vfs, handles: h } = installVirtualFs({
       "/ws/.vscode/dostuff/.gitignore": customBody,
     });
     handles = h;
 
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
     await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
 
-    const entry = fs.get("/ws/.vscode/dostuff/.gitignore");
+    const entry = vfs.get("/ws/.vscode/dostuff/.gitignore");
     expect(new TextDecoder().decode(entry!.content)).toBe(customBody);
+    store.dispose();
   });
 
   test("respects dostuff.writeStorageGitignore=false (no .gitignore written)", async () => {
-    const { fs, handles: h } = installVirtualFs({});
+    const { fs: vfs, handles: h } = installVirtualFs({});
     handles = h;
 
     const origGetConfig = vscode.workspace.getConfiguration;
@@ -469,44 +627,256 @@ describe("IssueStore (file-backed branch)", () => {
       has: () => false,
     });
     try {
-      const store = new IssueStore(makeContext());
+      const store = makeSqlStore(makeContext());
       await store.init();
       await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
-      expect(fs.has("/ws/.vscode/dostuff/.gitignore")).toBe(false);
+      expect(vfs.has("/ws/.vscode/dostuff/.gitignore")).toBe(false);
+      store.dispose();
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (vscode.workspace as any).getConfiguration = origGetConfig;
     }
   });
 
-  test("reload() re-reads from disk after external mutation", async () => {
-    const initialIssue = makeIssue({ id: "DS-001", number: 1, title: "first" });
-    const { fs, handles: h } = installVirtualFs({
-      "/ws/.vscode/dostuff/DS-001.json": JSON.stringify(initialIssue),
+  test("tag insertion order is preserved across DB round-trip", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    // Tag values chosen so PK ordering (lexical) would re-sort them: zebra, alpha, mango.
+    const issue = makeIssue({
+      id: "DS-300",
+      tags: ["zebra", "alpha", "mango"],
+    });
+    await a.upsert(issue);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-300")?.tags).toEqual(["zebra", "alpha", "mango"]);
+    b.dispose();
+  });
+
+  test("statusHistory and record entries are returned in insertion order", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    const issue = makeIssue({
+      id: "DS-400",
+      statusHistory: [
+        { status: "Thinking", at: "2025-01-01T00:00:00.000Z", by: "user" },
+        { status: "Planned", at: "2025-01-02T00:00:00.000Z", by: "user" },
+        { status: "Working", at: "2025-01-03T00:00:00.000Z", by: "agent" },
+      ],
+      record: [
+        { at: "2025-01-01T00:00:00.000Z", author: "user", text: "first" },
+        { at: "2025-01-02T00:00:00.000Z", author: "agent", source: "mcp", text: "second" },
+        { at: "2025-01-03T00:00:00.000Z", author: "user", text: "third" },
+      ],
+    });
+    await a.upsert(issue);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    const loaded = b.get("DS-400");
+    expect(loaded?.statusHistory.map((h) => h.status)).toEqual(["Thinking", "Planned", "Working"]);
+    expect(loaded?.statusHistory[2]?.by).toBe("agent");
+    expect(loaded?.record.map((r) => r.text)).toEqual(["first", "second", "third"]);
+    expect(loaded?.record[1]?.source).toBe("mcp");
+    expect(loaded?.record[0]?.source).toBeUndefined();
+    b.dispose();
+  });
+
+  test("migration normalises legacy JSON missing optional fields", async () => {
+    const legacy = {
+      id: "DS-001",
+      title: "legacy",
+      type: "Bug",
+      priority: "High",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      // missing: number, tasks, tags, attachments, statusHistory, record, resolvedAt
+    };
+    const { handles: h } = installVirtualFs({
+      "/ws/.vscode/dostuff/DS-001.json": JSON.stringify(legacy),
     });
     handles = h;
 
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
-    expect(store.get("DS-001")?.title).toBe("first");
+    const loaded = store.get("DS-001");
+    expect(loaded).toBeDefined();
+    expect(loaded?.number).toBe(1); // derived from "DS-001"
+    expect(loaded?.tasks).toEqual([]);
+    expect(loaded?.tags).toEqual([]);
+    expect(loaded?.attachments).toEqual([]);
+    expect(loaded?.statusHistory).toEqual([]);
+    expect(loaded?.record).toEqual([]);
+    expect(loaded?.resolvedAt).toBeNull();
+    store.dispose();
+  });
 
-    // Mutate disk directly (simulating an external editor write) and add a
-    // second file.
-    const renamed: Issue = { ...initialIssue, title: "renamed externally" };
-    fs.set("/ws/.vscode/dostuff/DS-001.json", {
-      content: new TextEncoder().encode(JSON.stringify(renamed)),
+  test("init on an empty storage folder creates the DB and yields empty list", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs({});
+    handles = h;
+
+    const store = makeSqlStore(makeContext());
+    await store.init();
+    expect(store.list()).toEqual([]);
+    expect(vfs.get("/ws/.vscode/dostuff/dostuff.db")).toBeDefined();
+    // No legacy-json-backup created when there are no .json files to move.
+    const hasBackup = Array.from(vfs.keys()).some((k) =>
+      k.startsWith("/ws/.vscode/dostuff/legacy-json-backup/"),
+    );
+    expect(hasBackup).toBe(false);
+    store.dispose();
+  });
+
+  test("replaceAll wipes prior issues and persists the new set", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(makeIssue({ id: "DS-001", number: 1 }));
+    await a.upsert(makeIssue({ id: "DS-002", number: 2 }));
+    await a.replaceAll([makeIssue({ id: "DS-099", number: 99, title: "fresh" })]);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.list().map((i) => i.id)).toEqual(["DS-099"]);
+    expect(b.get("DS-099")?.title).toBe("fresh");
+    b.dispose();
+  });
+
+  test("mergeAll combines prior + incoming and persists both", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(makeIssue({ id: "DS-001", number: 1, title: "original" }));
+    await a.mergeAll([
+      makeIssue({ id: "DS-001", number: 1, title: "overwritten" }),
+      makeIssue({ id: "DS-002", number: 2, title: "added" }),
+    ]);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-001")?.title).toBe("overwritten");
+    expect(b.get("DS-002")?.title).toBe("added");
+    expect(b.list()).toHaveLength(2);
+    b.dispose();
+  });
+
+  test("forward-compat: a DB with schema_meta.version newer than this build is not stamped down", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs({});
+    handles = h;
+
+    // First init creates v1 DB.
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(makeIssue({ id: "DS-001", number: 1 }));
+    a.dispose();
+
+    // Tamper with the on-disk DB: bump schema_meta.version to "999".
+    const dbBytes = vfs.get("/ws/.vscode/dostuff/dostuff.db")?.content;
+    expect(dbBytes).toBeDefined();
+    const initSqlJs = (await import("sql.js")).default;
+    const SQL = await initSqlJs({ wasmBinary: WASM_BINARY.buffer.slice(0) });
+    const tampered = new SQL.Database(dbBytes!);
+    tampered.run("UPDATE schema_meta SET value = '999' WHERE key = 'version'");
+    const tamperedBytes = tampered.export();
+    tampered.close();
+    vfs.set("/ws/.vscode/dostuff/dostuff.db", { content: tamperedBytes });
+
+    // Reopen — should NOT downgrade.
+    const b = makeSqlStore(ctx);
+    await b.init();
+    b.dispose();
+
+    const post = vfs.get("/ws/.vscode/dostuff/dostuff.db")?.content;
+    const SQL2 = await initSqlJs({ wasmBinary: WASM_BINARY.buffer.slice(0) });
+    const check = new SQL2.Database(post!);
+    const res = check.exec("SELECT value FROM schema_meta WHERE key = 'version'");
+    check.close();
+    expect(res[0]?.values[0]?.[0]).toBe("999");
+  });
+
+  test("data-loss-safe migration: rename phase failure leaves DB intact AND legacy files in place", async () => {
+    const goodIssue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      title: "good",
+      status: "Planned",
     });
-    fs.set("/ws/.vscode/dostuff/DS-002.json", {
-      content: new TextEncoder().encode(
-        JSON.stringify(makeIssue({ id: "DS-002", number: 2, title: "added externally" })),
-      ),
+    const { fs: vfs, handles: h } = installVirtualFs({
+      "/ws/.vscode/dostuff/DS-001.json": JSON.stringify(goodIssue),
     });
+    handles = h;
 
-    await store.reload();
+    // Wrap rename to throw exactly for the migration's move-to-backup phase.
+    const origRename = (vscode.workspace.fs as any).rename;
+    (vscode.workspace.fs as any).rename = async (
+      source: { path: string },
+      target: { path: string },
+      opts?: { overwrite?: boolean },
+    ) => {
+      if (target.path.includes("/legacy-json-backup/")) {
+        throw new Error("simulated rename failure");
+      }
+      return origRename(source, target, opts);
+    };
 
-    expect(store.get("DS-001")?.title).toBe("renamed externally");
-    expect(store.get("DS-002")?.title).toBe("added externally");
-    expect(store.list()).toHaveLength(2);
+    try {
+      const store = makeSqlStore(makeContext());
+      await store.init();
+      // Despite the rename failure, the DB must contain the migrated issue and
+      // the original .json file must still be on disk (so a future activation
+      // could retry migration if dostuff.db were lost). exportDb ran BEFORE
+      // rename, so dostuff.db is on disk too.
+      expect(store.get("DS-001")?.title).toBe("good");
+      expect(vfs.get("/ws/.vscode/dostuff/dostuff.db")).toBeDefined();
+      expect(vfs.get("/ws/.vscode/dostuff/DS-001.json")).toBeDefined();
+      expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-001.json")).toBeUndefined();
+      store.dispose();
+    } finally {
+      (vscode.workspace.fs as any).rename = origRename;
+    }
+  });
+
+  test("reload() re-hydrates from disk (covers external writes via a second store)", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const writer = makeSqlStore(ctx);
+    await writer.init();
+    await writer.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
+
+    // A second store opens the same workspace, writes another issue, and
+    // exports — simulating an external editor writing to dostuff.db.
+    const sideWriter = makeSqlStore(ctx);
+    await sideWriter.init();
+    await sideWriter.upsert(makeIssue({ id: "DS-002", number: 2, title: "second" }));
+    sideWriter.dispose();
+
+    await writer.reload();
+    expect(writer.list().map((i) => i.id).sort()).toEqual(["DS-001", "DS-002"]);
+    writer.dispose();
   });
 });
 
@@ -523,63 +893,68 @@ describe("IssueStore attachments", () => {
   });
 
   test("writeAttachment puts bytes at <storagePath>/attachments/<issueId>/<attId><ext>", async () => {
-    const { fs, handles: h } = installVirtualFs();
+    const { fs: vfs, handles: h } = installVirtualFs();
     handles = h;
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
     const bytes = new Uint8Array([1, 2, 3, 4]);
     const written = await store.writeAttachment("DS-001", "abc", ".png", bytes);
     expect(written).toBe(true);
-    const entry = fs.get("/ws/.vscode/dostuff/attachments/DS-001/abc.png");
+    const entry = vfs.get("/ws/.vscode/dostuff/attachments/DS-001/abc.png");
     expect(entry).toBeDefined();
     expect(Array.from(entry!.content)).toEqual([1, 2, 3, 4]);
+    store.dispose();
   });
 
   test("readAttachment round-trips the bytes", async () => {
     const { handles: h } = installVirtualFs();
     handles = h;
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
     const bytes = new Uint8Array([9, 8, 7]);
     await store.writeAttachment("DS-002", "att2", ".pdf", bytes);
     const out = await store.readAttachment("DS-002", "att2");
     expect(Array.from(out)).toEqual([9, 8, 7]);
+    store.dispose();
   });
 
   test("readAttachment on a missing file rejects", async () => {
     const { handles: h } = installVirtualFs();
     handles = h;
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
     await expect(store.readAttachment("DS-001", "missing")).rejects.toThrow();
+    store.dispose();
   });
 
   test("remove(id) prunes the per-issue attachment folder", async () => {
-    const { fs, handles: h } = installVirtualFs();
+    const { fs: vfs, handles: h } = installVirtualFs();
     handles = h;
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
     await store.upsert(makeIssue({ id: "DS-001" }));
     await store.writeAttachment("DS-001", "att1", ".png", new Uint8Array([1]));
     await store.writeAttachment("DS-001", "att2", ".pdf", new Uint8Array([2]));
-    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeDefined();
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeDefined();
 
     await store.remove("DS-001");
 
-    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeUndefined();
-    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/att2.pdf")).toBeUndefined();
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeUndefined();
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/att2.pdf")).toBeUndefined();
+    store.dispose();
   });
 
   test("deleteAttachmentFile removes a single file without touching siblings", async () => {
-    const { fs, handles: h } = installVirtualFs();
+    const { fs: vfs, handles: h } = installVirtualFs();
     handles = h;
-    const store = new IssueStore(makeContext());
+    const store = makeSqlStore(makeContext());
     await store.init();
     await store.writeAttachment("DS-001", "keep", ".png", new Uint8Array([1]));
     await store.writeAttachment("DS-001", "drop", ".pdf", new Uint8Array([2]));
     await store.deleteAttachmentFile("DS-001", "drop");
-    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/keep.png")).toBeDefined();
-    expect(fs.get("/ws/.vscode/dostuff/attachments/DS-001/drop.pdf")).toBeUndefined();
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/keep.png")).toBeDefined();
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/drop.pdf")).toBeUndefined();
+    store.dispose();
   });
 
   test("normalize() on a legacy issue without `attachments` returns []", () => {
@@ -606,5 +981,59 @@ describe("IssueStore attachments", () => {
     const { issue } = normalize(stale);
     expect(issue.attachments).toHaveLength(1);
     expect(issue.attachments[0]!.id).toBe("gone");
+  });
+
+  test("attachment insertion order is preserved across DB round-trip", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    // IDs chosen so PK ordering (lexical) would re-sort them: z, a, m.
+    const issue = makeIssue({
+      id: "DS-200",
+      attachments: [
+        { id: "z1", name: "z.png", mimeType: "image/png", sizeBytes: 1, addedAt: "2026-05-18T00:00:00.000Z" },
+        { id: "a1", name: "a.png", mimeType: "image/png", sizeBytes: 2, addedAt: "2026-05-18T00:00:01.000Z" },
+        { id: "m1", name: "m.png", mimeType: "image/png", sizeBytes: 3, addedAt: "2026-05-18T00:00:02.000Z" },
+      ],
+    });
+    await a.upsert(issue);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-200")?.attachments.map((x) => x.id)).toEqual(["z1", "a1", "m1"]);
+    b.dispose();
+  });
+
+  test("attachment metadata round-trips through the DB", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    const issue = makeIssue({
+      id: "DS-100",
+      number: 100,
+      attachments: [
+        {
+          id: "att1",
+          name: "screenshot.png",
+          mimeType: "image/png",
+          sizeBytes: 1234,
+          addedAt: "2026-05-18T12:00:00.000Z",
+        },
+      ],
+    });
+    await a.upsert(issue);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-100")?.attachments).toEqual(issue.attachments);
+    b.dispose();
   });
 });
