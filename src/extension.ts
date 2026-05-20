@@ -309,10 +309,28 @@ export function activate(context: vscode.ExtensionContext) {
 
   const attachmentHandlers = {
     onPick: async (issueId: string) => {
-      const uris = await vscode.window.showOpenDialog({
-        canSelectMany: true,
-        openLabel: "Attach to ticket",
-      });
+      // Avoid `defaultUri`: on Remote-WSL the workspace folder URI is a
+      // `vscode-remote://wsl+…` URI; passing that to the dialog has been
+      // observed to silently no-op on some VSCode versions because the
+      // Windows-side renderer can't translate it to a native file-dialog
+      // starting path. Letting VSCode pick the default location is safer.
+      store.appendLog(`pickAttachment: opening showOpenDialog for ${issueId}`);
+      let uris: vscode.Uri[] | undefined;
+      try {
+        uris = await vscode.window.showOpenDialog({
+          title: "Attach files to ticket",
+          openLabel: "Attach",
+          canSelectFiles: true,
+          canSelectFolders: false,
+          canSelectMany: true,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        store.appendLog(`pickAttachment: showOpenDialog threw: ${msg}`);
+        vscode.window.showErrorMessage(`DoStuff: file picker failed (${msg}).`);
+        return;
+      }
+      store.appendLog(`pickAttachment: dialog returned ${uris?.length ?? 0} file(s)`);
       if (!uris?.length) return;
       for (const uri of uris) {
         let bytes: Uint8Array;
@@ -330,6 +348,36 @@ export function activate(context: vscode.ExtensionContext) {
       }
     },
     onAddBytes: async (issueId: string, name: string, mimeType: string, bytes: Uint8Array) => {
+      await appendAttachment(issueId, name, mimeType, bytes);
+    },
+    /**
+     * Drop fallback for Remote-WSL (and other environments) where the
+     * webview's DataTransfer.files is empty but `text/uri-list` carries the
+     * source URI. Parsing through `vscode.Uri.parse` + `workspace.fs.readFile`
+     * lets VSCode transparently cross the remote/local boundary to fetch the
+     * bytes.
+     */
+    onAddByUri: async (issueId: string, rawUri: string) => {
+      let uri: vscode.Uri;
+      try {
+        uri = vscode.Uri.parse(rawUri, /* strict */ true);
+      } catch {
+        vscode.window.showErrorMessage(`DoStuff: dropped URI is malformed (${rawUri}).`);
+        return;
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = await vscode.workspace.fs.readFile(uri);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showWarningMessage(
+          `DoStuff: couldn't read dropped file (${msg}). Try the + button to pick it through the file dialog instead.`,
+        );
+        return;
+      }
+      const segments = uri.path.split("/");
+      const name = decodeURIComponent(segments[segments.length - 1] || "attachment");
+      const mimeType = inferMimeType(name);
       await appendAttachment(issueId, name, mimeType, bytes);
     },
     onDelete: async (issueId: string, attachmentId: string) => {

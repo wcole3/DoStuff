@@ -39,6 +39,7 @@ export class BoardPanel {
     attachments: AttachmentHandlers = {
       onPick: () => {},
       onAddBytes: () => {},
+      onAddByUri: () => {},
       onDelete: () => {},
       onOpen: () => {},
     },
@@ -100,6 +101,7 @@ export class BoardPanel {
     private readonly attachments: AttachmentHandlers = {
       onPick: () => {},
       onAddBytes: () => {},
+      onAddByUri: () => {},
       onDelete: () => {},
       onOpen: () => {},
     },
@@ -179,6 +181,7 @@ export class BoardPanel {
           this.output.appendLine(`Rejected pickAttachment: bad id`);
           break;
         }
+        this.output.appendLine(`Board received pickAttachment for ${id}`);
         await this.attachments.onPick(id);
         break;
       }
@@ -205,6 +208,21 @@ export class BoardPanel {
           m.mimeType,
           new Uint8Array(m.bytes as number[]),
         );
+        break;
+      }
+      case "addAttachmentByUri": {
+        const m = msg as { issueId?: unknown; uri?: unknown };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.uri !== "string" ||
+          m.uri.length === 0 ||
+          m.uri.length > 4096
+        ) {
+          this.output.appendLine(`Rejected addAttachmentByUri: bad payload`);
+          break;
+        }
+        await this.attachments.onAddByUri(m.issueId, m.uri);
         break;
       }
       case "deleteAttachment": {

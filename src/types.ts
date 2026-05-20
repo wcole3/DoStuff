@@ -139,6 +139,12 @@ export type WebviewToHost =
   // and ships them to the host. Bounded by `MAX_ATTACHMENT_BYTES` at both
   // ends.
   | { type: "addAttachmentBytes"; issueId: string; name: string; mimeType: string; bytes: number[] }
+  // Drag-drop fallback for environments (notably Remote-WSL when files originate
+  // from the Windows host) where the webview's `DataTransfer.files` is empty
+  // but `text/uri-list` carries the file URI. Host resolves the URI and reads
+  // bytes via `vscode.workspace.fs.readFile`, which transparently crosses the
+  // remote/local boundary.
+  | { type: "addAttachmentByUri"; issueId: string; uri: string }
   | { type: "deleteAttachment"; issueId: string; attachmentId: string }
   // Open a non-image attachment in VSCode via its on-disk URI.
   | { type: "openAttachment"; issueId: string; attachmentId: string };

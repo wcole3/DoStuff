@@ -190,6 +190,10 @@ export function postAddAttachmentBytes(
   });
 }
 
+export function postAddAttachmentByUri(issueId: string, uri: string): void {
+  vscodeApi.postMessage({ type: "addAttachmentByUri", issueId, uri });
+}
+
 export function postDeleteAttachment(issueId: string, attachmentId: string): void {
   vscodeApi.postMessage({ type: "deleteAttachment", issueId, attachmentId });
 }

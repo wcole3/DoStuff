@@ -38,6 +38,13 @@ export interface AttachmentHandlers {
     mimeType: string,
     bytes: Uint8Array,
   ) => void | Promise<void>;
+  /**
+   * Drag-drop fallback: webview shipped a file URI (typically because
+   * `DataTransfer.files` was empty on Remote-WSL drops from Windows). Host
+   * reads the bytes via `vscode.workspace.fs.readFile`, which crosses the
+   * local/remote boundary.
+   */
+  onAddByUri: (issueId: string, uri: string) => void | Promise<void>;
   onDelete: (issueId: string, attachmentId: string) => void | Promise<void>;
   /** Open the attachment in VSCode (image preview / system handler). */
   onOpen: (issueId: string, attachmentId: string) => void | Promise<void>;
@@ -46,6 +53,7 @@ export interface AttachmentHandlers {
 const NO_OP_ATTACHMENTS: AttachmentHandlers = {
   onPick: () => {},
   onAddBytes: () => {},
+  onAddByUri: () => {},
   onDelete: () => {},
   onOpen: () => {},
 };
@@ -239,6 +247,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           this.output.appendLine(`Rejected pickAttachment: bad id`);
           break;
         }
+        this.output.appendLine(`Sidebar received pickAttachment for ${id}`);
         await this.attachments.onPick(id);
         break;
       }
@@ -265,6 +274,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           m.mimeType,
           new Uint8Array(m.bytes as number[]),
         );
+        break;
+      }
+      case "addAttachmentByUri": {
+        const m = msg as { issueId?: unknown; uri?: unknown };
+        if (
+          typeof m.issueId !== "string" ||
+          !ID_RE.test(m.issueId) ||
+          typeof m.uri !== "string" ||
+          m.uri.length === 0 ||
+          m.uri.length > 4096
+        ) {
+          this.output.appendLine(`Rejected addAttachmentByUri: bad payload`);
+          break;
+        }
+        await this.attachments.onAddByUri(m.issueId, m.uri);
         break;
       }
       case "deleteAttachment": {

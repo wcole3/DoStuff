@@ -16,6 +16,7 @@ import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import {
   newTaskId,
   postAddAttachmentBytes,
+  postAddAttachmentByUri,
   postDeleteAttachment,
   postDeleteIssue,
   postOpenAttachment,
@@ -479,12 +480,16 @@ function AttachmentsSection({ issue, attachmentsBaseUri }: AttachmentsSectionPro
     e.preventDefault();
     setDragOver(false);
     if (disabled) return;
+
+    // Path 1: regular OS-drop — `DataTransfer.files` is populated by the
+    // browser, we already have bytes in memory.
     const files = Array.from(e.dataTransfer.files ?? []);
+    let handledViaFiles = false;
     for (const f of files) {
+      handledViaFiles = true;
       if (f.size > MAX_ATTACHMENT_BYTES) {
-        // Host shows a toast for size violations from its end too; this
-        // short-circuit prevents an obvious round-trip for files dropped
-        // straight into the webview.
+        // Host also shows a toast for size violations; short-circuit avoids an
+        // obvious round-trip for files dropped straight into the webview.
         continue;
       }
       const buf = await f.arrayBuffer();
@@ -494,6 +499,23 @@ function AttachmentsSection({ issue, attachmentsBaseUri }: AttachmentsSectionPro
         f.type || "application/octet-stream",
         new Uint8Array(buf),
       );
+    }
+    if (handledViaFiles) return;
+
+    // Path 2: Remote-WSL fallback. When the user drags a file from Windows
+    // Explorer onto the WSL-hosted webview, `DataTransfer.files` is empty but
+    // `text/uri-list` carries the file's URI. Ship the URIs to the host and
+    // let `vscode.workspace.fs.readFile` cross the boundary for us. Same path
+    // also covers some non-WSL remote scenarios where the browser refuses to
+    // surface raw bytes for cross-origin drops.
+    const uriList = e.dataTransfer.getData("text/uri-list");
+    if (!uriList) return;
+    const uris = uriList
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && !s.startsWith("#"));
+    for (const uri of uris) {
+      postAddAttachmentByUri(issue.id, uri);
     }
   };
 

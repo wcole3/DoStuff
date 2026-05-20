@@ -134,6 +134,108 @@ describe("IssueDetail", () => {
     expect(updates[0]!.issue.tasks[0]!.text).toBe("hello");
   });
 
+  test("attachment drop with bytes posts addAttachmentBytes", async () => {
+    const issue = makeIssue({ id: "DS-001", status: "Working" });
+    pushInit([issue], {
+      storagePath: ".vscode/dostuff",
+      autoSave: true,
+      activeLaneCap: 6,
+      // attachmentsBaseUri non-null so the drop zone isn't disabled.
+      attachmentsBaseUri: "vscode-webview://atts",
+    });
+    render(<IssueDetail issue={issue} />);
+
+    const zone = document.querySelector(".ds-attachments") as HTMLDivElement;
+    expect(zone).not.toBeNull();
+
+    const file = new File([new Uint8Array([0xff, 0x01, 0x02])], "screenshot.png", {
+      type: "image/png",
+    });
+    // happy-dom's fireEvent.drop accepts a dataTransfer-shaped property.
+    fireEvent.drop(zone, {
+      dataTransfer: {
+        files: [file],
+        getData: () => "",
+      },
+    });
+    // userEvent doesn't await arrayBuffer() reads — yield once so the
+    // post happens before we inspect.
+    await new Promise((r) => setTimeout(r, 0));
+
+    const msg = api.posted.find((m) => m.type === "addAttachmentBytes") as
+      | { type: "addAttachmentBytes"; issueId: string; name: string; mimeType: string; bytes: number[] }
+      | undefined;
+    expect(msg).toBeDefined();
+    expect(msg!.issueId).toBe("DS-001");
+    expect(msg!.name).toBe("screenshot.png");
+    expect(msg!.mimeType).toBe("image/png");
+    expect(msg!.bytes).toEqual([0xff, 0x01, 0x02]);
+  });
+
+  test("attachment drop with empty files but text/uri-list falls back to addAttachmentByUri", async () => {
+    // Regression: Remote-WSL drops from Windows Explorer arrive with
+    // `DataTransfer.files` empty but `text/uri-list` populated. We must
+    // forward the URI to the host instead of silently no-op'ing.
+    const issue = makeIssue({ id: "DS-001", status: "Working" });
+    pushInit([issue], {
+      storagePath: ".vscode/dostuff",
+      autoSave: true,
+      activeLaneCap: 6,
+      attachmentsBaseUri: "vscode-webview://atts",
+    });
+    render(<IssueDetail issue={issue} />);
+
+    const zone = document.querySelector(".ds-attachments") as HTMLDivElement;
+    fireEvent.drop(zone, {
+      dataTransfer: {
+        files: [],
+        getData: (fmt: string) =>
+          fmt === "text/uri-list"
+            ? "file:///C:/Users/me/screenshot.png\r\nfile:///C:/Users/me/notes.txt"
+            : "",
+      },
+    });
+
+    const uriMsgs = api.posted.filter((m) => m.type === "addAttachmentByUri") as Array<{
+      type: "addAttachmentByUri";
+      issueId: string;
+      uri: string;
+    }>;
+    expect(uriMsgs).toHaveLength(2);
+    expect(uriMsgs[0]!.issueId).toBe("DS-001");
+    expect(uriMsgs[0]!.uri).toBe("file:///C:/Users/me/screenshot.png");
+    expect(uriMsgs[1]!.uri).toBe("file:///C:/Users/me/notes.txt");
+    expect(api.posted.find((m) => m.type === "addAttachmentBytes")).toBeUndefined();
+  });
+
+  test("attachment drop ignores comments and blank lines in text/uri-list", async () => {
+    const issue = makeIssue({ id: "DS-001", status: "Working" });
+    pushInit([issue], {
+      storagePath: ".vscode/dostuff",
+      autoSave: true,
+      activeLaneCap: 6,
+      attachmentsBaseUri: "vscode-webview://atts",
+    });
+    render(<IssueDetail issue={issue} />);
+
+    const zone = document.querySelector(".ds-attachments") as HTMLDivElement;
+    fireEvent.drop(zone, {
+      dataTransfer: {
+        files: [],
+        getData: (fmt: string) =>
+          fmt === "text/uri-list"
+            ? "# header comment\nfile:///a/one.png\n\nfile:///a/two.png\n"
+            : "",
+      },
+    });
+
+    const uriMsgs = api.posted.filter((m) => m.type === "addAttachmentByUri") as Array<{
+      type: "addAttachmentByUri";
+      uri: string;
+    }>;
+    expect(uriMsgs.map((m) => m.uri)).toEqual(["file:///a/one.png", "file:///a/two.png"]);
+  });
+
   test("toggling a task checkbox posts updateIssue with the task flipped", async () => {
     const issue = makeIssue({
       id: "DS-001",
