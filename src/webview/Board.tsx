@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type DragEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { FixedSizeList, type ListChildComponentProps } from "react-window";
 import {
@@ -37,6 +37,9 @@ const ACTIVE_LANES: Status[] = ["Planned", "Working", "Verification"];
 // few px so a chip with a 1px border never gets clipped.
 const DRAWER_CARD_HEIGHT = 96;
 const TOAST_TTL_MS = 3000;
+// Minimum pixels moved before a pointerdown is promoted to a drag. Below this
+// threshold the gesture is treated as a click so card-open still works.
+const DRAG_THRESHOLD_PX = 5;
 
 const PRI_ORDER: Record<string, number> = { Critical: 0, High: 1, Regular: 2, Low: 3 };
 
@@ -71,19 +74,121 @@ export function decideDrop(
   return { kind: "ok", next: { ...issue, status: targetStatus } };
 }
 
+/**
+ * Pointer-event drag is used in place of native HTML5 DnD because VSCode
+ * wraps each webview in an `<iframe>` and sets `pointer-events: none` on it
+ * for the duration of any window-level drag (see microsoft/vscode#96967).
+ * That makes lane drop targets go dead if the cursor ever leaves and re-enters
+ * the panel. Synthesizing our own drag with pointer events keeps the gesture
+ * contained inside the webview where VSCode never disables it.
+ */
+interface PointerDragState {
+  beginDrag: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  dragId: string | null;
+  ghost: { x: number; y: number; title: string } | null;
+  hoverStatus: Status | null;
+  justDraggedRef: React.MutableRefObject<boolean>;
+}
+
+function statusFromPoint(x: number, y: number): Status | null {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return null;
+  const target = (el as Element).closest("[data-drop-status]");
+  if (!target) return null;
+  const raw = target.getAttribute("data-drop-status");
+  return raw as Status | null;
+}
+
+function usePointerDrag(
+  onDrop: (id: string, status: Status) => void,
+): PointerDragState {
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [ghost, setGhost] = useState<{ x: number; y: number; title: string } | null>(null);
+  const [hoverStatus, setHoverStatus] = useState<Status | null>(null);
+  const justDraggedRef = useRef(false);
+  const cleanupRef = useRef<(() => void) | null>(null);
+
+  // Tear down any in-flight listeners if the component unmounts mid-drag.
+  useEffect(() => () => cleanupRef.current?.(), []);
+
+  const beginDrag = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => {
+      if (e.button !== 0) return;
+      const start = { x: e.clientX, y: e.clientY };
+      const issueId = issue.id;
+      const issueTitle = issue.title;
+      let active = false;
+
+      const onMove = (ev: PointerEvent) => {
+        const dx = ev.clientX - start.x;
+        const dy = ev.clientY - start.y;
+        if (!active) {
+          if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+          active = true;
+          setDragId(issueId);
+          document.body.style.userSelect = "none";
+        }
+        setGhost({ x: ev.clientX, y: ev.clientY, title: issueTitle });
+        setHoverStatus(statusFromPoint(ev.clientX, ev.clientY));
+      };
+
+      const finish = (ev: PointerEvent | null) => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onCancel);
+        document.body.style.userSelect = "";
+        cleanupRef.current = null;
+        if (active) {
+          justDraggedRef.current = true;
+          // Reset on the next tick so the synthetic click that fires after
+          // pointerup (on the original element) gets swallowed, but a fresh
+          // user click on the next gesture still works.
+          window.setTimeout(() => {
+            justDraggedRef.current = false;
+          }, 0);
+          if (ev) {
+            const status = statusFromPoint(ev.clientX, ev.clientY);
+            if (status) onDrop(issueId, status);
+          }
+        }
+        setDragId(null);
+        setGhost(null);
+        setHoverStatus(null);
+      };
+
+      const onUp = (ev: PointerEvent) => finish(ev);
+      const onCancel = () => finish(null);
+
+      cleanupRef.current?.();
+      cleanupRef.current = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onCancel);
+        document.body.style.userSelect = "";
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+    },
+    [onDrop],
+  );
+
+  return { beginDrag, dragId, ghost, hoverStatus, justDraggedRef };
+}
+
 interface BoardCardProps {
   issue: Issue;
   onOpen: (issue: Issue) => void;
-  onDragStart: (e: DragEvent<HTMLDivElement>, issue: Issue) => void;
-  onDragEnd: () => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  justDraggedRef: React.MutableRefObject<boolean>;
   dragging: boolean;
 }
 
 const BoardCard = memo(function BoardCard({
   issue,
   onOpen,
-  onDragStart,
-  onDragEnd,
+  onPointerDown,
+  justDraggedRef,
   dragging,
 }: BoardCardProps) {
   const meta = STATUS_META[issue.status];
@@ -91,10 +196,11 @@ const BoardCard = memo(function BoardCard({
   return (
     <div
       className={`bd-card ${dragging ? "is-dragging" : ""}`}
-      draggable
-      onDragStart={(e) => onDragStart(e, issue)}
-      onDragEnd={onDragEnd}
-      onClick={() => onOpen(issue)}
+      onPointerDown={(e) => onPointerDown(e, issue)}
+      onClick={() => {
+        if (justDraggedRef.current) return;
+        onOpen(issue);
+      }}
       style={{ ["--card-accent" as string]: meta.color } as CSSProperties}
     >
       <div className="bd-card-top">
@@ -133,9 +239,10 @@ interface LaneProps {
   issues: Issue[];
   cap: number;
   dragId: string | null;
+  hoverStatus: Status | null;
   externalPickId: string | null;
-  onDragStart: (e: DragEvent<HTMLDivElement>, issue: Issue) => void;
-  onDragEnd: () => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  justDraggedRef: React.MutableRefObject<boolean>;
   onDropIssue: (id: string, status: Status) => void;
   onOpen: (issue: Issue) => void;
 }
@@ -145,40 +252,26 @@ function Lane({
   issues,
   cap,
   dragId,
+  hoverStatus,
   externalPickId,
-  onDragStart,
-  onDragEnd,
+  onPointerDown,
+  justDraggedRef,
   onDropIssue,
   onOpen,
 }: LaneProps) {
-  const [dragOver, setDragOver] = useState(false);
   const meta = STATUS_META[status];
   const count = issues.length;
   const isFull = count >= cap;
-  const dragBlocked = isFull && dragOver && dragId !== null && issues.every((i) => i.id !== dragId);
-
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = dragBlocked ? "none" : "move";
-    if (!dragOver) setDragOver(true);
-  };
-  const handleDragLeave = () => setDragOver(false);
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragOver(false);
-    const id = e.dataTransfer.getData("text/plain");
-    if (id) onDropIssue(id, status);
-  };
+  const dragOver = hoverStatus === status && dragId !== null;
+  const dragBlocked = isFull && dragOver && issues.every((i) => i.id !== dragId);
 
   return (
     <div
+      data-drop-status={status}
       className={`bd-lane ${dragOver ? "is-drag-over" : ""} ${isFull ? "is-full" : ""} ${
         dragBlocked ? "is-drag-blocked" : ""
       } ${externalPickId ? "is-pick-target" : ""}`}
       style={{ ["--lane-accent" as string]: meta.color } as CSSProperties}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
     >
       <div className="bd-lane-head">
         <span className="bd-lane-dot" style={{ background: meta.color }} />
@@ -197,8 +290,8 @@ function Lane({
               issue={issue}
               dragging={dragId === issue.id}
               onOpen={onOpen}
-              onDragStart={onDragStart}
-              onDragEnd={onDragEnd}
+              onPointerDown={onPointerDown}
+              justDraggedRef={justDraggedRef}
             />
           ))
         )}
@@ -226,8 +319,8 @@ interface DrawerCardRowData {
   onOpen: (issue: Issue) => void;
   onPickToBoard?: (id: string) => void;
   status: Status;
-  onDragStart: (e: DragEvent<HTMLDivElement>, issue: Issue) => void;
-  onDragEnd: () => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  justDraggedRef: React.MutableRefObject<boolean>;
 }
 
 const DrawerCardRow = memo(function DrawerCardRow({
@@ -242,10 +335,9 @@ const DrawerCardRow = memo(function DrawerCardRow({
     <div style={style}>
       <div
         className="bd-drawer-card"
-        draggable
-        onDragStart={(e) => data.onDragStart(e, issue)}
-        onDragEnd={data.onDragEnd}
+        onPointerDown={(e) => data.onPointerDown(e, issue)}
         onClick={(e) => {
+          if (data.justDraggedRef.current) return;
           // Thinking drawer: click opens the detail panel; shift-click promotes
           // straight to Planned. The shift-click shortcut is the only way an
           // accidental click won't move a draft onto the board.
@@ -283,13 +375,15 @@ interface DrawerProps {
   issues: Issue[];
   side: "left" | "right";
   open: boolean;
+  dragId: string | null;
+  hoverStatus: Status | null;
   externalPickId: string | null;
   onToggle: () => void;
   onDropIssue: (id: string, status: Status) => void;
   onOpen: (issue: Issue) => void;
   onPickToBoard?: (id: string) => void;
-  onDragStart: (e: DragEvent<HTMLDivElement>, issue: Issue) => void;
-  onDragEnd: () => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  justDraggedRef: React.MutableRefObject<boolean>;
 }
 
 function Drawer({
@@ -297,15 +391,16 @@ function Drawer({
   issues,
   side,
   open,
+  dragId,
+  hoverStatus,
   externalPickId,
   onToggle,
   onDropIssue,
   onOpen,
   onPickToBoard,
-  onDragStart,
-  onDragEnd,
+  onPointerDown,
+  justDraggedRef,
 }: DrawerProps) {
-  const [dragOver, setDragOver] = useState(false);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<IssueType | "All">("All");
   const [priorityFilter, setPriorityFilter] = useState<Priority | "All">("All");
@@ -313,6 +408,7 @@ function Drawer({
   const meta = STATUS_META[status];
   const listWrapRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
+  const dragOver = hoverStatus === status && dragId !== null;
 
   useEffect(() => {
     if (!open) {
@@ -351,22 +447,9 @@ function Drawer({
     return sortIssues(matched, sortKey);
   }, [issues, query, typeFilter, priorityFilter, sortKey]);
 
-  const onDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    if (!dragOver) setDragOver(true);
-  };
-  const onDragLeave = () => setDragOver(false);
-  const onDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    setDragOver(false);
-    const id = e.dataTransfer.getData("text/plain");
-    if (id) onDropIssue(id, status);
-  };
-
   const rowData = useMemo<DrawerCardRowData>(
-    () => ({ issues: displayedIssues, onOpen, onPickToBoard, status, onDragStart, onDragEnd }),
-    [displayedIssues, onOpen, onPickToBoard, status, onDragStart, onDragEnd],
+    () => ({ issues: displayedIssues, onOpen, onPickToBoard, status, onPointerDown, justDraggedRef }),
+    [displayedIssues, onOpen, onPickToBoard, status, onPointerDown, justDraggedRef],
   );
 
   const headClick = () => {
@@ -380,13 +463,11 @@ function Drawer({
 
   return (
     <div
+      data-drop-status={status}
       className={`bd-drawer bd-drawer-${side} ${dragOver ? "is-drag-over" : ""} ${
         open ? "is-open" : ""
       } ${externalPickId ? "is-pick-target" : ""}`}
       style={{ ["--drawer-accent" as string]: meta.color } as CSSProperties}
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
     >
       <button
         className="bd-drawer-head"
@@ -512,10 +593,31 @@ function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
   );
 }
 
+interface DragGhostProps {
+  ghost: { x: number; y: number; title: string } | null;
+}
+
+function DragGhost({ ghost }: DragGhostProps) {
+  if (!ghost) return null;
+  return (
+    <div
+      className="bd-drag-ghost"
+      style={{
+        position: "fixed",
+        left: ghost.x + 12,
+        top: ghost.y + 12,
+        pointerEvents: "none",
+        zIndex: 9999,
+      }}
+    >
+      {ghost.title}
+    </div>
+  );
+}
+
 export function Board() {
   const { issues, settings, initialized } = useIssues();
   const externalPickId = useExternalDragIssueId();
-  const [dragId, setDragId] = useState<string | null>(null);
   const [focusId, setFocusId] = useState<string | null>(null);
   const [leftOpen, setLeftOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
@@ -530,14 +632,6 @@ export function Board() {
     const t = window.setTimeout(() => setToast(null), TOAST_TTL_MS);
     return () => window.clearTimeout(t);
   }, [toast?.seq]);
-
-  // If the host re-broadcasts mid-drag and removes/reassigns the dragged ticket,
-  // onDragEnd may not fire (the source unmounts). Clear stuck dragId defensively.
-  useEffect(() => {
-    if (dragId === null) return;
-    const exists = issues.some((i) => i.id === dragId);
-    if (!exists) setDragId(null);
-  }, [issues, dragId]);
 
   // Esc cancels an in-progress sidebar→board drag (the board has no native
   // dragend signal for a cross-webview source).
@@ -566,15 +660,7 @@ export function Board() {
     [issues, showToast, cap],
   );
 
-  const onDragStart = useCallback(
-    (e: DragEvent<HTMLDivElement>, issue: Issue) => {
-      e.dataTransfer.setData("text/plain", issue.id);
-      e.dataTransfer.effectAllowed = "move";
-      setDragId(issue.id);
-    },
-    [],
-  );
-  const onDragEnd = useCallback(() => setDragId(null), []);
+  const { beginDrag, dragId, ghost, hoverStatus, justDraggedRef } = usePointerDrag(setStatus);
   const onOpen = useCallback((issue: Issue) => setFocusId(issue.id), []);
 
   const sortLane = useCallback((status: Status, list: Issue[]): Issue[] => {
@@ -624,14 +710,16 @@ export function Board() {
         status="Thinking"
         side="left"
         open={leftOpen}
+        dragId={dragId}
+        hoverStatus={hoverStatus}
         externalPickId={externalPickId}
         onToggle={() => setLeftOpen((v) => !v)}
         issues={byStatus.Thinking}
         onDropIssue={setStatus}
         onPickToBoard={(id) => setStatus(id, "Planned")}
         onOpen={onOpen}
-        onDragStart={onDragStart}
-        onDragEnd={onDragEnd}
+        onPointerDown={beginDrag}
+        justDraggedRef={justDraggedRef}
       />
 
       <div className="bd-lanes">
@@ -642,9 +730,10 @@ export function Board() {
             issues={byStatus[s]}
             cap={cap}
             dragId={dragId}
+            hoverStatus={hoverStatus}
             externalPickId={externalPickId}
-            onDragStart={onDragStart}
-            onDragEnd={onDragEnd}
+            onPointerDown={beginDrag}
+            justDraggedRef={justDraggedRef}
             onDropIssue={setStatus}
             onOpen={onOpen}
           />
@@ -655,16 +744,20 @@ export function Board() {
         status="Complete"
         side="right"
         open={rightOpen}
+        dragId={dragId}
+        hoverStatus={hoverStatus}
         externalPickId={externalPickId}
         onToggle={() => setRightOpen((v) => !v)}
         issues={byStatus.Complete}
         onDropIssue={setStatus}
         onOpen={onOpen}
-        onDragStart={onDragStart}
-        onDragEnd={onDragEnd}
+        onPointerDown={beginDrag}
+        justDraggedRef={justDraggedRef}
       />
 
       <FocusOverlay issue={focused} onClose={() => setFocusId(null)} />
+
+      <DragGhost ghost={ghost} />
 
       {toast && <div className="bd-toast">{toast.text}</div>}
     </div>

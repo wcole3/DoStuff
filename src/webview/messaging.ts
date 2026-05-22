@@ -110,9 +110,6 @@ export function startMessageBridge(): void {
       case "externalDragStart":
         setState({ externalDragIssueId: msg.issueId });
         break;
-      case "externalDragEnd":
-        setState({ externalDragIssueId: null });
-        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;
@@ -204,10 +201,6 @@ export function postOpenAttachment(issueId: string, attachmentId: string): void 
 
 export function postExternalDragStart(issueId: string): void {
   vscodeApi.postMessage({ type: "externalDragStart", issueId });
-}
-
-export function postExternalDragEnd(): void {
-  vscodeApi.postMessage({ type: "externalDragEnd" });
 }
 
 export function postOpenLink(url: string): void {

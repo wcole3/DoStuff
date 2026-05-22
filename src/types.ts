@@ -115,9 +115,11 @@ export type HostToWebview =
   | { type: "showNewIssue" }
   // Sidebar dragstart broadcast: the board uses this to enter a "pick a
   // lane" mode (lanes/drawers highlight as click targets) since native
-  // HTML5 drag cannot cross VSCode webview boundaries reliably.
-  | { type: "externalDragStart"; issueId: string }
-  | { type: "externalDragEnd" };
+  // HTML5 drag cannot cross VSCode webview boundaries reliably. The state
+  // is cleared by the board itself (overlay click or Esc); there is no
+  // matching end event because the sidebar's `dragend` fires too early —
+  // before VSCode restores pointer events on the board iframe.
+  | { type: "externalDragStart"; issueId: string };
 
 export type WebviewToHost =
   | { type: "ready" }
@@ -129,7 +131,6 @@ export type WebviewToHost =
   | { type: "exportJson" }
   | { type: "openSettings" }
   | { type: "externalDragStart"; issueId: string }
-  | { type: "externalDragEnd" }
   | { type: "openLink"; url: string }
   // Webview-initiated upload via the host file picker. Host opens a
   // `showOpenDialog` and reads bytes itself — keeps large files off the

@@ -862,6 +862,24 @@ button { font: inherit; color: inherit; }
 .bd-card:active { cursor: grabbing; }
 .bd-card.is-dragging { opacity: .35; transform: scale(.98); }
 
+/* Floating ghost rendered by the pointer-event drag system (see Board.tsx).
+   pointer-events:none in the inline style so elementFromPoint hits the lane
+   under the cursor, not the ghost itself. */
+.bd-drag-ghost {
+  background: var(--vsc-card-2);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--vsc-fg);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .35);
+  opacity: .92;
+}
+
 .bd-card-top {
   display: flex; align-items: center; gap: 6px;
   font-size: 10.5px; color: var(--vsc-fg-muted);

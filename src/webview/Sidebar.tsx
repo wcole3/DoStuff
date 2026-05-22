@@ -12,7 +12,7 @@ import {
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, absTime, relTime } from "./IssueDetail";
 import { TagStrip } from "./Tags";
-import { postExternalDragEnd, postExternalDragStart, useIssues } from "./messaging";
+import { postExternalDragStart, useIssues } from "./messaging";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
 import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
 
@@ -42,15 +42,23 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
         className={`ds-row ${expanded ? "is-expanded" : ""}`}
         draggable
         onDragStart={(e) => {
-          // Best-effort native cross-webview drag: if VSCode allows the drop
-          // to reach the board iframe, the board's existing onDrop handler
-          // picks up the ID. Either way, we also post a host message so the
-          // board can light up lanes as click targets.
+          // Arms cross-webview pick mode: the board webview lights up lanes
+          // and drawers as click targets (`bd-pick-overlay`). Native drop
+          // can't reach the board iframe because VSCode forces
+          // `pointer-events: none` on it during any window-level drag
+          // (microsoft/vscode#96967), so the user releases the mouse and
+          // then clicks an overlay to commit the move.
+          //
+          // We intentionally do NOT clear the pick state on `dragend`. If we
+          // did, the overlay would vanish at the exact moment the user
+          // becomes able to click it (the drag has to end first for the
+          // board iframe's pointer events to come back). The board clears
+          // the state itself after a successful overlay click, and Esc
+          // cancels.
           e.dataTransfer.setData("text/plain", issue.id);
           e.dataTransfer.effectAllowed = "move";
           postExternalDragStart(issue.id);
         }}
-        onDragEnd={() => postExternalDragEnd()}
         onClick={() => data.onToggle(issue.id)}
         onContextMenu={(e) => { e.preventDefault(); data.onContextMenu(issue.id); }}
         onKeyDown={(e) => {

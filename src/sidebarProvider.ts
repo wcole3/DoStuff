@@ -20,7 +20,6 @@ export type ApplyIssueUpdate = (issue: Issue) => Promise<void>;
  */
 export interface ExternalDragSignals {
   onStart: (issueId: string) => void;
-  onEnd: () => void;
 }
 
 /**
@@ -84,7 +83,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     private readonly extensionUri: vscode.Uri,
     private readonly store: IssueStore,
     private readonly applyUpdate: ApplyIssueUpdate,
-    private readonly externalDrag: ExternalDragSignals = { onStart: () => {}, onEnd: () => {} },
+    private readonly externalDrag: ExternalDragSignals = { onStart: () => {} },
     private readonly openLink: (url: string) => void | Promise<void> = () => {},
     private readonly attachments: AttachmentHandlers = NO_OP_ATTACHMENTS,
   ) {
@@ -229,9 +228,6 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         this.externalDrag.onStart(id);
         break;
       }
-      case "externalDragEnd":
-        this.externalDrag.onEnd();
-        break;
       case "openLink": {
         const url = (msg as { url?: unknown }).url;
         if (typeof url !== "string" || url.length === 0 || url.length > 4096) {

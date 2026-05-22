@@ -409,9 +409,6 @@ export function activate(context: vscode.ExtensionContext) {
       }
       BoardPanel.signalExternalDrag(issueId);
     },
-    onEnd: () => {
-      BoardPanel.signalExternalDragEnd();
-    },
   };
 
   /**
