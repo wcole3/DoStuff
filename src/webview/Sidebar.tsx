@@ -21,14 +21,18 @@ import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "
  * within the row's padding. Keep in sync with `.ds-row-title` line-height /
  * clamp in styles.css.
  */
-const ROW_HEIGHT = 64;
+const ROW_HEIGHT = 74;
 
 interface RowData {
   filtered: Issue[];
   expandedId: string | null;
   onToggle: (id: string) => void;
   onContextMenu: (id: string) => void;
+  width: number;
 }
+
+/** Below this list width the date is dropped from the meta line so chips fit. */
+const DATE_HIDE_WIDTH = 240;
 
 const Row = memo(function Row({ index, style, data }: ListChildComponentProps<RowData>) {
   const issue = data.filtered[index];
@@ -129,10 +133,14 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
               />
               {meta.label}
             </span>
-            <span className="ds-row-dot">·</span>
-            <span className="ds-row-date" title={absTime(issue.createdAt)}>
-              {relTime(issue.createdAt)}
-            </span>
+            {data.width >= DATE_HIDE_WIDTH && (
+              <>
+                <span className="ds-row-dot">·</span>
+                <span className="ds-row-date" title={absTime(issue.createdAt)}>
+                  {relTime(issue.createdAt)}
+                </span>
+              </>
+            )}
             {issue.tags.length > 0 && (
               <>
                 <span className="ds-row-dot">·</span>
@@ -233,8 +241,8 @@ export function Sidebar() {
   }, [issues]);
 
   const rowData = useMemo<RowData>(
-    () => ({ filtered, expandedId, onToggle, onContextMenu }),
-    [filtered, expandedId, onToggle, onContextMenu],
+    () => ({ filtered, expandedId, onToggle, onContextMenu, width: listSize.width }),
+    [filtered, expandedId, onToggle, onContextMenu, listSize.width],
   );
 
   return (

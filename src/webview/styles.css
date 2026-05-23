@@ -157,6 +157,7 @@ button { font: inherit; color: inherit; }
   grid-template-columns: 16px 18px 1fr;
   gap: 4px;
   align-items: flex-start;
+  align-content: start;
   padding: 6px 8px 6px 4px;
   cursor: pointer;
   border-left: 2px solid transparent;
@@ -180,7 +181,7 @@ button { font: inherit; color: inherit; }
   display: inline-flex; align-items: center; justify-content: center;
   padding-top: 2px;
 }
-.ds-row-body { min-width: 0; padding-top: 1px; }
+.ds-row-body { min-width: 0; padding-top: 1px; align-self: start; }
 .ds-row-title {
   font-size: 13px; line-height: 1.3;
   color: var(--vsc-fg);
@@ -193,9 +194,10 @@ button { font: inherit; color: inherit; }
   min-height: calc(13px * 1.3 * 2);
 }
 .ds-row-meta {
-  margin-top: 3px;
+  margin-top: 7px;
   display: flex; align-items: center; gap: 5px;
   font-size: 11px; color: var(--vsc-fg-muted);
+  flex-wrap: nowrap; white-space: nowrap; overflow: hidden;
 }
 .ds-row-id { font-variant-numeric: tabular-nums; opacity: .75; font-size: 10.5px; }
 .ds-row-dot { opacity: .4; }
