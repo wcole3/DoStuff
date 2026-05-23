@@ -1,17 +1,12 @@
-# DoStuff
+# DoStuff Issue Board
 
 A simple software issue board for VSCode with a built-in MCP server, so coding agents can read tickets and report progress without being able to silently change scope.
 
-## Install
+Made mostly for solo devs who have trouble keeping track of things there were totally going to fix after the agent broke it.
 
-```bash
-git clone <this repo>
-cd DoStuff
-bun install
-bun run package
-```
+Keeps an audit log of the changes to a ticket in case you still have the willpower to read something after reviewing the 113 file PR the agent opened. 
 
-`bun run package` produces a `.vsix`. In VSCode, right-click the file and choose **Install Extension VSIX**.
+![alt text](imgs/image.png)
 
 ## Using the extension
 
@@ -28,7 +23,7 @@ Thinking drawer  →  Planned  →  Working  →  Verification  →  Complete dr
    (left)                                                    (right)
 ```
 
-Drag a card between lanes to change its status. Each active lane (Planned, Working, Verification) is capped at **6 open tickets**; the UI rejects drops that would exceed the cap with a toast.
+Drag a card between lanes to change its status. Each active lane (Planned, Working, Verification) is capped at **6 open tickets** (setting configurable).
 
 You can also start a drag in the **sidebar** — the board lights up each lane and drawer with a "Move to *lane*" overlay; click any lane to commit, or press **Esc** to cancel. If the board isn't open, dragging from the sidebar reveals it.
 
@@ -48,7 +43,7 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 - Only humans can promote a ticket from Thinking to Planned. Agents cannot.
 - Tickets move freely between Planned, Working, and Verification.
 - Only humans can move a ticket to **Complete** or **Closed** (via the UI).
-- Active lanes (Planned, Working, Verification) are each capped at 6 open tickets. This is a workflow throttle: finish or de-scope before starting more work.
+- Active lanes (Planned, Working, Verification) are each capped. This is a workflow throttle: finish or de-scope before starting more work. Or change the limit in settings, I'm not your supervisor.
 - **Closed** is a "won't do" state. It lives only in the sidebar (no board lane/drawer), is hidden under the **All** filter, and is reachable via its dedicated filter chip.
 - **Tags** are free-form labels (like Jira labels) edited in the issue detail panel. They show as colored chips on sidebar rows and board cards; once a row runs out of space the extras collapse to colored dots. Tag colors are derived from the tag name — no per-tag setup. Both the sidebar search and the board drawer filter match against tag substrings.
 - **Links in descriptions and verify-criteria are clickable.** Bare `http(s)://`, `file:///`, and `mailto:` URLs are detected automatically, along with workspace-relative `./path/to/file` references. External links open in your default browser; file links and relative paths open in VSCode.
@@ -77,7 +72,7 @@ DoStuff runs an HTTP MCP server on `127.0.0.1:<port>/mcp`. Each VSCode window bi
 
 Every tool response includes a `workspace` field (`{ name, rootPath }` or `null`) so agents can immediately verify they are connected to the intended project.
 
-### Pinning the port (recommended)
+### Pinning the port (_recommended_)
 
 By default the OS picks an ephemeral port each session, so any `mcp.json` URL with a hard-coded port breaks at the next restart. To keep the URL stable:
 
@@ -179,6 +174,8 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 
 ## Multi-workspace agent discovery
 
+**TLDR: Just pin the port**
+
 Each VSCode window with DoStuff enabled binds its MCP server to an ephemeral localhost port and registers itself in a user-global file so external agents can discover the right endpoint per workspace.
 
 - Registry file: `~/.config/dostuff/instances.json` on Linux/macOS, `%APPDATA%/dostuff/instances.json` on Windows.
@@ -201,13 +198,13 @@ Tickets are stored as one `<id>.json` file per ticket in `<workspace>/.vscode/do
 
 On first use, DoStuff writes a nested `.gitignore` inside the storage folder so ticket files are excluded from Git even when `.vscode/` is tracked. The gitignore itself is kept trackable (via `!.gitignore`) so teammates can see why their tickets aren't there. Disable via `dostuff.writeStorageGitignore: false`.
 
-## Contributing / development
+## Install from source
 
 ```bash
+git clone <this repo>
+cd DoStuff
 bun install
-bun run watch    # esbuild watches both bundles
-bun test         # runs src/mcpServer.test.ts
+bun run package
 ```
 
-Press **F5** in VSCode to launch an Extension Development Host with the current build. `SMOKE-TEST.md` lists the manual test plan to walk before tagging a release.
-
+`bun run package` produces a `.vsix`. In VSCode, right-click the file and choose **Install Extension VSIX**.
