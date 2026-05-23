@@ -54,8 +54,8 @@ import {
 
 // The default workflow prompt lives in its own small module so the extension
 // host can import it without dragging the full MCP SDK + zod into its bundle.
-export { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
-import { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
+export { DEFAULT_WORKFLOW_PROMPT, buildDefaultWorkflowPrompt } from "./workflowPrompt";
+import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 
 // ----- Tool result helpers ---------------------------------------------------
 
@@ -171,7 +171,9 @@ export function publicView(issue: Issue) {
 export function readWorkflowPrompt(): string {
   const cfg = vscode.workspace.getConfiguration("dostuff");
   const custom = cfg.get<string>("mcp.instructions");
-  return custom && custom.trim() ? custom : DEFAULT_WORKFLOW_PROMPT;
+  if (custom && custom.trim()) return custom;
+  const cap = cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP);
+  return buildDefaultWorkflowPrompt(cap);
 }
 
 /**
@@ -1075,6 +1077,9 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
     async (args) => runCreateTicket(store, args as CreateTicketInput),
   );
 
+  const liveCap = vscode.workspace
+    .getConfiguration("dostuff")
+    .get<number>("activeLaneCap", ACTIVE_LANE_CAP);
   mcp.registerTool(
     "update_ticket_status",
     {
@@ -1083,7 +1088,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "Move a ticket between Planned, Working, and Verification. " +
         "You cannot mark a ticket Complete -- only a human reviewer can do that. " +
         "You also cannot move a ticket back to Thinking once it has left. " +
-        `Each active lane is capped at ${ACTIVE_LANE_CAP} tickets; a move that would exceed the cap is rejected.`,
+        `Each active lane is capped at ${liveCap} tickets; a move that would exceed the cap is rejected.`,
       inputSchema: STATUS_INPUT,
     },
     async (args) => runUpdateTicketStatus(store, args as UpdateStatusInput),

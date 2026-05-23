@@ -6,7 +6,7 @@ import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
-import { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
+import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
 import {
   ACTIVE_LANE_CAP,
@@ -675,13 +675,15 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("dostuff.mcp.editInstructions", async () => {
       const cfg = vscode.workspace.getConfiguration("dostuff");
       const current = cfg.get<string>("mcp.instructions", "");
+      const cap = cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP);
+      const liveDefault = buildDefaultWorkflowPrompt(cap);
       const next = await vscode.window.showInputBox({
         prompt: "Edit custom instructions. Clear all text to revert to the built-in default.",
-        value: current || DEFAULT_WORKFLOW_PROMPT,
+        value: current || liveDefault,
         ignoreFocusOut: true,
       });
       if (next === undefined) return;
-      const toSave = next.trim() === DEFAULT_WORKFLOW_PROMPT.trim() ? "" : next;
+      const toSave = next.trim() === liveDefault.trim() ? "" : next;
       await cfg.update("mcp.instructions", toSave, vscode.ConfigurationTarget.Global);
     }),
     vscode.commands.registerCommand("dostuff.mcp.pinPort", async () => {
