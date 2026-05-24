@@ -6,7 +6,7 @@ Made mostly for solo devs who have trouble keeping track of things they were tot
 
 Keeps an audit log of changes to a ticket — in case you still have the willpower to read something after reviewing the 113-file PR the agent opened.
 
-![DoStuff board screenshot](imgs/image.png)
+![DoStuff board screenshot](media/board_image.png)
 
 ## Install
 
