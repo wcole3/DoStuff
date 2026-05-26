@@ -103,8 +103,9 @@ export interface Issue {
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
 export const AGENT_WRITABLE_STATUSES: Status[] = ["Planned", "Working", "Verification"];
 
-/** Statuses that get served as tickets to MCP clients. */
-export const AGENT_SERVABLE_STATUSES: Status[] = ["Planned", "Working", "Verification"];
+/** Statuses an MCP-connected agent is allowed to read (get_ticket, resources)
+ *  and annotate (update_ticket_progress). Excludes Complete and Closed. */
+export const AGENT_VISIBLE_STATUSES: Status[] = ["Thinking", "Planned", "Working", "Verification"];
 
 /** Wire format for host ↔ webview messaging. */
 export type HostToWebview =

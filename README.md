@@ -159,9 +159,13 @@ Workflow contract:
      i.e. "get ticket 42 and begin work" or "start on the OAuth ticket".
   2. Tickets have descriptions and verify criteria written by the human. Read before
      starting. Some tickets have subtasks to help you plan.
-  3. Read `dostuff://tickets` to discover work. Only Planned / Working / Verification
-     tickets are visible -- Thinking tickets are drafts the human is still shaping,
-     and Complete tickets are done.
+  3. Read `dostuff://tickets` to discover work. It lists Thinking + active-lane
+     tickets (Complete and Closed are hidden). Thinking tickets are drafts the
+     human hasn't triaged yet -- do not start work on them, and only a human can
+     promote one to Planned. You *may* read and annotate them via
+     `update_ticket_progress`: use this to record relationships ("blocks DS-042",
+     "follow-up of DS-019") on a ticket you just filed with `create_ticket`, or
+     to leave context for the human before they triage.
   4. When you start a ticket, call `update_ticket_status` to move it to "Working".
      When you believe it's ready for verification, move it to "Verification".
   5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
@@ -184,16 +188,16 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
-| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Only Planned / Working / Verification tickets are servable. `statusHistory` and `resolvedAt` are stripped. |
+| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped. |
 | `list_issues` | optional `type`, `priority`, `status` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Includes the workflow prompt and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. |
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. |
 | `update_ticket_status` | `id`, `status` (one of Planned / Working / Verification), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete and Closed. |
-| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, or verifyCriteria. |
+| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, or verifyCriteria. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 
 ### Resources
 
-- `dostuff://tickets` — list of active (Planned / Working / Verification) tickets.
-- `dostuff://tickets/{id}` — one active ticket.
+- `dostuff://tickets` — list of Thinking + active-lane tickets (Complete and Closed hidden).
+- `dostuff://tickets/{id}` — one Thinking or active-lane ticket.
 - `dostuff://attachments/{ticketId}/{attachmentId}` — raw attachment bytes (base64).
 - `dostuff://instructions/workflow` — the workflow prompt.
 

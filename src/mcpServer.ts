@@ -2,8 +2,8 @@
 //
 // Surface:
 //   Resources
-//     dostuff://tickets                       List of servable tickets (Planned/Working/Verification)
-//     dostuff://tickets/{id}                  One ticket
+//     dostuff://tickets                       List of Thinking + active-lane tickets (Complete/Closed hidden)
+//     dostuff://tickets/{id}                  One Thinking or active-lane ticket
 //     dostuff://instructions/workflow         The workflow prompt
 //
 //   Prompt
@@ -19,10 +19,13 @@
 //     update_ticket_progress toggle task[].done and append a record entry
 //
 // Constraints enforced by the server (not just the schema):
-//   - Tickets in Thinking or Complete are never returned by the read APIs.
+//   - Tickets in Complete or Closed are never returned by the read APIs.
+//     Thinking tickets ARE readable + annotatable (so agents can record
+//     relationships on tickets they just filed), but cannot be promoted.
 //   - update_ticket_status rejects:
 //       * targets that aren't Planned/Working/Verification
-//       * current status that isn't Planned/Working/Verification (Thinking-one-way)
+//       * current status that isn't Planned/Working/Verification
+//         (Thinking-one-way; only humans triage)
 //       * moves into a lane already at ACTIVE_LANE_CAP
 //   - update_ticket_progress can only touch tasks[].done and append to record.
 
@@ -42,7 +45,7 @@ import {
 import {
   ACTIVE_LANE_CAP,
   ACTIVE_LANES,
-  AGENT_SERVABLE_STATUSES,
+  AGENT_VISIBLE_STATUSES,
   AGENT_WRITABLE_STATUSES,
   MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
@@ -237,8 +240,8 @@ export type UpdateProgressInput = {
  *
  * Returns the ticket plus the current workflow prompt as JSON.
  *
- * - Only Planned / Working / Verification tickets are servable; Thinking and
- *   Complete return an error.
+ * - Thinking, Planned, Working, and Verification tickets are servable;
+ *   Complete and Closed return an error.
  * - Title-substring queries that match multiple servable tickets return an
  *   ambiguity error listing each candidate so the agent can narrow.
  * - `statusHistory` and `resolvedAt` are stripped from the response.
@@ -275,7 +278,7 @@ export async function runGetTicket(
     }
     if (hits.length > 1) {
       const servableHits = hits.filter((h) =>
-        AGENT_SERVABLE_STATUSES.includes(h.status),
+        AGENT_VISIBLE_STATUSES.includes(h.status),
       );
       if (servableHits.length === 1) {
         match = servableHits[0];
@@ -297,13 +300,10 @@ export async function runGetTicket(
     );
   }
 
-  if (!AGENT_SERVABLE_STATUSES.includes(match.status)) {
+  if (!AGENT_VISIBLE_STATUSES.includes(match.status)) {
     return ToolResultErr(
       `Ticket #${match.number} (${match.id}) is in "${match.status}". ` +
-        `Only Planned, Working, and Verification tickets are servable. ` +
-        (match.status === "Thinking"
-          ? "Ask the human to triage and move it to Planned first."
-          : "This work is already complete."),
+        `Agents cannot fetch Complete or Closed tickets.`,
     );
   }
 
@@ -461,7 +461,7 @@ export async function runUpdateTicketStatus(
   // Thinking-one-way + Complete-is-terminal: current must already be active.
   // Only humans can promote out of Thinking, and Complete tickets cannot be
   // reopened by an agent.
-  if (!AGENT_SERVABLE_STATUSES.includes(issue.status)) {
+  if (!AGENT_WRITABLE_STATUSES.includes(issue.status)) {
     if (issue.status === "Thinking") {
       return ToolResultErr(
         `Ticket ${issue.id} is in "Thinking" -- only a human can triage and promote it to Planned.`,
@@ -516,12 +516,14 @@ export async function runUpdateTicketStatus(
 }
 
 /**
- * Append progress to a servable ticket: toggle task `done` flags and/or
+ * Append progress to a non-terminal ticket: toggle task `done` flags and/or
  * append one record entry.
  *
  * Returns `{ id, tasks, recordLength }` on success.
  *
- * - The ticket must currently be Planned, Working, or Verification.
+ * - The ticket must currently be Thinking, Planned, Working, or Verification.
+ *   Complete and Closed are rejected. Thinking is allowed so an agent can
+ *   record relationships ("blocks DS-042") on a ticket it just filed.
  * - Every `taskUpdates[].id` must match an existing task on the ticket; an
  *   unknown id rejects the whole call.
  * - This is the only MCP tool that writes ticket content. Title, description,
@@ -539,9 +541,9 @@ export async function runUpdateTicketProgress(
   const issue = store.get(args.id);
   if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
 
-  if (!AGENT_SERVABLE_STATUSES.includes(issue.status)) {
+  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
     return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may only update tickets that are Planned, Working, or Verification.`,
+      `Ticket ${issue.id} is in "${issue.status}". Agents may not update Complete or Closed tickets.`,
     );
   }
 
@@ -870,15 +872,15 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
     "tickets",
     "dostuff://tickets",
     {
-      title: "DoStuff tickets (active)",
+      title: "DoStuff tickets (Thinking + active lanes)",
       description:
-        "All tickets currently in a non-terminal state (Planned, Working, Verification).",
+        "All tickets currently in a non-terminal state (Thinking, Planned, Working, Verification). Complete and Closed are hidden.",
       mimeType: "application/json",
     },
     async (uri) => {
       const servable = store
         .list()
-        .filter((i) => AGENT_SERVABLE_STATUSES.includes(i.status))
+        .filter((i) => AGENT_VISIBLE_STATUSES.includes(i.status))
         .map(publicView);
       return {
         contents: [
@@ -906,7 +908,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
     {
       title: "DoStuff ticket",
       description:
-        "A single ticket. Only Planned / Working / Verification tickets are returned.",
+        "A single ticket. Thinking, Planned, Working, and Verification tickets are returned; Complete and Closed are rejected.",
       mimeType: "application/json",
     },
     async (uri, variables) => {
@@ -916,9 +918,9 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
       if (!issue) {
         throw new Error(`Ticket ${id} not found`);
       }
-      if (!AGENT_SERVABLE_STATUSES.includes(issue.status)) {
+      if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
         throw new Error(
-          `Ticket ${id} is in "${issue.status}" -- only Planned, Working, and Verification tickets are served.`,
+          `Ticket ${id} is in "${issue.status}" -- Complete and Closed tickets are not served.`,
         );
       }
       return {
@@ -1042,10 +1044,10 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
     {
       title: "Get ticket",
       description:
-        "Look up an active ticket and return its full content + the workflow prompt. " +
+        "Look up a ticket and return its full content + the workflow prompt. " +
         "`query` may be a ticket number (e.g. '#42' or '42'), an id (e.g. 'DS-042'), " +
-        "or a case-insensitive substring of the ticket title. Only tickets currently " +
-        "in Planned, Working, or Verification are servable; Thinking and Complete are rejected.",
+        "or a case-insensitive substring of the ticket title. Thinking, Planned, " +
+        "Working, and Verification tickets are servable; Complete and Closed are rejected.",
       inputSchema: GET_TICKET_INPUT,
     },
     async (args) => runGetTicket(store, args as GetTicketInput),
@@ -1101,7 +1103,8 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       description:
         "Tick tasks done/undone and append a note to the ticket's record. " +
         "This is the ONLY way an agent can write back to a ticket's content. " +
-        "Title, description, priority, type, and verifyCriteria are not modifiable here.",
+        "Title, description, priority, type, and verifyCriteria are not modifiable here. " +
+        "Allowed on Thinking, Planned, Working, and Verification tickets; Complete and Closed are rejected.",
       inputSchema: PROGRESS_INPUT,
     },
     async (args) => runUpdateTicketProgress(store, args as UpdateProgressInput),

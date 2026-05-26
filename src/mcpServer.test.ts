@@ -180,13 +180,25 @@ describe("get_ticket", () => {
     expect(body.ticket).not.toHaveProperty("resolvedAt");
   });
 
-  test("404 for Thinking ticket", async () => {
+  test("Thinking ticket is fetchable (agents may read drafts they just filed)", async () => {
     const store = await makeStore([
       makeIssue({ number: 9, id: "DS-009", title: "Brainstorm idea", status: "Thinking" }),
     ]);
     const res = await runGetTicket(store, { query: "9" });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("Thinking");
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { ticket: { id: string; status: string } };
+    expect(body.ticket.id).toBe("DS-009");
+    expect(body.ticket.status).toBe("Thinking");
+  });
+
+  test("Thinking ticket is fetchable by DS- id and by title substring", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 9, id: "DS-009", title: "Draft idea", status: "Thinking" }),
+    ]);
+    const byId = await runGetTicket(store, { query: "DS-009" });
+    expect(byId.isError).toBeFalsy();
+    const bySubstr = await runGetTicket(store, { query: "draft" });
+    expect(bySubstr.isError).toBeFalsy();
   });
 
   test("404 for Complete ticket", async () => {
@@ -196,6 +208,15 @@ describe("get_ticket", () => {
     const res = await runGetTicket(store, { query: "10" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("Complete");
+  });
+
+  test("404 for Closed ticket", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 11, id: "DS-011", title: "Won't do", status: "Closed" }),
+    ]);
+    const res = await runGetTicket(store, { query: "11" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("Closed");
   });
 
   test("404 when no ticket matches the title substring", async () => {
@@ -247,17 +268,29 @@ describe("get_ticket", () => {
     expect(text).toContain("DS-003");
   });
 
-  test("substring matches mix of servable + non-servable narrows to the servable one", async () => {
+  test("substring matches mix of visible + terminal narrows to the visible one", async () => {
     const store = await makeStore([
       makeIssue({ number: 1, id: "DS-001", title: "auth login planned", status: "Planned" }),
       makeIssue({ number: 2, id: "DS-002", title: "auth login complete", status: "Complete" }),
-      makeIssue({ number: 3, id: "DS-003", title: "auth login thinking", status: "Thinking" }),
+      makeIssue({ number: 3, id: "DS-003", title: "auth login closed", status: "Closed" }),
     ]);
     const res = await runGetTicket(store, { query: "auth" });
     expect(res.isError).toBeFalsy();
     const body = payload(res) as { ticket: { id: string; status: string } };
     expect(body.ticket.id).toBe("DS-001");
     expect(body.ticket.status).toBe("Planned");
+  });
+
+  test("substring narrows from terminal-only mix to a single Thinking match", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "auth refresh thinking", status: "Thinking" }),
+      makeIssue({ number: 2, id: "DS-002", title: "auth refresh closed", status: "Closed" }),
+    ]);
+    const res = await runGetTicket(store, { query: "auth" });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { ticket: { id: string; status: string } };
+    expect(body.ticket.id).toBe("DS-001");
+    expect(body.ticket.status).toBe("Thinking");
   });
 
   test("empty query string is rejected (zod min(1))", async () => {
@@ -913,8 +946,22 @@ describe("update_ticket_progress", () => {
     expect(typeof updated.record[0].at).toBe("string");
   });
 
-  test("rejects when ticket is in Thinking", async () => {
+  test("allowed on Thinking: appends an agent-authored record entry", async () => {
     const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking", tasks: [] })]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      recordEntry: "blocks DS-042",
+    });
+    expect(res.isError).toBeFalsy();
+    const updated = store.get("DS-001")!;
+    expect(updated.status).toBe("Thinking");
+    expect(updated.record).toHaveLength(1);
+    expect(updated.record[0].author).toBe("agent");
+    expect(updated.record[0].text).toContain("blocks DS-042");
+  });
+
+  test("rejects when ticket is in Complete", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Complete", tasks: [] })]);
     const res = await runUpdateTicketProgress(store, {
       id: "DS-001",
       recordEntry: "should not write",
@@ -923,8 +970,8 @@ describe("update_ticket_progress", () => {
     expect(store.get("DS-001")!.record).toHaveLength(0);
   });
 
-  test("rejects when ticket is in Complete", async () => {
-    const store = await makeStore([makeIssue({ id: "DS-001", status: "Complete", tasks: [] })]);
+  test("rejects when ticket is in Closed", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Closed", tasks: [] })]);
     const res = await runUpdateTicketProgress(store, {
       id: "DS-001",
       recordEntry: "should not write",
@@ -1667,13 +1714,14 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     return json as { result?: unknown; error?: { message: string } };
   }
 
-  test("resource dostuff://tickets returns only servable tickets", async () => {
+  test("resource dostuff://tickets returns Thinking + active-lane tickets (Complete/Closed hidden)", async () => {
     const store = await makeStore([
       makeIssue({ id: "DS-001", number: 1, title: "Planned one", status: "Planned" }),
       makeIssue({ id: "DS-002", number: 2, title: "Working one", status: "Working" }),
       makeIssue({ id: "DS-003", number: 3, title: "Testing one", status: "Verification" }),
       makeIssue({ id: "DS-004", number: 4, title: "Thinking one", status: "Thinking" }),
       makeIssue({ id: "DS-005", number: 5, title: "Complete one", status: "Complete" }),
+      makeIssue({ id: "DS-006", number: 6, title: "Closed one", status: "Closed" }),
     ]);
     ({ server, port } = await bootServer(store));
 
@@ -1685,10 +1733,10 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       tickets: Array<{ id: string; status: string }>;
     };
     const ids = payload.tickets.map((t) => t.id).sort();
-    expect(ids).toEqual(["DS-001", "DS-002", "DS-003"]);
-    // Thinking and Complete must be filtered out.
+    expect(ids).toEqual(["DS-001", "DS-002", "DS-003", "DS-004"]);
+    // Complete and Closed must be filtered out.
     for (const t of payload.tickets) {
-      expect(["Planned", "Working", "Verification"]).toContain(t.status);
+      expect(["Thinking", "Planned", "Working", "Verification"]).toContain(t.status);
     }
   });
 
@@ -1724,7 +1772,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     expect(typeof payload.workflow).toBe("string");
   });
 
-  test("resource dostuff://tickets/{id} for Thinking ticket: errors (not servable)", async () => {
+  test("resource dostuff://tickets/{id} for Thinking ticket: returns the ticket", async () => {
     const store = await makeStore([
       makeIssue({ id: "DS-001", number: 1, title: "Draft", status: "Thinking" }),
     ]);
@@ -1733,8 +1781,11 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     const json = await mcpJsonRpc(port, "resources/read", {
       uri: "dostuff://tickets/DS-001",
     });
-    expect(json.error).toBeDefined();
-    expect(json.error!.message).toContain("Thinking");
+    expect(json.error).toBeUndefined();
+    const contents = (json.result as { contents: Array<{ text: string }> }).contents;
+    const payload = JSON.parse(contents[0].text) as { ticket: { id: string; status: string } };
+    expect(payload.ticket.id).toBe("DS-001");
+    expect(payload.ticket.status).toBe("Thinking");
   });
 
   test("resource dostuff://tickets/{id} for Complete ticket: errors (not servable)", async () => {
@@ -1748,6 +1799,19 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     });
     expect(json.error).toBeDefined();
     expect(json.error!.message).toContain("Complete");
+  });
+
+  test("resource dostuff://tickets/{id} for Closed ticket: errors (not servable)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, title: "Won't do", status: "Closed" }),
+    ]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "resources/read", {
+      uri: "dostuff://tickets/DS-001",
+    });
+    expect(json.error).toBeDefined();
+    expect(json.error!.message).toContain("Closed");
   });
 
   test("resource dostuff://tickets/{id} for a non-existent ticket: errors with 'not found'", async () => {
