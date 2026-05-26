@@ -110,6 +110,17 @@ export function startMessageBridge(): void {
       case "externalDragStart":
         setState({ externalDragIssueId: msg.issueId });
         break;
+      case "attachmentStaged":
+        // The new-issue modal listens for this CustomEvent and appends the
+        // bytes to its local staging state. Routed through a window event
+        // (rather than the React store) because the modal is short-lived and
+        // owns the bytes — no other component should see them.
+        window.dispatchEvent(
+          new CustomEvent("dostuff:attachmentStaged", {
+            detail: { name: msg.name, mimeType: msg.mimeType, bytes: msg.bytes },
+          }),
+        );
+        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;
@@ -149,6 +160,14 @@ export function postCreateIssue(
   partial: Extract<WebviewToHost, { type: "createIssue" }>["partial"],
 ): void {
   vscodeApi.postMessage({ type: "createIssue", partial });
+}
+
+export function postPickAttachmentForStaging(): void {
+  vscodeApi.postMessage({ type: "pickAttachmentForStaging" });
+}
+
+export function postStageAttachmentByUri(uri: string): void {
+  vscodeApi.postMessage({ type: "stageAttachmentByUri", uri });
 }
 
 export function postOpenBoard(): void {

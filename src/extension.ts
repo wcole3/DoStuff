@@ -398,6 +398,100 @@ export function activate(context: vscode.ExtensionContext) {
       }
       await vscode.commands.executeCommand("vscode.open", uri);
     },
+    /**
+     * Staging counterpart to `onPick`. The new-issue modal calls this *before*
+     * a ticket exists — the host opens the file picker, reads bytes, and
+     * returns them so the webview can hold them in the modal's local state
+     * until submit. No disk writes happen here; `appendAttachment` runs later
+     * once `createIssue` mints the real ticket id.
+     */
+    onPickForStaging: async (): Promise<
+      Array<{ name: string; mimeType: string; bytes: Uint8Array }>
+    > => {
+      if (!vscode.workspace.workspaceFolders?.length) {
+        vscode.window.showWarningMessage(
+          "DoStuff: open a folder first — attachments need a workspace to live in.",
+        );
+        return [];
+      }
+      let uris: vscode.Uri[] | undefined;
+      try {
+        uris = await vscode.window.showOpenDialog({
+          title: "Attach files to new ticket",
+          openLabel: "Attach",
+          canSelectFiles: true,
+          canSelectFolders: false,
+          canSelectMany: true,
+        });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`DoStuff: file picker failed (${msg}).`);
+        return [];
+      }
+      if (!uris?.length) return [];
+      const out: Array<{ name: string; mimeType: string; bytes: Uint8Array }> = [];
+      for (const uri of uris) {
+        let bytes: Uint8Array;
+        try {
+          bytes = await vscode.workspace.fs.readFile(uri);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          vscode.window.showErrorMessage(`DoStuff: could not read ${uri.fsPath} (${msg}).`);
+          continue;
+        }
+        if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+          vscode.window.showWarningMessage(
+            `DoStuff: "${uri.fsPath}" is larger than the 10 MB attachment cap.`,
+          );
+          continue;
+        }
+        const segments = uri.path.split("/");
+        const name = segments[segments.length - 1] || "attachment";
+        out.push({ name, mimeType: inferMimeType(name), bytes });
+      }
+      return out;
+    },
+    /**
+     * Staging counterpart to `onAddByUri`. Same Remote-WSL motivation: host
+     * reads the dropped URI via `workspace.fs.readFile` so the modal can hold
+     * the bytes locally until submit.
+     */
+    onStageByUri: async (
+      rawUri: string,
+    ): Promise<{ name: string; mimeType: string; bytes: Uint8Array } | null> => {
+      if (!vscode.workspace.workspaceFolders?.length) {
+        vscode.window.showWarningMessage(
+          "DoStuff: open a folder first — attachments need a workspace to live in.",
+        );
+        return null;
+      }
+      let uri: vscode.Uri;
+      try {
+        uri = vscode.Uri.parse(rawUri, /* strict */ true);
+      } catch {
+        vscode.window.showErrorMessage(`DoStuff: dropped URI is malformed (${rawUri}).`);
+        return null;
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = await vscode.workspace.fs.readFile(uri);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        vscode.window.showWarningMessage(
+          `DoStuff: couldn't read dropped file (${msg}). Try the + button to pick it through the file dialog instead.`,
+        );
+        return null;
+      }
+      if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+        vscode.window.showWarningMessage(
+          `DoStuff: dropped file is larger than the 10 MB attachment cap.`,
+        );
+        return null;
+      }
+      const segments = uri.path.split("/");
+      const name = decodeURIComponent(segments[segments.length - 1] || "attachment");
+      return { name, mimeType: inferMimeType(name), bytes };
+    },
   };
 
   const externalDrag = {

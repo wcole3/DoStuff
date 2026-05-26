@@ -120,11 +120,27 @@ export type HostToWebview =
   // is cleared by the board itself (overlay click or Esc); there is no
   // matching end event because the sidebar's `dragend` fires too early —
   // before VSCode restores pointer events on the board iframe.
-  | { type: "externalDragStart"; issueId: string };
+  | { type: "externalDragStart"; issueId: string }
+  // Host's reply to `pickAttachmentForStaging` / `stageAttachmentByUri`.
+  // Carries the bytes the new-issue modal should add to its local staging
+  // list; nothing has been written to disk yet — the actual write happens
+  // after the modal submits and the host expands these into appendAttachment
+  // calls against the freshly-created ticket.
+  | { type: "attachmentStaged"; name: string; mimeType: string; bytes: number[] };
 
 export type WebviewToHost =
   | { type: "ready" }
-  | { type: "createIssue"; partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments"> & { tasks?: Task[] } }
+  | {
+      type: "createIssue";
+      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments"> & {
+        tasks?: Task[];
+        // Inline attachments staged in the new-issue modal. The host loops
+        // these through the regular appendAttachment chokepoint after upserting
+        // the new ticket, so the size cap and workspace precondition still
+        // apply uniformly.
+        attachments?: Array<{ name: string; mimeType: string; bytes: number[] }>;
+      };
+    }
   | { type: "updateIssue"; issue: Issue }
   | { type: "deleteIssue"; id: string }
   | { type: "openBoard" }
@@ -149,7 +165,13 @@ export type WebviewToHost =
   | { type: "addAttachmentByUri"; issueId: string; uri: string }
   | { type: "deleteAttachment"; issueId: string; attachmentId: string }
   // Open a non-image attachment in VSCode via its on-disk URI.
-  | { type: "openAttachment"; issueId: string; attachmentId: string };
+  | { type: "openAttachment"; issueId: string; attachmentId: string }
+  // New-issue modal staging: open the host file picker without an issueId,
+  // read each picked file, and reply with one `attachmentStaged` per file.
+  | { type: "pickAttachmentForStaging" }
+  // New-issue modal staging fallback for Remote-WSL URI drops. Host reads the
+  // URI and replies with `attachmentStaged`.
+  | { type: "stageAttachmentByUri"; uri: string };
 
 export interface Settings {
   storagePath: string;

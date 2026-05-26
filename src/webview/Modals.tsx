@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import {
+  MAX_ATTACHMENT_BYTES,
   PRIORITIES,
   TYPES,
   type Issue,
@@ -8,8 +9,32 @@ import {
   type Task,
 } from "../types";
 import { Icon } from "./Icons";
-import { newTaskId, postCreateIssue, postDeleteIssue, useIssues } from "./messaging";
+import {
+  newTaskId,
+  postCreateIssue,
+  postDeleteIssue,
+  postPickAttachmentForStaging,
+  postStageAttachmentByUri,
+  useIssues,
+} from "./messaging";
 import { TagEditor } from "./Tags";
+
+function isImageMime(mimeType: string): boolean {
+  return mimeType.startsWith("image/");
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+interface PendingAttachment {
+  tempId: string;
+  name: string;
+  mimeType: string;
+  bytes: Uint8Array;
+}
 
 interface ModalProps {
   title: string;
@@ -50,7 +75,7 @@ interface AddIssueModalProps {
 }
 
 export function AddIssueModal({ onClose }: AddIssueModalProps) {
-  const { issues } = useIssues();
+  const { issues, settings } = useIssues();
   const [title, setTitle] = useState("");
   const [type, setType] = useState<IssueType>("Bug");
   const [priority, setPriority] = useState<Priority>("Regular");
@@ -58,7 +83,77 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
   const [verifyCriteria, setVerifyCriteria] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tags, setTags] = useState<string[]>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [attDragOver, setAttDragOver] = useState(false);
   const newTaskInputRef = useRef<HTMLInputElement>(null);
+  const attachmentsDisabled = settings?.attachmentsBaseUri == null;
+
+  // Host's reply to pickAttachmentForStaging / stageAttachmentByUri arrives as
+  // a CustomEvent dispatched by the message bridge.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ name: string; mimeType: string; bytes: number[] }>).detail;
+      if (!detail) return;
+      setPendingAttachments((prev) => [
+        ...prev,
+        {
+          tempId: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          name: detail.name,
+          mimeType: detail.mimeType,
+          bytes: new Uint8Array(detail.bytes),
+        },
+      ]);
+    };
+    window.addEventListener("dostuff:attachmentStaged", handler);
+    return () => window.removeEventListener("dostuff:attachmentStaged", handler);
+  }, []);
+
+  const stageBytes = (name: string, mimeType: string, bytes: Uint8Array) => {
+    if (bytes.byteLength > MAX_ATTACHMENT_BYTES) return;
+    setPendingAttachments((prev) => [
+      ...prev,
+      {
+        tempId: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        mimeType: mimeType || "application/octet-stream",
+        bytes,
+      },
+    ]);
+  };
+
+  const removePending = (tempId: string) =>
+    setPendingAttachments((prev) => prev.filter((a) => a.tempId !== tempId));
+
+  const handleAttDragOver = (e: DragEvent<HTMLDivElement>) => {
+    if (attachmentsDisabled) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    if (!attDragOver) setAttDragOver(true);
+  };
+  const handleAttDragLeave = () => setAttDragOver(false);
+  const handleAttDrop = async (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setAttDragOver(false);
+    if (attachmentsDisabled) return;
+    const files = Array.from(e.dataTransfer.files ?? []);
+    let handledViaFiles = false;
+    for (const f of files) {
+      handledViaFiles = true;
+      if (f.size > MAX_ATTACHMENT_BYTES) continue;
+      const buf = await f.arrayBuffer();
+      stageBytes(f.name, f.type || "application/octet-stream", new Uint8Array(buf));
+    }
+    if (handledViaFiles) return;
+    // Remote-WSL fallback: bytes weren't surfaced, ship the URI to the host
+    // and let it read + return them.
+    const uriList = e.dataTransfer.getData("text/uri-list");
+    if (!uriList) return;
+    const uris = uriList
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && !s.startsWith("#"));
+    for (const uri of uris) postStageAttachmentByUri(uri);
+  };
 
   // Unique tags across every ticket, sorted alphabetically — feeds the
   // TagEditor datalist so the user picks an existing tag instead of
@@ -100,6 +195,14 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
       status: "Thinking",
       tasks: tasks.filter((t) => t.text.trim()).map((t) => ({ ...t, text: t.text.trim() })),
       tags,
+      attachments: pendingAttachments.length
+        ? pendingAttachments.map((a) => ({
+            name: a.name,
+            mimeType: a.mimeType,
+            // JSON-serialise via plain number[]; the host re-wraps as Uint8Array.
+            bytes: Array.from(a.bytes),
+          }))
+        : undefined,
     });
     onClose();
   };
@@ -231,8 +334,101 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
             </div>
           )}
         </div>
+        <div className="ds-form-row">
+          <div className="ds-d-section-head">
+            <span>Attachments</span>
+            <span style={{ opacity: 0.5, fontWeight: 400, marginLeft: 6 }}>
+              {pendingAttachments.length}
+            </span>
+            <button
+              className="ds-d-add-task"
+              onClick={postPickAttachmentForStaging}
+              title={attachmentsDisabled ? "Open a folder to attach files" : "Attach a file"}
+              aria-label="Attach a file"
+              disabled={attachmentsDisabled}
+            >
+              <Icon name="plus" size={12} />
+            </button>
+          </div>
+          <div
+            className={`ds-attachments ${attDragOver ? "is-drag-over" : ""} ${attachmentsDisabled ? "is-disabled" : ""}`}
+            onDragOver={handleAttDragOver}
+            onDragLeave={handleAttDragLeave}
+            onDrop={handleAttDrop}
+          >
+            {pendingAttachments.length === 0 ? (
+              <div className="ds-att-empty">
+                {attachmentsDisabled
+                  ? "Open a workspace folder to attach files."
+                  : "Drop files here or click + to attach."}
+              </div>
+            ) : (
+              pendingAttachments.map((att) => (
+                <PendingAttachmentChip
+                  key={att.tempId}
+                  attachment={att}
+                  onRemove={() => removePending(att.tempId)}
+                />
+              ))
+            )}
+          </div>
+        </div>
       </div>
     </Modal>
+  );
+}
+
+interface PendingAttachmentChipProps {
+  attachment: PendingAttachment;
+  onRemove: () => void;
+}
+
+function PendingAttachmentChip({ attachment, onRemove }: PendingAttachmentChipProps) {
+  const image = isImageMime(attachment.mimeType);
+  // Build a blob URL for image previews; revoke on unmount or when bytes change
+  // so the modal doesn't leak object URLs while it's open.
+  const previewUrl = useMemo(() => {
+    if (!image) return null;
+    return URL.createObjectURL(
+      new Blob([attachment.bytes as BlobPart], { type: attachment.mimeType }),
+    );
+  }, [image, attachment.bytes, attachment.mimeType]);
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  return (
+    <div className={`ds-att-chip ${image ? "is-image" : ""}`}>
+      <span className="ds-att-chip-main" aria-disabled>
+        {image && previewUrl ? (
+          <img
+            className="ds-att-thumb"
+            src={previewUrl}
+            alt={attachment.name}
+            loading="lazy"
+          />
+        ) : (
+          <span className="ds-att-icon" aria-hidden="true">
+            <Icon name="files" size={14} />
+          </span>
+        )}
+        <span className="ds-att-meta">
+          <span className="ds-att-name" title={attachment.name}>{attachment.name}</span>
+          <span className="ds-att-size">{formatBytes(attachment.bytes.byteLength)}</span>
+        </span>
+      </span>
+      <button
+        type="button"
+        className="ds-att-delete"
+        onClick={onRemove}
+        title="Remove attachment"
+        aria-label="Remove attachment"
+      >
+        <Icon name="close" size={10} />
+      </button>
+    </div>
   );
 }
 

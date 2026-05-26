@@ -47,6 +47,16 @@ export interface AttachmentHandlers {
   onDelete: (issueId: string, attachmentId: string) => void | Promise<void>;
   /** Open the attachment in VSCode (image preview / system handler). */
   onOpen: (issueId: string, attachmentId: string) => void | Promise<void>;
+  /**
+   * Staging variant of `onPick` for the new-issue modal. No issueId because the
+   * ticket doesn't exist yet — the host returns the picked bytes for the
+   * webview to hold in modal state until submit.
+   */
+  onPickForStaging: () => Promise<Array<{ name: string; mimeType: string; bytes: Uint8Array }>>;
+  /** Staging variant of `onAddByUri` (Remote-WSL drop into the new-issue modal). */
+  onStageByUri: (
+    uri: string,
+  ) => Promise<{ name: string; mimeType: string; bytes: Uint8Array } | null>;
 }
 
 const NO_OP_ATTACHMENTS: AttachmentHandlers = {
@@ -55,6 +65,8 @@ const NO_OP_ATTACHMENTS: AttachmentHandlers = {
   onAddByUri: () => {},
   onDelete: () => {},
   onOpen: () => {},
+  onPickForStaging: async () => [],
+  onStageByUri: async () => null,
 };
 
 const ID_RE = /^DS-\d+$/;
@@ -187,6 +199,29 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           record: [],
         };
         await this.store.upsert(issue);
+        // Inline attachments from the new-issue modal: replay them through the
+        // regular host chokepoint so size + workspace guards apply identically.
+        const inlineAttachments = (partial as {
+          attachments?: Array<{ name?: unknown; mimeType?: unknown; bytes?: unknown }>;
+        }).attachments;
+        if (Array.isArray(inlineAttachments)) {
+          for (const att of inlineAttachments) {
+            if (
+              typeof att?.name !== "string" ||
+              typeof att?.mimeType !== "string" ||
+              !Array.isArray(att?.bytes)
+            ) {
+              this.output.appendLine(`Skipping inline attachment: bad payload`);
+              continue;
+            }
+            await this.attachments.onAddBytes(
+              issue.id,
+              att.name,
+              att.mimeType,
+              new Uint8Array(att.bytes as number[]),
+            );
+          }
+        }
         break;
       }
       case "updateIssue": {
@@ -313,6 +348,35 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           break;
         }
         await this.attachments.onOpen(m.issueId, m.attachmentId);
+        break;
+      }
+      case "pickAttachmentForStaging": {
+        const staged = await this.attachments.onPickForStaging();
+        for (const item of staged) {
+          this.view?.webview.postMessage({
+            type: "attachmentStaged",
+            name: item.name,
+            mimeType: item.mimeType,
+            bytes: Array.from(item.bytes),
+          });
+        }
+        break;
+      }
+      case "stageAttachmentByUri": {
+        const m = msg as { uri?: unknown };
+        if (typeof m.uri !== "string" || m.uri.length === 0 || m.uri.length > 4096) {
+          this.output.appendLine(`Rejected stageAttachmentByUri: bad uri`);
+          break;
+        }
+        const staged = await this.attachments.onStageByUri(m.uri);
+        if (staged) {
+          this.view?.webview.postMessage({
+            type: "attachmentStaged",
+            name: staged.name,
+            mimeType: staged.mimeType,
+            bytes: Array.from(staged.bytes),
+          });
+        }
         break;
       }
       default: {

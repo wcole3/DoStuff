@@ -42,6 +42,8 @@ export class BoardPanel {
       onAddByUri: () => {},
       onDelete: () => {},
       onOpen: () => {},
+      onPickForStaging: async () => [],
+      onStageByUri: async () => null,
     },
   ) {
     if (BoardPanel.current) {
@@ -99,6 +101,8 @@ export class BoardPanel {
       onAddByUri: () => {},
       onDelete: () => {},
       onOpen: () => {},
+      onPickForStaging: async () => [],
+      onStageByUri: async () => null,
     },
   ) {
     this.panel = panel;
