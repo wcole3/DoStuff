@@ -21,7 +21,14 @@ import {
 import type { LinkKind } from "../types";
 import { Icon, TYPE_ICON } from "./Icons";
 import { LINK_KIND_COLOR } from "./Links";
-import { buildGraphModel, LINK_KIND_LABEL, type GraphEdge, type GraphNode } from "./linkModel";
+import {
+  buildGraphModel,
+  graphNodeMatchesQuery,
+  visibleGraphNodeIds,
+  LINK_KIND_LABEL,
+  type GraphEdge,
+  type GraphNode,
+} from "./linkModel";
 import { postOpenBoard, postRevealTicket, useIssues } from "./messaging";
 
 // d3-force mutates node objects in place, stamping x/y/vx/vy. We keep our own
@@ -50,6 +57,24 @@ const DRAG_THRESHOLD = 5;
 export function Graph() {
   const { issues } = useIssues();
   const model = useMemo(() => buildGraphModel(issues), [issues]);
+
+  // Free-text filter. A node "matches" by id/number/title/tags; visibility is
+  // then expanded to whole connected components so a matched ticket keeps its
+  // chain/context (see visibleGraphNodeIds).
+  const [filter, setFilter] = useState("");
+  const filterActive = filter.trim().length > 0;
+  const matchedIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const n of model.nodes) if (graphNodeMatchesQuery(n, filter)) s.add(n.id);
+    return s;
+  }, [model, filter]);
+  const visibleIds = useMemo(
+    () =>
+      filterActive
+        ? visibleGraphNodeIds(matchedIds, model.edges)
+        : new Set(model.nodes.map((n) => n.id)),
+    [filterActive, matchedIds, model],
+  );
 
   // Stable signature: only re-run the layout when the set of nodes/edges
   // actually changes, not on every unrelated issue edit (e.g. a title tweak).
@@ -255,10 +280,13 @@ export function Graph() {
     drag.current = null;
   };
 
-  // Reset = fit all nodes into view (centered, padded). Always reframes — even
-  // a small drift produces a visible change, so the button has clear feedback.
+  // Reset = fit the *visible* nodes into view (centered, padded). When a filter
+  // is active this frames just the matched cluster; otherwise it frames the
+  // whole graph. Always reframes — even a small drift produces a visible
+  // change, so the button has clear feedback.
   const fitView = () => {
-    const ns = simRef.current?.nodes() ?? nodes;
+    const all = simRef.current?.nodes() ?? nodes;
+    const ns = all.filter((n) => visibleIds.has(n.id));
     if (!ns.length) {
       setView({ tx: 0, ty: 0, scale: 1 });
       return;
@@ -282,6 +310,13 @@ export function Graph() {
     });
   };
 
+  // Reframe to the visible subset whenever the filter query changes, so the
+  // matched cluster comes into focus without a manual "Fit to view".
+  useEffect(() => {
+    fitView();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter]);
+
   if (model.nodes.length === 0) {
     return (
       <div className="ds-graph-empty">
@@ -297,9 +332,17 @@ export function Graph() {
   return (
     <div className="ds-graph-root">
       <div className="ds-graph-toolbar">
+        <input
+          className="ds-input ds-graph-filter"
+          value={filter}
+          placeholder="Filter by #id, title, or tag…"
+          onChange={(e) => setFilter(e.target.value)}
+          aria-label="Filter graph"
+        />
         <span className="ds-graph-count">
-          {model.nodes.length} linked ticket{model.nodes.length === 1 ? "" : "s"} · {model.edges.length} link
-          {model.edges.length === 1 ? "" : "s"}
+          {filterActive
+            ? `${visibleIds.size} of ${model.nodes.length} shown`
+            : `${model.nodes.length} linked ticket${model.nodes.length === 1 ? "" : "s"} · ${model.edges.length} link${model.edges.length === 1 ? "" : "s"}`}
         </span>
         <div className="ds-graph-legend" aria-label="Edge color legend">
           {(Object.keys(LINK_KIND_COLOR) as LinkKind[]).map((k) => (
@@ -353,20 +396,30 @@ export function Graph() {
           ))}
         </defs>
         <g transform={`translate(${view.tx} ${view.ty}) scale(${view.scale})`}>
-          {edges.map((e, i) => (
-            <Edge key={i} edge={e} />
-          ))}
-          {nodes.map((n) => (
-            <NodeView
-              key={n.id}
-              node={n}
-              label={titleById.get(n.id) ?? n.id}
-              onPointerDown={(ev) => onNodePointerDown(ev, n)}
-              onActivate={() => postRevealTicket(n.id)}
-            />
-          ))}
+          {edges
+            .filter((e) => visibleIds.has(e.source.id) && visibleIds.has(e.target.id))
+            .map((e, i) => (
+              <Edge key={i} edge={e} />
+            ))}
+          {nodes
+            .filter((n) => visibleIds.has(n.id))
+            .map((n) => (
+              <NodeView
+                key={n.id}
+                node={n}
+                label={titleById.get(n.id) ?? n.id}
+                // When filtering, nodes kept only for chain context (not direct
+                // matches) render dimmed so matches stand out.
+                dimmed={filterActive && !matchedIds.has(n.id)}
+                onPointerDown={(ev) => onNodePointerDown(ev, n)}
+                onActivate={() => postRevealTicket(n.id)}
+              />
+            ))}
         </g>
       </svg>
+      {filterActive && visibleIds.size === 0 && (
+        <div className="ds-graph-no-match">No linked tickets match “{filter.trim()}”.</div>
+      )}
     </div>
   );
 }
@@ -401,16 +454,18 @@ function Edge({ edge }: { edge: SimEdge }) {
 interface NodeViewProps {
   node: SimNode;
   label: string;
+  dimmed?: boolean;
   onPointerDown: (e: ReactPointerEvent) => void;
   onActivate: () => void;
 }
 
-function NodeView({ node, label, onPointerDown, onActivate }: NodeViewProps) {
+function NodeView({ node, label, dimmed, onPointerDown, onActivate }: NodeViewProps) {
   return (
     <g
       transform={`translate(${node.x} ${node.y})`}
-      className="ds-graph-node"
+      className={`ds-graph-node${dimmed ? " is-dimmed" : ""}`}
       data-node={node.id}
+      data-dimmed={dimmed ? "true" : undefined}
       tabIndex={0}
       role="button"
       aria-label={label}

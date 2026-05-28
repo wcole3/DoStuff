@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import {
+  INVERSE_LINK_KIND,
   MAX_ATTACHMENT_BYTES,
   PRIORITIES,
   TYPES,
   type Issue,
   type IssueType,
+  type LinkKind,
   type Priority,
   type Task,
   type TicketLink,
 } from "../types";
 import { LinkEditor } from "./LinkEditor";
+import { InboundLinkChip } from "./Links";
 import { Icon } from "./Icons";
 import {
   newTaskId,
@@ -86,6 +89,9 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tags, setTags] = useState<string[]>([]);
   const [links, setLinks] = useState<TicketLink[]>([]);
+  // Inverse relationships ("new ticket is blocked by X") staged for the host
+  // to write onto the source ticket X after the new ticket gets its id.
+  const [inboundLinks, setInboundLinks] = useState<Array<{ sourceId: string; kind: LinkKind }>>([]);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [attDragOver, setAttDragOver] = useState(false);
   const newTaskInputRef = useRef<HTMLInputElement>(null);
@@ -199,6 +205,7 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
       tasks: tasks.filter((t) => t.text.trim()).map((t) => ({ ...t, text: t.text.trim() })),
       tags,
       links: links.length ? links : undefined,
+      inboundLinks: inboundLinks.length ? inboundLinks : undefined,
       attachments: pendingAttachments.length
         ? pendingAttachments.map((a) => ({
             name: a.name,
@@ -282,7 +289,42 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
         </div>
         <div className="ds-form-row">
           <span>Links</span>
-          <LinkEditor value={links} onChange={setLinks} allIssues={issues} />
+          <LinkEditor
+            value={links}
+            onChange={setLinks}
+            onAddInverse={(targetId, kind) =>
+              setInboundLinks((prev) =>
+                prev.some((l) => l.sourceId === targetId && l.kind === kind)
+                  ? prev
+                  : [...prev, { sourceId: targetId, kind }],
+              )
+            }
+            allIssues={issues}
+          />
+          {inboundLinks.length > 0 && (
+            <div className="ds-link-chip-row" style={{ marginTop: 4 }}>
+              {inboundLinks.map((l) => {
+                const src = issues.find((i) => i.id === l.sourceId);
+                return (
+                  <InboundLinkChip
+                    key={`${l.sourceId}|${l.kind}`}
+                    link={{
+                      sourceId: l.sourceId,
+                      sourceTitle: src?.title ?? l.sourceId,
+                      kind: INVERSE_LINK_KIND[l.kind],
+                      storedKind: l.kind,
+                    }}
+                    source={src}
+                    onRemove={() =>
+                      setInboundLinks((prev) =>
+                        prev.filter((x) => !(x.sourceId === l.sourceId && x.kind === l.kind)),
+                      )
+                    }
+                  />
+                );
+              })}
+            </div>
+          )}
         </div>
         <label className="ds-form-row">
           <span>Description</span>

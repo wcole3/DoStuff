@@ -11,11 +11,14 @@ import {
 } from "../types";
 
 /** One inbound edge from the target's vantage point. The `kind` is inverted
- *  (e.g. an outbound `blocks` surfaces as `blocked-by`). */
+ *  for display (e.g. an outbound `blocks` surfaces as `blocked-by`), while
+ *  `storedKind` is the actual forward kind persisted on the source ticket —
+ *  needed to remove the link from the right place. */
 export interface InboundLink {
   sourceId: string;
   sourceTitle: string;
   kind: InverseLinkLabel;
+  storedKind: LinkKind;
 }
 
 /**
@@ -34,11 +37,43 @@ export function deriveInbound(targetId: string, allIssues: Issue[]): InboundLink
           sourceId: i.id,
           sourceTitle: i.title,
           kind: INVERSE_LINK_KIND[l.kind],
+          storedKind: l.kind,
         });
       }
     }
   }
   return out;
+}
+
+/**
+ * A relationship as the user picks it from one ticket's perspective. Forward
+ * kinds (`blocks`/`child-of`/`relates-to`) store an outbound link on the
+ * current ticket; inverse kinds (`blocked-by`/`parent-of`) instead store the
+ * matching forward link on the *target* ticket — that's what lets you define
+ * "this ticket is blocked by X" without opening X. `relates-to` is symmetric,
+ * so it has no separate inverse option.
+ */
+export type RelLabel = LinkKind | "blocked-by" | "parent-of";
+
+export interface RelationshipOption {
+  rel: RelLabel;
+  label: string;
+  /** When true, the stored link lives on the *target* ticket, not the current one. */
+  inverse: boolean;
+  /** The forward kind actually persisted in storage. */
+  storedKind: LinkKind;
+}
+
+export const RELATIONSHIP_OPTIONS: RelationshipOption[] = [
+  { rel: "blocks", label: "blocks", inverse: false, storedKind: "blocks" },
+  { rel: "blocked-by", label: "blocked by", inverse: true, storedKind: "blocks" },
+  { rel: "child-of", label: "child of", inverse: false, storedKind: "child-of" },
+  { rel: "parent-of", label: "parent of", inverse: true, storedKind: "child-of" },
+  { rel: "relates-to", label: "relates to", inverse: false, storedKind: "relates-to" },
+];
+
+export function relationshipOption(rel: RelLabel): RelationshipOption {
+  return RELATIONSHIP_OPTIONS.find((o) => o.rel === rel)!;
 }
 
 /** A node in the graph view: an issue that participates in at least one link
@@ -49,6 +84,7 @@ export interface GraphNode {
   title: string;
   status: Issue["status"];
   type: Issue["type"];
+  tags: string[];
 }
 
 /** A directed edge: source --(kind)--> target. */
@@ -101,11 +137,61 @@ export function buildGraphModel(allIssues: Issue[]): GraphModel {
       title: i.title,
       status: i.status,
       type: i.type,
+      tags: i.tags,
     });
   }
   // Stable ordering keeps the d3-force layout deterministic across renders.
   nodes.sort((a, b) => a.number - b.number);
   return { nodes, edges };
+}
+
+/**
+ * Does a graph node match a free-text filter query? Empty query matches all.
+ * Matches `#<number>` / `<number>`, the DS-id (case-insensitive substring),
+ * a title substring, or any tag substring — mirroring the sidebar's search.
+ */
+export function graphNodeMatchesQuery(node: GraphNode, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  if (`#${node.number}` === q || `${node.number}` === q) return true;
+  if (node.id.toLowerCase().includes(q)) return true;
+  if (node.title.toLowerCase().includes(q)) return true;
+  if (node.tags.some((t) => t.toLowerCase().includes(q))) return true;
+  return false;
+}
+
+/**
+ * Given the ids that directly match a filter, return every node id that should
+ * stay visible: the matches PLUS every node reachable from a match through the
+ * link graph (treated as undirected). This preserves whole chains/clusters so
+ * a matched ticket is never shown stripped of its context.
+ */
+export function visibleGraphNodeIds(
+  matchedIds: ReadonlySet<string>,
+  edges: ReadonlyArray<{ sourceId: string; targetId: string }>,
+): Set<string> {
+  const adjacency = new Map<string, string[]>();
+  const link = (a: string, b: string) => {
+    const list = adjacency.get(a);
+    if (list) list.push(b);
+    else adjacency.set(a, [b]);
+  };
+  for (const e of edges) {
+    link(e.sourceId, e.targetId);
+    link(e.targetId, e.sourceId);
+  }
+  const visible = new Set<string>(matchedIds);
+  const stack = [...matchedIds];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    for (const next of adjacency.get(cur) ?? []) {
+      if (!visible.has(next)) {
+        visible.add(next);
+        stack.push(next);
+      }
+    }
+  }
+  return visible;
 }
 
 /**

@@ -23,6 +23,7 @@ import {
   runCreateTicket,
   runUpdateTicketStatus,
   runUpdateTicketProgress,
+  runUpdateTicketDraft,
   registerMcpTools,
   getWorkspaceContext,
   DoStuffMcpServer,
@@ -1163,6 +1164,119 @@ describe("update_ticket_progress", () => {
   });
 });
 
+describe("update_ticket_draft", () => {
+  test("sets tags on a Thinking ticket", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking", tags: [] })]);
+    const res = await runUpdateTicketDraft(store, { id: "DS-001", tags: ["Auth", "auth", "  backend "] });
+    expect(res.isError).toBeFalsy();
+    // coerceTags dedupes case-insensitively + trims.
+    expect(store.get("DS-001")!.tags).toEqual(["Auth", "backend"]);
+  });
+
+  test("replaces the task list with fresh-id tasks", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Thinking", tasks: [{ id: "old", text: "stale", done: true }] }),
+    ]);
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      tasks: [{ text: "first" }, { text: "second", done: true }],
+    });
+    expect(res.isError).toBeFalsy();
+    const tasks = store.get("DS-001")!.tasks;
+    expect(tasks.map((t) => ({ text: t.text, done: t.done }))).toEqual([
+      { text: "first", done: false },
+      { text: "second", done: true },
+    ]);
+    // Fresh ids, not the old one.
+    expect(tasks.every((t) => t.id !== "old")).toBe(true);
+  });
+
+  test("sets links and drops unknown-target entries", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Thinking", links: [] }),
+      makeIssue({ id: "DS-002", status: "Planned" }),
+    ]);
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      links: [
+        { targetId: "DS-002", kind: "blocks" },
+        { targetId: "DS-999", kind: "relates-to" }, // unknown -> dropped
+      ],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.links).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+  });
+
+  test("omitted fields are left untouched; [] clears", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Thinking",
+        tags: ["keep"],
+        tasks: [{ id: "t1", text: "keep", done: false }],
+        links: [],
+      }),
+    ]);
+    // Only clear tags; tasks must remain.
+    await runUpdateTicketDraft(store, { id: "DS-001", tags: [] });
+    const updated = store.get("DS-001")!;
+    expect(updated.tags).toEqual([]);
+    expect(updated.tasks).toHaveLength(1);
+  });
+
+  test("drops a self-link and keeps valid ones", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Thinking", links: [] }),
+      makeIssue({ id: "DS-002", status: "Planned" }),
+    ]);
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      links: [
+        { targetId: "DS-001", kind: "blocks" }, // self -> dropped
+        { targetId: "DS-002", kind: "relates-to" },
+      ],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.links).toEqual([{ targetId: "DS-002", kind: "relates-to" }]);
+  });
+
+  test("rejects when the ticket is not in Thinking", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Planned", tags: ["x"] })]);
+    const res = await runUpdateTicketDraft(store, { id: "DS-001", tags: ["y"] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/not Thinking/i);
+    expect(store.get("DS-001")!.tags).toEqual(["x"]); // unchanged
+  });
+
+  test("rejects unknown ticket id", async () => {
+    const store = await makeStore([]);
+    const res = await runUpdateTicketDraft(store, { id: "DS-404", tags: ["x"] });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/not found/i);
+  });
+
+  test("does not touch title/description/priority/type/verifyCriteria", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Thinking",
+        title: "Original",
+        description: "Original desc",
+        priority: "High",
+        type: "Bug",
+        verifyCriteria: "Original verify",
+      }),
+    ]);
+    await runUpdateTicketDraft(store, { id: "DS-001", tags: ["new"] });
+    const u = store.get("DS-001")!;
+    expect(u.title).toBe("Original");
+    expect(u.description).toBe("Original desc");
+    expect(u.priority).toBe("High");
+    expect(u.type).toBe("Bug");
+    expect(u.verifyCriteria).toBe("Original verify");
+  });
+});
+
 // ----- HTTP integration tests -----------------------------------------------
 
 describe("DoStuffMcpServer HTTP", () => {
@@ -1705,7 +1819,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     }
   });
 
-  test("real /mcp POST with tools/list returns the 4 registered tool names", async () => {
+  test("real /mcp POST with tools/list returns the registered tool names", async () => {
     const store = await makeStore([]);
     ({ server, port } = await bootServer(store));
 
@@ -1738,6 +1852,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       "create_ticket",
       "get_ticket",
       "list_issues",
+      "update_ticket_draft",
       "update_ticket_progress",
       "update_ticket_status",
     ]);
@@ -1757,6 +1872,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
         "create_ticket",
         "get_ticket",
         "list_issues",
+        "update_ticket_draft",
         "update_ticket_progress",
         "update_ticket_status",
       ]);

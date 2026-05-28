@@ -178,6 +178,7 @@ dist
 media/webview.js
 media/webview.js.map
 media/styles.css
+media/styles.css.map
 media/index.js
 media/index.js.map
 

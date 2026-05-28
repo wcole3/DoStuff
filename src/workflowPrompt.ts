@@ -35,12 +35,16 @@ Workflow contract:
   8. If you discover follow-up work, call \`create_ticket\` to file it. New
      tickets land in "Thinking" for the human to triage. Optionally supply
      \`links: [{ targetId, kind }]\` to record first-class relationships at
-     creation time (kinds: blocks, child-of, relates-to). Links cannot be
-     mutated by the MCP server afterwards -- set them at create time, or
-     leave a record entry and ask the human to update.
+     creation time (kinds: blocks, child-of, relates-to).
+  9. While a ticket is still in "Thinking" (an untriaged draft), call
+     \`update_ticket_draft\` to reshape its tags, links, and/or task list --
+     useful for fleshing out a ticket you just filed before a human triages
+     it. Once it's triaged to an active lane, that scope locks -- you can then
+     only toggle task done-state via \`update_ticket_progress\`.
 
-You may NOT modify a ticket's title, description, priority, type, verify
-criteria, or links via the MCP server. If something is wrong with those, file a new
+You may NOT modify a ticket's title, description, priority, type, or verify
+criteria via the MCP server, and tags/links/tasks become read-only once a
+ticket leaves "Thinking". If something is wrong with those, file a new
 ticket instead.`;
 }
 

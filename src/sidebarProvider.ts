@@ -3,7 +3,7 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import { coerceLinks, coerceTags, isPriority, isType, type Issue, type Settings, type WebviewToHost } from "./types";
+import { coerceLinks, coerceTags, isLinkKind, isPriority, isType, type Issue, type Settings, type WebviewToHost } from "./types";
 import { validateLinks } from "./extension";
 
 /**
@@ -244,6 +244,36 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
               att.mimeType,
               new Uint8Array(att.bytes as number[]),
             );
+          }
+        }
+        // Inverse links staged in the modal ("new ticket blocked by X"): stored
+        // single-source as a forward link on each source ticket X, pointing at
+        // the just-minted ticket. Skip unknown sources / bad kinds / self.
+        const inboundLinks = (partial as {
+          inboundLinks?: Array<{ sourceId?: unknown; kind?: unknown }>;
+        }).inboundLinks;
+        if (Array.isArray(inboundLinks)) {
+          for (const inbound of inboundLinks) {
+            const sourceId = inbound?.sourceId;
+            const kind = inbound?.kind;
+            if (typeof sourceId !== "string" || !ID_RE.test(sourceId) || sourceId === issue.id) {
+              this.output.appendLine(`Skipping inbound link: bad source ${JSON.stringify(sourceId)}`);
+              continue;
+            }
+            if (!isLinkKind(kind)) {
+              this.output.appendLine(`Skipping inbound link: bad kind ${JSON.stringify(kind)}`);
+              continue;
+            }
+            const source = this.store.get(sourceId);
+            if (!source) {
+              this.output.appendLine(`Skipping inbound link: unknown source ${sourceId}`);
+              continue;
+            }
+            if (source.links.some((l) => l.targetId === issue.id && l.kind === kind)) continue;
+            await this.store.upsert({
+              ...source,
+              links: [...source.links, { targetId: issue.id, kind }],
+            });
           }
         }
         break;

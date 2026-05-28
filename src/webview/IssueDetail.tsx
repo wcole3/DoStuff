@@ -8,6 +8,7 @@ import {
   type Attachment,
   type Issue,
   type IssueType,
+  type LinkKind,
   type Priority,
   type Status,
   type Task,
@@ -189,6 +190,25 @@ export function IssueDetail({ issue }: IssueDetailProps) {
   const setTags = (tags: string[]) => postUpdateIssue({ ...issue, tags });
   const setLinks = (links: typeof issue.links) => postUpdateIssue({ ...issue, links });
 
+  // Inverse relationship ("this ticket is blocked by X") is stored as a
+  // forward link on the *target* ticket (X blocks current) — single-source.
+  // So we update X, not the current ticket.
+  const addInverseLink = (targetId: string, storedKind: LinkKind) => {
+    const target = issuesById.get(targetId);
+    if (!target) return;
+    if (target.links.some((l) => l.targetId === issue.id && l.kind === storedKind)) return;
+    postUpdateIssue({ ...target, links: [...target.links, { targetId: issue.id, kind: storedKind }] });
+  };
+  // Remove an inbound link: scrub the forward link that lives on the source.
+  const removeInboundLink = (sourceId: string, storedKind: LinkKind) => {
+    const source = issuesById.get(sourceId);
+    if (!source) return;
+    postUpdateIssue({
+      ...source,
+      links: source.links.filter((l) => !(l.targetId === issue.id && l.kind === storedKind)),
+    });
+  };
+
   const toggleTask = (taskId: string) => {
     postUpdateIssue({
       ...issue,
@@ -323,6 +343,7 @@ export function IssueDetail({ issue }: IssueDetailProps) {
           key={issue.id}
           value={issue.links}
           onChange={setLinks}
+          onAddInverse={addInverseLink}
           allIssues={issues}
           currentIssueId={issue.id}
         />
@@ -333,7 +354,12 @@ export function IssueDetail({ issue }: IssueDetailProps) {
           <div className="ds-d-section-h">Linked by</div>
           <div className="ds-link-chip-row">
             {inboundLinks.map((l) => (
-              <InboundLinkChip key={`${l.sourceId}|${l.kind}`} link={l} source={issuesById.get(l.sourceId)} />
+              <InboundLinkChip
+                key={`${l.sourceId}|${l.storedKind}`}
+                link={l}
+                source={issuesById.get(l.sourceId)}
+                onRemove={() => removeInboundLink(l.sourceId, l.storedKind)}
+              />
             ))}
           </div>
         </div>

@@ -46,11 +46,13 @@ You can also start a drag in the **sidebar**. The board lights each lane and dra
 
 ### Ticket links
 
-Relate tickets to each other from the detail panel's **Links** field. Pick a kind — **blocks**, **child of**, or **relates to** — then search the target by `#number`, `DS-id`, or a title substring. The link shows as a chip; click it to jump to that ticket. The target ticket shows the inverse relationship under **Linked by** (e.g. an outbound *blocks* surfaces as *blocked by* on the other side). Links are directional and stored once on the source — deleting the link, or the ticket, cleans up both ends. The new-issue dialog can stage links before the ticket is even created.
+Relate tickets to each other from the detail panel's **Links** field. Pick a relationship — **blocks**, **blocked by**, **child of**, **parent of**, or **relates to** — then search the target by `#number`, `DS-id`, or a title substring. Forward kinds (blocks / child of / relates to) are stored on the current ticket and shown as chips; inverse kinds (blocked by / parent of) define the relationship from the *other* ticket's side without leaving the current one, and appear under **Linked by**. Click any chip to jump to that ticket; remove a **Linked by** chip to delete the relationship from its source. Links are directional and stored once — deleting the link, or the ticket, cleans up both ends. The new-issue dialog offers the same relationships (forward and inverse); inverse ones are applied to their source tickets right after the new ticket is created.
 
 ### Graph view
 
-Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear. Edges are colored and arrowed by kind. **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket. *Reset view* re-centers.
+Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear. Edges are colored and arrowed by kind. **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket. *Fit to view* frames everything currently shown.
+
+Use the **filter** box (by `#id`, title, or tag) to focus on part of the network. Filtering preserves context: a matched ticket keeps its whole connected chain so you never see it stripped of its blockers, children, or related tickets — matches render normally while the surrounding chain dims. The view auto-fits to the matching cluster.
 
 ### Attachments
 
@@ -185,13 +187,17 @@ Workflow contract:
   8. If you discover follow-up work, call `create_ticket` to file it. New
      tickets land in "Thinking" for the human to triage. Optionally supply
      `links: [{ targetId, kind }]` to record first-class relationships at
-     creation time (kinds: blocks, child-of, relates-to). Links cannot be
-     mutated by the MCP server afterwards -- set them at create time, or
-     leave a record entry and ask the human to update.
+     creation time (kinds: blocks, child-of, relates-to).
+  9. While a ticket is still in "Thinking" (an untriaged draft), call
+     `update_ticket_draft` to reshape its tags, links, and/or task list --
+     useful for fleshing out a ticket you just filed before a human triages
+     it. Once it's triaged to an active lane, that scope locks -- you can then
+     only toggle task done-state via `update_ticket_progress`.
 
-You may NOT modify a ticket's title, description, priority, type, verify
-criteria, or links via the MCP server after creation. If something is wrong
-with those, file a new ticket instead.
+You may NOT modify a ticket's title, description, priority, type, or verify
+criteria via the MCP server, and tags/links/tasks become read-only once a
+ticket leaves "Thinking". If something is wrong with those, file a new
+ticket instead.
 ```
 
 Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `dostuff.mcp.instructions` in Settings. Leave the setting blank to use the built-in text above.
@@ -205,6 +211,7 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
 | `update_ticket_status` | `id`, `status` (one of Planned / Working / Verification), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete and Closed. |
 | `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, verifyCriteria, or links. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
+| `update_ticket_draft` | `id`, optional `tags[]`, `links[]`, `tasks[]` | Reshapes an untriaged draft's tags, links, and/or task list. **Thinking-only** — rejected once the ticket is triaged to an active lane (use the UI after that). Omit a field to leave it unchanged; pass `[]` to clear it. Unknown link targets are dropped. |
 
 ### Resources
 

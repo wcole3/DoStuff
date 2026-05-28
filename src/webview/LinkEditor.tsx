@@ -3,33 +3,70 @@
 // commits survive the host round-trip (see TagEditor's long comment).
 
 import { useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { LINK_KINDS, type Issue, type LinkKind, type TicketLink } from "../types";
+import { type Issue, type LinkKind, type TicketLink } from "../types";
 import { Icon, STATUS_META, TYPE_ICON } from "./Icons";
 import { OutboundLinkChip, LINK_KIND_COLOR } from "./Links";
-import { LINK_KIND_LABEL, searchIssuesForLink, sortLinks } from "./linkModel";
+import {
+  RELATIONSHIP_OPTIONS,
+  relationshipOption,
+  searchIssuesForLink,
+  sortLinks,
+  type RelLabel,
+} from "./linkModel";
 
 interface LinkEditorProps {
+  /** The current ticket's outbound (forward) links. */
   value: TicketLink[];
+  /** Called with the new outbound list when a *forward* relationship is added
+   *  or removed. */
   onChange: (next: TicketLink[]) => void;
+  /** Called when an *inverse* relationship is added (e.g. "blocked by X"). The
+   *  caller stores the forward link on the target ticket. Required for inverse
+   *  options to be offered. */
+  onAddInverse?: (targetId: string, storedKind: LinkKind) => void;
   allIssues: Issue[];
   /** The ticket being edited — excluded from results so it can't self-link.
    *  Omit in the new-issue modal (no id yet). */
   currentIssueId?: string;
 }
 
-export function LinkEditor({ value, onChange, allIssues, currentIssueId }: LinkEditorProps) {
+export function LinkEditor({
+  value,
+  onChange,
+  onAddInverse,
+  allIssues,
+  currentIssueId,
+}: LinkEditorProps) {
   const [local, setLocal] = useState(value);
   const [draft, setDraft] = useState("");
-  const [kind, setKind] = useState<LinkKind>("relates-to");
+  const [rel, setRel] = useState<RelLabel>("relates-to");
   const [open, setOpen] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Inverse kinds need a place to store the back-link; offer them only when
+  // the caller handles inverse adds.
+  const offerInverse = !!onAddInverse;
+  const options = useMemo(
+    () => RELATIONSHIP_OPTIONS.filter((o) => offerInverse || !o.inverse),
+    [offerInverse],
+  );
+  const opt = relationshipOption(rel);
+
   const byId = useMemo(() => new Map(allIssues.map((i) => [i.id, i] as const)), [allIssues]);
-  const linkedIds = useMemo(() => new Set(local.map((l) => l.targetId)), [local]);
+  // Exclude targets already linked with the selected forward kind so the
+  // dropdown can't produce an exact duplicate. (Inverse picks aren't excluded
+  // here — the host de-dupes on the target side.)
+  const excludedIds = useMemo(() => {
+    const s = new Set<string>();
+    if (!opt.inverse) {
+      for (const l of local) if (l.kind === opt.storedKind) s.add(l.targetId);
+    }
+    return s;
+  }, [local, opt]);
 
   const results = useMemo(
-    () => searchIssuesForLink(draft, allIssues, currentIssueId, linkedIds).slice(0, 8),
-    [draft, allIssues, currentIssueId, linkedIds],
+    () => searchIssuesForLink(draft, allIssues, currentIssueId, excludedIds).slice(0, 8),
+    [draft, allIssues, currentIssueId, excludedIds],
   );
 
   const emit = (next: TicketLink[]) => {
@@ -38,16 +75,18 @@ export function LinkEditor({ value, onChange, allIssues, currentIssueId }: LinkE
   };
 
   const commit = (target: Issue) => {
-    // A given (target, kind) pair is unique; coerceLinks dedupes on the host
-    // anyway, but guard here so the chip list doesn't visually double up.
-    if (local.some((l) => l.targetId === target.id && l.kind === kind)) {
-      setDraft("");
-      setOpen(false);
-      return;
-    }
-    emit([...local, { targetId: target.id, kind }]);
     setDraft("");
     setOpen(false);
+    if (opt.inverse) {
+      // Stored on the target ticket as a forward link back to current.
+      onAddInverse?.(target.id, opt.storedKind);
+      return;
+    }
+    // Forward link on the current ticket. A given (target, kind) pair is
+    // unique; coerceLinks dedupes on the host anyway, but guard here so the
+    // chip list doesn't visually double up.
+    if (local.some((l) => l.targetId === target.id && l.kind === opt.storedKind)) return;
+    emit([...local, { targetId: target.id, kind: opt.storedKind }]);
   };
 
   const remove = (link: TicketLink) =>
@@ -85,14 +124,14 @@ export function LinkEditor({ value, onChange, allIssues, currentIssueId }: LinkE
       <div className="ds-link-edit-controls">
         <select
           className="ds-input ds-link-kind-select"
-          value={kind}
-          onChange={(e) => setKind(e.target.value as LinkKind)}
+          value={rel}
+          onChange={(e) => setRel(e.target.value as RelLabel)}
           aria-label="Link kind"
-          style={{ borderColor: LINK_KIND_COLOR[kind] }}
+          style={{ borderColor: LINK_KIND_COLOR[opt.storedKind] }}
         >
-          {LINK_KINDS.map((k) => (
-            <option key={k} value={k}>
-              {LINK_KIND_LABEL[k]}
+          {options.map((o) => (
+            <option key={o.rel} value={o.rel}>
+              {o.label}
             </option>
           ))}
         </select>

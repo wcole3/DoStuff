@@ -62,7 +62,7 @@ describe("LinkEditor typeahead", () => {
     expect(text).toContain("OAuth refresh tokens");
   });
 
-  test("excludes already-linked targets from results", async () => {
+  test("excludes a target already linked with the SAME kind, but offers it for other kinds", async () => {
     render(
       <LinkEditor
         value={[{ targetId: "DS-042", kind: "blocks" }]}
@@ -71,13 +71,23 @@ describe("LinkEditor typeahead", () => {
         currentIssueId="DS-099"
       />,
     );
+    // Select "blocks": DS-042 is already blocked, so it must not reappear.
+    fireEvent.change(screen.getByLabelText(/link kind/i), { target: { value: "blocks" } });
     await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "oauth");
-    const text = within(screen.getByRole("listbox"))
+    let text = within(screen.getByRole("listbox"))
       .getAllByRole("option")
       .map((o) => o.textContent)
       .join(" ");
     expect(text).toContain("Fix OAuth login");
     expect(text).not.toContain("OAuth refresh tokens");
+
+    // Switch to "relates to": DS-042 is fair game again (different kind).
+    fireEvent.change(screen.getByLabelText(/link kind/i), { target: { value: "relates-to" } });
+    text = within(screen.getByRole("listbox"))
+      .getAllByRole("option")
+      .map((o) => o.textContent)
+      .join(" ");
+    expect(text).toContain("OAuth refresh tokens");
   });
 });
 
@@ -109,6 +119,46 @@ describe("LinkEditor commit + kind", () => {
     const opt = within(screen.getByRole("listbox")).getByRole("option");
     fireEvent.mouseDown(within(opt).getByRole("button"));
     expect(lastCall(calls)).toEqual([{ targetId: "DS-002", kind: "relates-to" }]);
+  });
+
+  test("picking an inverse kind calls onAddInverse with the forward storedKind (not onChange)", async () => {
+    const changes: TicketLink[][] = [];
+    const inverse: Array<{ targetId: string; storedKind: string }> = [];
+    render(
+      <LinkEditor
+        value={[]}
+        onChange={(n) => changes.push(n)}
+        onAddInverse={(targetId, storedKind) => inverse.push({ targetId, storedKind })}
+        allIssues={allIssues}
+        currentIssueId="DS-099"
+      />,
+    );
+    // "blocked by" is the inverse of "blocks"; storing it means DS-002 blocks current.
+    fireEvent.change(screen.getByLabelText(/link kind/i), { target: { value: "blocked-by" } });
+    await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "csv");
+    fireEvent.mouseDown(within(within(screen.getByRole("listbox")).getByRole("option")).getByRole("button"));
+    expect(inverse).toEqual([{ targetId: "DS-002", storedKind: "blocks" }]);
+    expect(changes).toHaveLength(0); // current ticket's outbound list is untouched
+  });
+
+  test("inverse options are hidden when onAddInverse is omitted (forward-only)", () => {
+    render(
+      <LinkEditor value={[]} onChange={() => {}} allIssues={allIssues} currentIssueId="DS-099" />,
+    );
+    const opts = Array.from(screen.getByLabelText(/link kind/i).querySelectorAll("option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(opts).toEqual(["blocks", "child-of", "relates-to"]);
+  });
+
+  test("inverse options appear when onAddInverse is supplied", () => {
+    render(
+      <LinkEditor value={[]} onChange={() => {}} onAddInverse={() => {}} allIssues={allIssues} currentIssueId="DS-099" />,
+    );
+    const opts = Array.from(screen.getByLabelText(/link kind/i).querySelectorAll("option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(opts).toEqual(["blocks", "blocked-by", "child-of", "parent-of", "relates-to"]);
   });
 
   test("Enter commits the top result", async () => {

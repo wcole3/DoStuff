@@ -1296,6 +1296,7 @@ button { font: inherit; color: inherit; }
   display: flex;
   flex-direction: column;
   height: 100%;
+  position: relative;
   background: var(--vsc-editor-bg);
   color: var(--vsc-fg);
 }
@@ -1309,6 +1310,7 @@ button { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--vsc-border-2);
   background: var(--vsc-sidebar-bg);
 }
+.ds-graph-filter { flex: 0 1 240px; min-width: 120px; }
 .ds-graph-count { color: var(--vsc-fg-muted); font-size: 11px; white-space: nowrap; }
 .ds-graph-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .ds-graph-legend-item {
@@ -1337,6 +1339,10 @@ button { font: inherit; color: inherit; }
 .ds-graph-svg text { user-select: none; }
 
 .ds-graph-node { cursor: pointer; outline: none; }
+/* Nodes kept only for chain context while filtering — de-emphasized so direct
+   matches stand out. */
+.ds-graph-node.is-dimmed { opacity: 0.32; }
+.ds-graph-node.is-dimmed:hover, .ds-graph-node.is-dimmed:focus-visible { opacity: 0.75; }
 .ds-graph-node-circle {
   fill: var(--vsc-card);
   stroke: color-mix(in srgb, var(--accent) 70%, transparent);
@@ -1381,3 +1387,16 @@ button { font: inherit; color: inherit; }
 }
 .ds-graph-empty p { margin: 0; }
 .ds-graph-empty-sub { font-size: 12px; color: var(--vsc-fg-dim); max-width: 360px; }
+.ds-graph-no-match {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 10px 16px;
+  border-radius: 6px;
+  background: var(--vsc-card);
+  border: 1px solid var(--vsc-border-2);
+  color: var(--vsc-fg-muted);
+  font-size: 12px;
+  pointer-events: none;
+}

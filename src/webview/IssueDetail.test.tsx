@@ -447,4 +447,48 @@ describe("IssueDetail links", () => {
       | undefined;
     expect(reveal?.id).toBe("DS-001");
   });
+
+  test("adding an inverse link ('blocked by') posts updateIssue on the TARGET ticket", async () => {
+    const current = makeIssue({ id: "DS-001", number: 1, title: "current", status: "Working", links: [] });
+    const other = makeIssue({ id: "DS-002", number: 2, title: "CSV blocker", status: "Planned", links: [] });
+    pushInit([current, other]);
+    render(<IssueDetail issue={current} />);
+
+    // "blocked by DS-002" ⇒ DS-002 blocks DS-001, stored on DS-002.
+    fireEvent.change(screen.getByLabelText(/link kind/i), { target: { value: "blocked-by" } });
+    await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "csv");
+    fireEvent.mouseDown(within(within(screen.getByRole("listbox")).getByRole("option")).getByRole("button"));
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue") as Array<{
+      type: "updateIssue";
+      issue: Issue;
+    }>;
+    const lastUpdate = updates[updates.length - 1]!;
+    expect(lastUpdate.issue.id).toBe("DS-002"); // the target, not current
+    expect(lastUpdate.issue.links).toEqual([{ targetId: "DS-001", kind: "blocks" }]);
+  });
+
+  test("removing an inbound chip posts updateIssue scrubbing the link from the source", async () => {
+    const current = makeIssue({ id: "DS-002", number: 2, title: "blocked", status: "Planned", links: [] });
+    const source = makeIssue({
+      id: "DS-001",
+      number: 1,
+      title: "blocker",
+      status: "Working",
+      links: [{ targetId: "DS-002", kind: "blocks" }],
+    });
+    pushInit([source, current]);
+    render(<IssueDetail issue={current} />);
+
+    const linkedBy = screen.getByText("Linked by").parentElement!;
+    await userEvent.click(within(linkedBy).getByRole("button", { name: /remove link from DS-001/i }));
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue") as Array<{
+      type: "updateIssue";
+      issue: Issue;
+    }>;
+    const lastUpdate = updates[updates.length - 1]!;
+    expect(lastUpdate.issue.id).toBe("DS-001"); // the source owns the link
+    expect(lastUpdate.issue.links).toEqual([]);
+  });
 });

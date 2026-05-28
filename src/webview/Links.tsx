@@ -67,11 +67,15 @@ export function OutboundLinkChip({ kind, target, targetId, onRemove }: OutboundC
 interface InboundChipProps {
   link: InboundLink;
   source: Issue | undefined;
+  /** When provided, renders a remove button that deletes the underlying link
+   *  from the source ticket — so inbound relationships can be managed from
+   *  either side, not just by opening the source. */
+  onRemove?: () => void;
 }
 
-/** A chip for a derived inbound link ("Linked by"). Read-only — to remove it,
- *  you edit the source ticket. The kind is the already-inverted label. */
-export function InboundLinkChip({ link, source }: InboundChipProps) {
+/** A chip for a derived inbound link ("Linked by"). The kind is the
+ *  already-inverted label. */
+export function InboundLinkChip({ link, source, onRemove }: InboundChipProps) {
   const label = `${source ? `#${source.number}` : link.sourceId} ${source?.title ?? link.sourceTitle}`.trim();
   return (
     <span className="ds-link-chip ds-link-chip-inbound">
@@ -92,6 +96,17 @@ export function InboundLinkChip({ link, source }: InboundChipProps) {
           />
         )}
       </button>
+      {onRemove && (
+        <button
+          type="button"
+          className="ds-link-chip-rm"
+          onClick={onRemove}
+          aria-label={`Remove link from ${link.sourceId}`}
+          title="Remove link"
+        >
+          <Icon name="close" size={10} />
+        </button>
+      )}
     </span>
   );
 }

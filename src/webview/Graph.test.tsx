@@ -119,3 +119,60 @@ describe("Graph rendering", () => {
     expect(legend.querySelectorAll(".ds-graph-legend-line")).toHaveLength(3);
   });
 });
+
+describe("Graph filtering", () => {
+  // Two separate chains: A-B-C (the "auth" cluster) and D-E (unrelated).
+  function seedTwoChains() {
+    pushInit([
+      makeIssue({ id: "DS-001", number: 1, title: "auth blocker", tags: ["auth"], links: [{ targetId: "DS-002", kind: "blocks" }] }),
+      makeIssue({ id: "DS-002", number: 2, title: "auth middle", links: [{ targetId: "DS-003", kind: "child-of" }] }),
+      makeIssue({ id: "DS-003", number: 3, title: "auth leaf" }),
+      makeIssue({ id: "DS-004", number: 4, title: "billing one", links: [{ targetId: "DS-005", kind: "blocks" }] }),
+      makeIssue({ id: "DS-005", number: 5, title: "billing two" }),
+    ]);
+  }
+
+  test("filtering preserves the whole chain of a matched node", () => {
+    seedTwoChains();
+    render(<Graph />);
+    // Match only the middle node's title; its full A-B-C chain must remain.
+    fireEvent.change(screen.getByLabelText(/filter graph/i), { target: { value: "auth middle" } });
+    const shown = Array.from(document.querySelectorAll("[data-node]")).map((n) => n.getAttribute("data-node"));
+    expect(shown.sort()).toEqual(["DS-001", "DS-002", "DS-003"]);
+  });
+
+  test("the unrelated chain is hidden when it has no match", () => {
+    seedTwoChains();
+    render(<Graph />);
+    fireEvent.change(screen.getByLabelText(/filter graph/i), { target: { value: "auth" } });
+    expect(document.querySelector('[data-node="DS-004"]')).toBeNull();
+    expect(document.querySelector('[data-node="DS-005"]')).toBeNull();
+  });
+
+  test("context nodes (preserved but not matched) are dimmed; matches are not", () => {
+    seedTwoChains();
+    render(<Graph />);
+    // Only DS-001 matches by tag; DS-002/DS-003 are context (dimmed).
+    fireEvent.change(screen.getByLabelText(/filter graph/i), { target: { value: "auth blocker" } });
+    expect(document.querySelector('[data-node="DS-001"]')!.getAttribute("data-dimmed")).toBeNull();
+    expect(document.querySelector('[data-node="DS-002"]')!.getAttribute("data-dimmed")).toBe("true");
+  });
+
+  test("clearing the filter restores all nodes", () => {
+    seedTwoChains();
+    render(<Graph />);
+    const input = screen.getByLabelText(/filter graph/i);
+    fireEvent.change(input, { target: { value: "auth" } });
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(3);
+    fireEvent.change(input, { target: { value: "" } });
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(5);
+  });
+
+  test("a query matching nothing shows the no-match message", () => {
+    seedTwoChains();
+    render(<Graph />);
+    fireEvent.change(screen.getByLabelText(/filter graph/i), { target: { value: "zzz-nope" } });
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(0);
+    expect(screen.getByText(/no linked tickets match/i)).toBeDefined();
+  });
+});

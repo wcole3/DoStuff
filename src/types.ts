@@ -210,6 +210,11 @@ export type WebviewToHost =
         // the store (dropping unknown targetIds and self-links) before
         // persisting alongside the freshly-created ticket.
         links?: TicketLink[];
+        // Inverse relationships staged in the modal (e.g. "new ticket is
+        // blocked by DS-042"). Single-source storage means these are written
+        // as forward links on the *source* ticket after the new ticket gets
+        // its id: host appends `{ targetId: <newId>, kind }` to each source.
+        inboundLinks?: Array<{ sourceId: string; kind: LinkKind }>;
       };
     }
   | { type: "updateIssue"; issue: Issue }

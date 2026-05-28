@@ -396,4 +396,49 @@ describe("AddIssueModal: links staging", () => {
     expect(msg).toBeDefined();
     expect(msg!.partial.links).toBeUndefined();
   });
+
+  test("inverse options are offered in the modal and staged into inboundLinks", async () => {
+    pushInit([makeIssue({ id: "DS-002", number: 2, title: "CSV blocker" })]);
+    render(<AddIssueModal onClose={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/short summary/i), "Needs unblocking");
+
+    // Modal now offers inverse kinds.
+    const opts = Array.from(screen.getByLabelText(/link kind/i).querySelectorAll("option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(opts).toContain("blocked-by");
+
+    // "blocked by DS-002" ⇒ host should store {DS-002 blocks new ticket}.
+    fireEvent.change(screen.getByLabelText(/link kind/i), { target: { value: "blocked-by" } });
+    await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "csv");
+    fireEvent.mouseDown(within(within(screen.getByRole("listbox")).getByRole("option")).getByRole("button"));
+
+    // A staged inbound chip is shown for feedback (its remove button is unique).
+    expect(screen.getByRole("button", { name: /remove link from DS-002/i })).toBeDefined();
+
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    const msg = api.posted.find((m) => m.type === "createIssue") as
+      | { type: "createIssue"; partial: { links?: unknown; inboundLinks?: Array<{ sourceId: string; kind: string }> } }
+      | undefined;
+    expect(msg).toBeDefined();
+    expect(msg!.partial.links).toBeUndefined(); // forward list empty
+    expect(msg!.partial.inboundLinks).toEqual([{ sourceId: "DS-002", kind: "blocks" }]);
+  });
+
+  test("a staged inbound chip can be removed before submit", async () => {
+    pushInit([makeIssue({ id: "DS-002", number: 2, title: "CSV blocker" })]);
+    render(<AddIssueModal onClose={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/short summary/i), "x");
+    fireEvent.change(screen.getByLabelText(/link kind/i), { target: { value: "blocked-by" } });
+    await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "csv");
+    fireEvent.mouseDown(within(within(screen.getByRole("listbox")).getByRole("option")).getByRole("button"));
+
+    await userEvent.click(screen.getByRole("button", { name: /remove link from DS-002/i }));
+
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    const msg = api.posted.find((m) => m.type === "createIssue") as
+      | { type: "createIssue"; partial: { inboundLinks?: unknown } }
+      | undefined;
+    expect(msg!.partial.inboundLinks).toBeUndefined();
+  });
 });

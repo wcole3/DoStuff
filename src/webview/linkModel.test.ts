@@ -3,9 +3,14 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  RELATIONSHIP_OPTIONS,
   buildGraphModel,
   deriveInbound,
+  graphNodeMatchesQuery,
+  relationshipOption,
   searchIssuesForLink,
+  visibleGraphNodeIds,
+  type GraphNode,
 } from "./linkModel";
 import { makeIssue, resetCounter } from "./__tests__/testUtils";
 
@@ -21,8 +26,16 @@ describe("deriveInbound", () => {
       makeIssue({ id: "DS-002", title: "blocked" }),
     ];
     expect(deriveInbound("DS-002", issues)).toEqual([
-      { sourceId: "DS-001", sourceTitle: "blocker", kind: "blocked-by" },
+      { sourceId: "DS-001", sourceTitle: "blocker", kind: "blocked-by", storedKind: "blocks" },
     ]);
+  });
+
+  test("includes the storedKind so the link can be removed from the source", () => {
+    const issues = [
+      makeIssue({ id: "DS-001", title: "kid", links: [{ targetId: "DS-002", kind: "child-of" }] }),
+      makeIssue({ id: "DS-002", title: "parent" }),
+    ];
+    expect(deriveInbound("DS-002", issues)[0]!.storedKind).toBe("child-of");
   });
 
   test("child-of inverts to parent-of", () => {
@@ -136,5 +149,97 @@ describe("searchIssuesForLink", () => {
   test("excludes already-linked targets", () => {
     const out = searchIssuesForLink("oauth", fixture(), undefined, new Set(["DS-042"]));
     expect(out.map((i) => i.id)).toEqual(["DS-001"]);
+  });
+});
+
+describe("RELATIONSHIP_OPTIONS", () => {
+  test("offers the three forward kinds plus the two inverse kinds", () => {
+    expect(RELATIONSHIP_OPTIONS.map((o) => o.rel)).toEqual([
+      "blocks",
+      "blocked-by",
+      "child-of",
+      "parent-of",
+      "relates-to",
+    ]);
+  });
+
+  test("inverse options carry the forward storedKind they persist", () => {
+    expect(relationshipOption("blocked-by")).toMatchObject({ inverse: true, storedKind: "blocks" });
+    expect(relationshipOption("parent-of")).toMatchObject({ inverse: true, storedKind: "child-of" });
+  });
+
+  test("forward options store their own kind", () => {
+    expect(relationshipOption("blocks")).toMatchObject({ inverse: false, storedKind: "blocks" });
+    expect(relationshipOption("child-of")).toMatchObject({ inverse: false, storedKind: "child-of" });
+    expect(relationshipOption("relates-to")).toMatchObject({ inverse: false, storedKind: "relates-to" });
+  });
+});
+
+describe("graphNodeMatchesQuery", () => {
+  const node: GraphNode = {
+    id: "DS-042",
+    number: 42,
+    title: "Fix OAuth login",
+    status: "Planned",
+    type: "Bug",
+    tags: ["auth", "backend"],
+  };
+
+  test("empty query matches everything", () => {
+    expect(graphNodeMatchesQuery(node, "")).toBe(true);
+    expect(graphNodeMatchesQuery(node, "   ")).toBe(true);
+  });
+  test("matches by number and #number", () => {
+    expect(graphNodeMatchesQuery(node, "42")).toBe(true);
+    expect(graphNodeMatchesQuery(node, "#42")).toBe(true);
+  });
+  test("matches by id substring (case-insensitive)", () => {
+    expect(graphNodeMatchesQuery(node, "ds-042")).toBe(true);
+  });
+  test("matches by title substring (case-insensitive)", () => {
+    expect(graphNodeMatchesQuery(node, "oauth")).toBe(true);
+  });
+  test("matches by tag substring", () => {
+    expect(graphNodeMatchesQuery(node, "auth")).toBe(true);
+    expect(graphNodeMatchesQuery(node, "back")).toBe(true);
+  });
+  test("no match returns false", () => {
+    expect(graphNodeMatchesQuery(node, "zzz")).toBe(false);
+  });
+});
+
+describe("visibleGraphNodeIds (chain preservation)", () => {
+  // A -> B -> C  is one chain;  D -> E is a separate one.
+  const edges = [
+    { sourceId: "A", targetId: "B" },
+    { sourceId: "B", targetId: "C" },
+    { sourceId: "D", targetId: "E" },
+  ];
+
+  test("a match pulls in its whole connected chain (both directions)", () => {
+    // Match the middle node B → the entire A-B-C chain is visible.
+    const vis = visibleGraphNodeIds(new Set(["B"]), edges);
+    expect([...vis].sort()).toEqual(["A", "B", "C"]);
+  });
+
+  test("matching an endpoint still preserves the full chain", () => {
+    const vis = visibleGraphNodeIds(new Set(["A"]), edges);
+    expect([...vis].sort()).toEqual(["A", "B", "C"]);
+  });
+
+  test("does not pull in a disconnected chain", () => {
+    const vis = visibleGraphNodeIds(new Set(["A"]), edges);
+    expect(vis.has("D")).toBe(false);
+    expect(vis.has("E")).toBe(false);
+  });
+
+  test("multiple matches across chains union their components", () => {
+    const vis = visibleGraphNodeIds(new Set(["C", "D"]), edges);
+    expect([...vis].sort()).toEqual(["A", "B", "C", "D", "E"]);
+  });
+
+  test("a match with no edges is visible on its own", () => {
+    const vis = visibleGraphNodeIds(new Set(["Z"]), edges);
+    expect([...vis]).toEqual(["Z"]);
   });
 });

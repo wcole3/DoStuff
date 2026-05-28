@@ -17,6 +17,7 @@
 //                            with lane-cap enforcement (cap=6) and the
 //                            Thinking-one-way rule (current must already be active)
 //     update_ticket_progress toggle task[].done and append a record entry
+//     update_ticket_draft    reshape a Thinking draft's tags/links/tasks
 //
 // Constraints enforced by the server (not just the schema):
 //   - Tickets in Complete or Closed are never returned by the read APIs.
@@ -28,6 +29,9 @@
 //         (Thinking-one-way; only humans triage)
 //       * moves into a lane already at ACTIVE_LANE_CAP
 //   - update_ticket_progress can only touch tasks[].done and append to record.
+//   - update_ticket_draft can replace tags/links/tasks, but ONLY while the
+//     ticket is in Thinking (untriaged). Title/description/priority/type/
+//     verifyCriteria remain UI-only.
 
 import * as http from "http";
 import type { AddressInfo } from "node:net";
@@ -121,6 +125,30 @@ const PROGRESS_INPUT = {
   recordEntry: z.string().max(5_000).optional(),
 };
 
+// Shape-edit a *draft* (Thinking) ticket: replace tags / links / tasks. Each
+// field is optional; omitted fields are left untouched. Only valid while the
+// ticket is in Thinking — once triaged, scope is locked (use the UI).
+const DRAFT_INPUT = {
+  id: z.string().regex(/^DS-\d+$/),
+  tags: z.array(z.string().max(64)).optional(),
+  links: z
+    .array(
+      z.object({
+        targetId: z.string().regex(/^DS-\d+$/i, "Expected an id like DS-001"),
+        kind: z.enum(LINK_KINDS),
+      }),
+    )
+    .optional(),
+  tasks: z
+    .array(
+      z.object({
+        text: z.string().min(1).max(500),
+        done: z.boolean().optional().default(false),
+      }),
+    )
+    .optional(),
+};
+
 const GET_TICKET_INPUT = {
   query: z
     .string()
@@ -150,6 +178,7 @@ const LIST_ISSUES_INPUT = {
 const NewTicketSchema   = z.object(NEW_TICKET_INPUT).strict();
 const StatusSchema      = z.object(STATUS_INPUT).strict();
 const ProgressSchema    = z.object(PROGRESS_INPUT).strict();
+const DraftSchema       = z.object(DRAFT_INPUT).strict();
 const GetTicketSchema   = z.object(GET_TICKET_INPUT).strict();
 const ListIssuesSchema  = z.object(LIST_ISSUES_INPUT).strict();
 
@@ -262,6 +291,12 @@ export type UpdateProgressInput = {
   id: string;
   taskUpdates?: Array<{ id: string; done: boolean }>;
   recordEntry?: string;
+};
+export type UpdateDraftInput = {
+  id: string;
+  tags?: string[];
+  links?: Array<{ targetId: string; kind: LinkKind }>;
+  tasks?: Array<{ text: string; done?: boolean }>;
 };
 
 /**
@@ -624,6 +659,79 @@ export async function runUpdateTicketProgress(
         id: next.id,
         tasks: next.tasks.map((t) => ({ id: t.id, done: t.done })),
         recordLength: next.record.length,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+/**
+ * Shape a *draft* ticket: replace its `tags`, `links`, and/or `tasks`.
+ *
+ * Returns `{ id, tags, links, tasks }` (the post-update lists) on success.
+ *
+ * - The ticket MUST be in `Thinking`. Once a human triages it to an active
+ *   lane, scope is locked again — agents can only toggle task done-state and
+ *   append records via `update_ticket_progress`. This keeps agents from
+ *   silently rewriting the scope of work that's already been triaged.
+ * - Each field is independent: omit one to leave it unchanged; pass `[]` to
+ *   clear it. `links` are validated against the store (unknown targets and
+ *   self-links dropped); `tasks` are replaced wholesale with fresh ids.
+ * - Title, description, priority, type, and verifyCriteria remain UI-only.
+ */
+export async function runUpdateTicketDraft(
+  store: IssueStore,
+  args: UpdateDraftInput,
+): Promise<ToolResult> {
+  const parsed = DraftSchema.safeParse(args);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_draft: ${parsed.error.message}`);
+  const validated = parsed.data;
+
+  const issue = store.get(validated.id);
+  if (!issue) return ToolResultErr(`Ticket ${validated.id} not found.`);
+  if (issue.status !== "Thinking") {
+    return ToolResultErr(
+      `Ticket ${issue.id} is in "${issue.status}", not Thinking. ` +
+        `Tags, links, and tasks can only be edited via MCP while a ticket is an untriaged draft. ` +
+        `Use update_ticket_progress to toggle task done-state on active tickets, or the UI to edit scope.`,
+    );
+  }
+
+  const next: Issue = { ...issue };
+
+  if (validated.tags !== undefined) {
+    next.tags = coerceTags(validated.tags);
+  }
+  if (validated.links !== undefined) {
+    const knownIds = new Set(store.list().map((i) => i.id));
+    const { kept, dropped } = validateLinks(coerceLinks(validated.links, issue.id), issue.id, knownIds);
+    if (dropped.length) {
+      store.appendLog(
+        `MCP update_ticket_draft on ${issue.id} dropped ${dropped.length} unknown-target link(s).`,
+      );
+    }
+    next.links = kept;
+  }
+  if (validated.tasks !== undefined) {
+    // Replace the task list wholesale with fresh ids — drafts aren't being
+    // worked yet, so there's no done-state correlation worth preserving.
+    next.tasks = validated.tasks.map((t) => ({
+      id: `t-${randomUUID()}`,
+      text: t.text,
+      done: t.done ?? false,
+    }));
+  }
+
+  await store.upsert(next);
+  return ToolResultOk(
+    JSON.stringify(
+      {
+        workspace: getWorkspaceContext(),
+        id: next.id,
+        tags: next.tags,
+        links: next.links,
+        tasks: next.tasks.map((t) => ({ id: t.id, text: t.text, done: t.done })),
       },
       null,
       2,
@@ -1151,12 +1259,27 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       title: "Update ticket progress",
       description:
         "Tick tasks done/undone and append a note to the ticket's record. " +
-        "This is the ONLY way an agent can write back to a ticket's content. " +
         "Title, description, priority, type, and verifyCriteria are not modifiable here. " +
-        "Allowed on Thinking, Planned, Working, and Verification tickets; Complete and Closed are rejected.",
+        "Allowed on Thinking, Planned, Working, and Verification tickets; Complete and Closed are rejected. " +
+        "To reshape a draft's tags/links/task-list, use update_ticket_draft (Thinking only).",
       inputSchema: PROGRESS_INPUT,
     },
     async (args) => runUpdateTicketProgress(store, args as UpdateProgressInput),
+  );
+
+  mcp.registerTool(
+    "update_ticket_draft",
+    {
+      title: "Update ticket draft",
+      description:
+        "Reshape an untriaged draft: replace its tags, links, and/or task list. " +
+        "Only valid while the ticket is in 'Thinking' — once a human triages it to an " +
+        "active lane, scope locks and you can only toggle task done-state via " +
+        "update_ticket_progress. Omit a field to leave it unchanged; pass [] to clear it. " +
+        "Link kinds: blocks, child-of, relates-to (unknown targets are dropped).",
+      inputSchema: DRAFT_INPUT,
+    },
+    async (args) => runUpdateTicketDraft(store, args as UpdateDraftInput),
   );
 }
 
