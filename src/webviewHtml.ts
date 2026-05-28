@@ -12,7 +12,7 @@ export function getNonce(): string {
 interface WebviewOpts {
   webview: vscode.Webview;
   extensionUri: vscode.Uri;
-  mode: "sidebar" | "board";
+  mode: "sidebar" | "board" | "graph";
 }
 
 /**

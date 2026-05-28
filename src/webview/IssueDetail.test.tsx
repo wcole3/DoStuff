@@ -12,7 +12,7 @@
 // (covered by extension.test.ts).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render, fireEvent } from "@testing-library/react";
+import { cleanup, render, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { IssueDetail } from "./IssueDetail";
 import { ACTIVE_LANE_CAP, type Issue } from "../types";
@@ -364,5 +364,87 @@ describe("IssueDetail", () => {
       document.querySelectorAll(".ds-d-link"),
     ) as HTMLAnchorElement[];
     expect(anchors.map((a) => a.getAttribute("href"))).toEqual(["./docs/overview.md"]);
+  });
+});
+
+describe("IssueDetail links", () => {
+  test("adding a link via the editor posts updateIssue with the new links array", async () => {
+    const issue = makeIssue({ id: "DS-001", number: 1, title: "source", status: "Working", links: [] });
+    const target = makeIssue({ id: "DS-002", number: 2, title: "CSV export target", status: "Planned" });
+    pushInit([issue, target]);
+    render(<IssueDetail issue={issue} />);
+
+    const input = screen.getByPlaceholderText(/link a ticket/i);
+    await userEvent.type(input, "csv");
+    const opt = within(screen.getByRole("listbox")).getByRole("option");
+    fireEvent.mouseDown(within(opt).getByRole("button"));
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue") as Array<{
+      type: "updateIssue";
+      issue: Issue;
+    }>;
+    expect(updates.length).toBeGreaterThan(0);
+    expect(updates[updates.length - 1]!.issue.links).toEqual([
+      { targetId: "DS-002", kind: "relates-to" },
+    ]);
+  });
+
+  test("removing a link posts updateIssue with the shortened array", async () => {
+    const issue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      status: "Working",
+      links: [{ targetId: "DS-002", kind: "blocks" }],
+    });
+    const target = makeIssue({ id: "DS-002", number: 2, title: "blocked" });
+    pushInit([issue, target]);
+    render(<IssueDetail issue={issue} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /remove link to DS-002/i }));
+    const updates = api.posted.filter((m) => m.type === "updateIssue") as Array<{
+      type: "updateIssue";
+      issue: Issue;
+    }>;
+    expect(updates[updates.length - 1]!.issue.links).toEqual([]);
+  });
+
+  test("'Linked by' section renders inbound chips derived from other issues", () => {
+    const target = makeIssue({ id: "DS-002", number: 2, title: "the target", status: "Planned", links: [] });
+    const source = makeIssue({
+      id: "DS-001",
+      number: 1,
+      title: "the blocker",
+      status: "Working",
+      links: [{ targetId: "DS-002", kind: "blocks" }],
+    });
+    pushInit([source, target]);
+    render(<IssueDetail issue={target} />);
+
+    // Inbound chip shows the inverted kind label "blocked by" + the source number.
+    const linkedBy = screen.getByText("Linked by").parentElement!;
+    expect(linkedBy.textContent).toContain("blocked by");
+    expect(linkedBy.textContent).toContain("#1");
+  });
+
+  test("clicking an inbound chip posts revealTicket for the source", async () => {
+    const target = makeIssue({ id: "DS-002", number: 2, title: "target", status: "Planned" });
+    const source = makeIssue({
+      id: "DS-001",
+      number: 1,
+      title: "blocker",
+      status: "Working",
+      links: [{ targetId: "DS-002", kind: "blocks" }],
+    });
+    pushInit([source, target]);
+    render(<IssueDetail issue={target} />);
+
+    const linkedBy = screen.getByText("Linked by").parentElement!;
+    const chipButton = within(linkedBy).getByTitle(/open #1/i);
+    await userEvent.click(chipButton);
+
+    const reveal = api.posted.find((m) => m.type === "revealTicket") as
+      | { type: "revealTicket"; id: string }
+      | undefined;
+    expect(reveal?.id).toBe("DS-001");
   });
 });

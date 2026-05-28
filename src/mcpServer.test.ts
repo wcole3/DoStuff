@@ -27,6 +27,7 @@ import {
   getWorkspaceContext,
   DoStuffMcpServer,
   DEFAULT_WORKFLOW_PROMPT,
+  type CreateTicketInput,
   type ToolResult,
 } from "./mcpServer";
 import { ACTIVE_LANE_CAP, type Issue, type Priority, type IssueType, type Status } from "./types";
@@ -90,6 +91,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
+    links: overrides.links ?? [],
   };
 }
 
@@ -678,6 +680,72 @@ describe("create_ticket", () => {
     const body = payload(res) as { id: string };
     const persisted = store.get(body.id)!;
     expect(persisted.description).toBe("");
+  });
+
+  test("accepts well-formed links and persists them on the new ticket", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", title: "parent" }),
+      makeIssue({ id: "DS-002", title: "blocker" }),
+    ]);
+    const res = await runCreateTicket(store, {
+      title: "Child of 1, blocked by 2",
+      type: "Feature",
+      priority: "Regular",
+      links: [
+        { targetId: "DS-001", kind: "child-of" },
+        { targetId: "DS-002", kind: "blocks" },
+      ],
+    });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { id: string };
+    const persisted = store.get(body.id)!;
+    expect(persisted.links).toEqual([
+      { targetId: "DS-001", kind: "child-of" },
+      { targetId: "DS-002", kind: "blocks" },
+    ]);
+  });
+
+  test("drops links whose targetId doesn't exist (logged via store)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", title: "real" }),
+    ]);
+    const res = await runCreateTicket(store, {
+      title: "Mixed valid + ghost links",
+      links: [
+        { targetId: "DS-001", kind: "relates-to" },
+        { targetId: "DS-999", kind: "blocks" }, // unknown
+      ],
+    });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { id: string };
+    const persisted = store.get(body.id)!;
+    expect(persisted.links).toEqual([{ targetId: "DS-001", kind: "relates-to" }]);
+  });
+
+  test("drops self-link entries (cannot link to a not-yet-existing self id)", async () => {
+    const store = await makeStore([]);
+    // The MCP allocates the next id (DS-001) for this ticket; an agent that
+    // smuggles a self-reference should see it dropped.
+    const res = await runCreateTicket(store, {
+      title: "Tries to self-link",
+      links: [{ targetId: "DS-001", kind: "blocks" }],
+    });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { id: string };
+    const persisted = store.get(body.id)!;
+    expect(persisted.links).toEqual([]);
+  });
+
+  test("rejects unknown link kinds at the zod boundary", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001" })]);
+    const res = await runCreateTicket(store, {
+      title: "Bad kind",
+      // Deliberately invalid kind, cast through unknown to exercise the
+      // runtime zod boundary (the strict schema must reject it).
+      links: [{ targetId: "DS-001", kind: "duplicates" }] as unknown as CreateTicketInput["links"],
+    });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/invalid/i);
   });
 });
 
@@ -1892,6 +1960,58 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     };
     expect(Array.isArray(payload.ticket.attachments)).toBe(true);
     expect(payload.ticket.attachments).toHaveLength(0);
+  });
+
+  test("publicView includes outbound links + derived inboundLinks with inverted kinds", async () => {
+    // A -- blocks --> B   surfaces on B as { sourceId: A, kind: "blocked-by" }.
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        title: "blocker",
+        status: "Planned",
+        links: [{ targetId: "DS-002", kind: "blocks" }],
+      }),
+      makeIssue({ id: "DS-002", number: 2, title: "blocked", status: "Planned" }),
+    ]);
+    ({ server, port } = await bootServer(store));
+
+    const a = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets/DS-001" });
+    const aBody = JSON.parse(
+      (a.result as { contents: Array<{ text: string }> }).contents[0].text,
+    ) as { ticket: { links: unknown; inboundLinks: unknown } };
+    expect(aBody.ticket.links).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+    expect(aBody.ticket.inboundLinks).toEqual([]);
+
+    const b = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets/DS-002" });
+    const bBody = JSON.parse(
+      (b.result as { contents: Array<{ text: string }> }).contents[0].text,
+    ) as { ticket: { links: unknown; inboundLinks: unknown } };
+    expect(bBody.ticket.links).toEqual([]);
+    expect(bBody.ticket.inboundLinks).toEqual([
+      { sourceId: "DS-001", sourceTitle: "blocker", kind: "blocked-by" },
+    ]);
+  });
+
+  test("publicView relates-to inverts to itself (symmetric)", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        title: "A",
+        status: "Planned",
+        links: [{ targetId: "DS-002", kind: "relates-to" }],
+      }),
+      makeIssue({ id: "DS-002", number: 2, title: "B", status: "Planned" }),
+    ]);
+    ({ server, port } = await bootServer(store));
+
+    const b = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets/DS-002" });
+    const bBody = JSON.parse(
+      (b.result as { contents: Array<{ text: string }> }).contents[0].text,
+    ) as { ticket: { inboundLinks: Array<{ kind: string }> } };
+    expect(bBody.ticket.inboundLinks).toHaveLength(1);
+    expect(bBody.ticket.inboundLinks[0].kind).toBe("relates-to");
   });
 
   test("attachment resource returns BlobResourceContents with the bytes", async () => {

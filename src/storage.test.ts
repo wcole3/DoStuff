@@ -83,6 +83,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
+    links: overrides.links ?? [],
   };
 }
 
@@ -1035,5 +1036,126 @@ describe("IssueStore attachments", () => {
     await b.init();
     expect(b.get("DS-100")?.attachments).toEqual(issue.attachments);
     b.dispose();
+  });
+});
+
+describe("IssueStore links (SQLite-backed)", () => {
+  let handles: FsHandles | null = null;
+
+  afterEach(() => {
+    if (handles) {
+      restoreFs(handles);
+      handles = null;
+    }
+  });
+
+  test("round-trips a ticket with multiple links across kinds", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(makeIssue({ id: "DS-001", title: "parent" }));
+    await a.upsert(makeIssue({ id: "DS-002", title: "child" }));
+    await a.upsert(makeIssue({ id: "DS-003", title: "blocker" }));
+    const source = makeIssue({
+      id: "DS-004",
+      title: "with links",
+      links: [
+        { targetId: "DS-001", kind: "child-of" },
+        { targetId: "DS-002", kind: "relates-to" },
+        { targetId: "DS-003", kind: "blocks" },
+      ],
+    });
+    await a.upsert(source);
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    const loaded = b.get("DS-004");
+    expect(loaded?.links).toEqual(source.links);
+    b.dispose();
+  });
+
+  test("deleting the source ticket cascades-removes its outbound link rows", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const ctx = makeContext();
+    const store = makeSqlStore(ctx);
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001" }));
+    await store.upsert(
+      makeIssue({
+        id: "DS-002",
+        links: [{ targetId: "DS-001", kind: "blocks" }],
+      }),
+    );
+    await store.remove("DS-002");
+    // Verify by reopening: DS-001 still present, DS-002 gone, no dangling rows
+    // (next upsert of DS-002 must not re-surface a phantom link).
+    store.dispose();
+    const reopened = makeSqlStore(ctx);
+    await reopened.init();
+    expect(reopened.get("DS-002")).toBeUndefined();
+    // A fresh DS-002 with no links should be exactly that.
+    await reopened.upsert(makeIssue({ id: "DS-002", links: [] }));
+    expect(reopened.get("DS-002")?.links).toEqual([]);
+    reopened.dispose();
+  });
+
+  test("deleting the TARGET ticket cascades-removes inbound link rows", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const ctx = makeContext();
+    const store = makeSqlStore(ctx);
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001", title: "target" }));
+    await store.upsert(
+      makeIssue({
+        id: "DS-002",
+        title: "source",
+        links: [{ targetId: "DS-001", kind: "blocks" }],
+      }),
+    );
+
+    await store.remove("DS-001");
+    // DS-002 must no longer carry a link to the deleted DS-001.
+    expect(store.get("DS-002")?.links).toEqual([]);
+
+    // Confirmed across a reopen as well — exercises the hydrator path.
+    store.dispose();
+    const reopened = makeSqlStore(ctx);
+    await reopened.init();
+    expect(reopened.get("DS-002")?.links).toEqual([]);
+    reopened.dispose();
+  });
+
+  test("legacy JSON without links field migrates to an empty array", async () => {
+    const legacy = {
+      id: "DS-001",
+      number: 1,
+      title: "old",
+      type: "Feature",
+      priority: "Regular",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      tasks: [],
+      tags: [],
+      createdAt: "2025-01-01T00:00:00.000Z",
+      resolvedAt: null,
+      statusHistory: [{ status: "Planned", at: "2025-01-01T00:00:00.000Z", by: "user" }],
+      record: [],
+      attachments: [],
+      // NO links field — simulating older tickets.
+    };
+    const { handles: h } = installVirtualFs({
+      "/ws/.vscode/dostuff/DS-001.json": JSON.stringify(legacy),
+    });
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+    expect(store.get("DS-001")?.links).toEqual([]);
+    store.dispose();
   });
 });

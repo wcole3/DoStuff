@@ -26,6 +26,9 @@ import {
   useIssues,
 } from "./messaging";
 import { TagEditor } from "./Tags";
+import { LinkEditor } from "./LinkEditor";
+import { InboundLinkChip } from "./Links";
+import { deriveInbound } from "./linkModel";
 
 // Match http(s)/file/mailto URLs and workspace-relative paths starting with
 // ./ or ../ (must include a non-whitespace tail). Captured group is the URL
@@ -140,6 +143,8 @@ export function IssueDetail({ issue }: IssueDetailProps) {
     }
     return out.sort((a, b) => a.localeCompare(b));
   }, [issues]);
+  const issuesById = useMemo(() => new Map(issues.map((i) => [i.id, i] as const)), [issues]);
+  const inboundLinks = useMemo(() => deriveInbound(issue.id, issues), [issue.id, issues]);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingDesc, setEditingDesc] = useState(false);
   const [editingVerify, setEditingVerify] = useState(false);
@@ -182,6 +187,7 @@ export function IssueDetail({ issue }: IssueDetailProps) {
   const setPriority = (p: Priority) => postUpdateIssue({ ...issue, priority: p });
   const setType = (t: IssueType) => postUpdateIssue({ ...issue, type: t });
   const setTags = (tags: string[]) => postUpdateIssue({ ...issue, tags });
+  const setLinks = (links: typeof issue.links) => postUpdateIssue({ ...issue, links });
 
   const toggleTask = (taskId: string) => {
     postUpdateIssue({
@@ -310,6 +316,28 @@ export function IssueDetail({ issue }: IssueDetailProps) {
         <div className="ds-d-section-h">Tags</div>
         <TagEditor key={issue.id} tags={issue.tags} onChange={setTags} suggestions={tagSuggestions} />
       </div>
+
+      <div>
+        <div className="ds-d-section-h">Links</div>
+        <LinkEditor
+          key={issue.id}
+          value={issue.links}
+          onChange={setLinks}
+          allIssues={issues}
+          currentIssueId={issue.id}
+        />
+      </div>
+
+      {inboundLinks.length > 0 && (
+        <div>
+          <div className="ds-d-section-h">Linked by</div>
+          <div className="ds-link-chip-row">
+            {inboundLinks.map((l) => (
+              <InboundLinkChip key={`${l.sourceId}|${l.kind}`} link={l} source={issuesById.get(l.sourceId)} />
+            ))}
+          </div>
+        </div>
+      )}
 
       <AttachmentsSection
         issue={issue}

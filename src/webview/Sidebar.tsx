@@ -195,6 +195,18 @@ export function Sidebar() {
     return () => window.removeEventListener("dostuff:showNewIssue", handler);
   }, []);
 
+  // Open a ticket's detail when the host broadcasts revealTicket (e.g. a graph
+  // node click or a link-chip click). expandedIssue is derived from the full
+  // issue list, so this surfaces the detail even if the ticket is filtered out.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const id = (e as CustomEvent<{ id: string }>).detail?.id;
+      if (typeof id === "string") setExpandedId(id);
+    };
+    window.addEventListener("dostuff:revealTicket", handler);
+    return () => window.removeEventListener("dostuff:revealTicket", handler);
+  }, []);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     const matched = issues

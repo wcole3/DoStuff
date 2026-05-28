@@ -33,10 +33,14 @@ Workflow contract:
   7. As you make progress, call \`update_ticket_progress\` to tick tasks off and
      append a short note to the ticket's record. Be terse and factual.
   8. If you discover follow-up work, call \`create_ticket\` to file it. New
-     tickets land in "Thinking" for the human to triage.
+     tickets land in "Thinking" for the human to triage. Optionally supply
+     \`links: [{ targetId, kind }]\` to record first-class relationships at
+     creation time (kinds: blocks, child-of, relates-to). Links cannot be
+     mutated by the MCP server afterwards -- set them at create time, or
+     leave a record entry and ask the human to update.
 
-You may NOT modify a ticket's title, description, priority, type, or verify
-criteria via the MCP server. If something is wrong with those, file a new
+You may NOT modify a ticket's title, description, priority, type, verify
+criteria, or links via the MCP server. If something is wrong with those, file a new
 ticket instead.`;
 }
 

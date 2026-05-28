@@ -3,7 +3,8 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import { coerceTags, isPriority, isType, type Issue, type Settings, type WebviewToHost } from "./types";
+import { coerceLinks, coerceTags, isPriority, isType, type Issue, type Settings, type WebviewToHost } from "./types";
+import { validateLinks } from "./extension";
 
 /**
  * Host-supplied handler for "updateIssue" messages. Owns the statusHistory
@@ -148,6 +149,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     this.view?.webview.postMessage({ type: "showNewIssue" });
   }
 
+  /** Surface a ticket's IssueDetail in the sidebar (reveals the view first). */
+  revealTicket(id: string): void {
+    this.view?.show?.(true);
+    this.view?.webview.postMessage({ type: "revealTicket", id });
+  }
+
   /** Publish a fresh issue list to the webview. */
   broadcast(issues: Issue[] = this.store.list()) {
     this.view?.webview.postMessage({ type: "issues", issues });
@@ -181,8 +188,24 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         // New tickets always land in Thinking — humans are the only ones
         // allowed to promote Thinking → Planned (see extension.ts).
         const status: Issue["status"] = "Thinking";
+        const newId = `DS-${String(number).padStart(3, "0")}`;
+        // Inline links from the new-issue modal. Coerce shape, then drop any
+        // unknown-id targets + self-links against the live store. This must
+        // run BEFORE upsert so the issue lands with its final link list.
+        const inlineLinksRaw = (partial as { links?: unknown }).links;
+        const knownIds = new Set(this.store.list().map((i) => i.id));
+        const { kept: validatedLinks, dropped: droppedLinks } = validateLinks(
+          coerceLinks(inlineLinksRaw, newId),
+          newId,
+          knownIds,
+        );
+        if (droppedLinks.length) {
+          this.output.appendLine(
+            `Dropped ${droppedLinks.length} inline link(s) on ${newId} (unknown targets).`,
+          );
+        }
         const issue: Issue = {
-          id: `DS-${String(number).padStart(3, "0")}`,
+          id: newId,
           number,
           title: partial.title,
           type: partial.type,
@@ -193,6 +216,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
           tasks: Array.isArray(partial.tasks) ? partial.tasks : [],
           tags: coerceTags((partial as { tags?: unknown }).tags),
           attachments: [],
+          links: validatedLinks,
           createdAt: now,
           resolvedAt: null,
           statusHistory: [{ status, at: now, by: "user" }],
@@ -379,6 +403,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         }
         break;
       }
+      case "revealTicket": {
+        const id = (msg as { id?: unknown }).id;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected revealTicket: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        // Single broadcaster: the command re-posts `revealTicket` to every
+        // open webview (sidebar + board), so no double-handling here.
+        vscode.commands.executeCommand("dostuff.revealTicket", id);
+        break;
+      }
+      case "openGraph":
+        vscode.commands.executeCommand("dostuff.openGraph");
+        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;

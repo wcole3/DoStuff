@@ -27,7 +27,7 @@ Keeps an audit log of changes to a ticket — in case you still have the willpow
 
 The sidebar lists every issue, newest first. The search box matches title, id, description, and tags; the status chips filter by lane. **Complete tickets are hidden by default** — toggle "Show completed" to reveal them.
 
-Click any row to expand an inline detail panel for editing title, description, type, priority, status, tags, tasks, verify criteria, and attachments. Edits autosave as you type (toggleable in settings).
+Click any row to expand an inline detail panel for editing title, description, type, priority, status, tags, links, tasks, verify criteria, and attachments. Edits autosave as you type (toggleable in settings).
 
 ### Board
 
@@ -43,6 +43,14 @@ Drag a card between lanes to change its status. Each active lane (Planned, Worki
 You can also start a drag in the **sidebar**. The board lights each lane and drawer with a "Move to *lane*" overlay; click any lane to drop, or press **Esc** to cancel. If the board isn't open, dragging from the sidebar opens it.
 
 **Thinking drawer**: click a card to view its details. **Shift+Click** promotes the draft straight to Planned.
+
+### Ticket links
+
+Relate tickets to each other from the detail panel's **Links** field. Pick a kind — **blocks**, **child of**, or **relates to** — then search the target by `#number`, `DS-id`, or a title substring. The link shows as a chip; click it to jump to that ticket. The target ticket shows the inverse relationship under **Linked by** (e.g. an outbound *blocks* surfaces as *blocked by* on the other side). Links are directional and stored once on the source — deleting the link, or the ticket, cleans up both ends. The new-issue dialog can stage links before the ticket is even created.
+
+### Graph view
+
+Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear. Edges are colored and arrowed by kind. **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket. *Reset view* re-centers.
 
 ### Attachments
 
@@ -175,11 +183,15 @@ Workflow contract:
   7. As you make progress, call `update_ticket_progress` to tick tasks off and
      append a short note to the ticket's record. Be terse and factual.
   8. If you discover follow-up work, call `create_ticket` to file it. New
-     tickets land in "Thinking" for the human to triage.
+     tickets land in "Thinking" for the human to triage. Optionally supply
+     `links: [{ targetId, kind }]` to record first-class relationships at
+     creation time (kinds: blocks, child-of, relates-to). Links cannot be
+     mutated by the MCP server afterwards -- set them at create time, or
+     leave a record entry and ask the human to update.
 
-You may NOT modify a ticket's title, description, priority, type, or verify
-criteria via the MCP server. If something is wrong with those, file a new
-ticket instead.
+You may NOT modify a ticket's title, description, priority, type, verify
+criteria, or links via the MCP server after creation. If something is wrong
+with those, file a new ticket instead.
 ```
 
 Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `dostuff.mcp.instructions` in Settings. Leave the setting blank to use the built-in text above.
@@ -188,11 +200,11 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
-| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped. |
+| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped; outbound `links` and derived `inboundLinks` are included. |
 | `list_issues` | optional `type`, `priority`, `status` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Includes the workflow prompt and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. |
-| `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. |
+| `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
 | `update_ticket_status` | `id`, `status` (one of Planned / Working / Verification), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete and Closed. |
-| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, or verifyCriteria. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
+| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, verifyCriteria, or links. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 
 ### Resources
 

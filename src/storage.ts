@@ -20,6 +20,7 @@ import initSqlJs, {
 } from "sql.js";
 import {
   coerceAttachments,
+  coerceLinks,
   coerceTags,
   isPriority,
   isStatus,
@@ -114,6 +115,15 @@ CREATE TABLE IF NOT EXISTS issue_record (
   PRIMARY KEY (issue_id, position)
 );
 
+CREATE TABLE IF NOT EXISTS issue_links (
+  source_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  target_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  kind      TEXT NOT NULL,
+  position  INTEGER NOT NULL,
+  PRIMARY KEY (source_id, target_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_links_target ON issue_links(target_id);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -160,6 +170,7 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       tasks: Array.isArray(issue.tasks) ? issue.tasks : [],
       tags: coerceTags((issue as any).tags),
       attachments: coerceAttachments((issue as any).attachments),
+      links: coerceLinks((issue as any).links, (issue as any).id),
       resolvedAt: issue.resolvedAt ?? null,
     },
     coerced,
@@ -260,9 +271,24 @@ export class IssueStore {
   }
 
   async remove(id: string): Promise<void> {
-    this.cache = this.cache.filter((i) => i.id !== id);
+    this.cache = this.cache
+      .filter((i) => i.id !== id)
+      // Inbound link cleanup: the DB cascades `issue_links` rows where this
+      // id was the target, but the in-memory cache still carries the old
+      // `links` arrays. Scrub them in sync so reads after `remove()` don't
+      // see ghost links.
+      .map((i) =>
+        i.links.some((l) => l.targetId === id)
+          ? { ...i, links: i.links.filter((l) => l.targetId !== id) }
+          : i,
+      );
     if (this.db) {
       this.runInTransaction(() => {
+        // Explicit inbound-link cleanup. sql.js's PRAGMA foreign_keys =
+        // CASCADE setting has been historically unreliable across exports;
+        // doing the DELETE ourselves guarantees no dangling rows survive
+        // a round-trip through `exportDb`.
+        this.db!.run("DELETE FROM issue_links WHERE target_id = ? OR source_id = ?", [id, id]);
         this.db!.run("DELETE FROM issues WHERE id = ?", [id]);
       });
       await this.exportDb();
@@ -681,6 +707,15 @@ export class IssueStore {
       }>(db, "SELECT * FROM issue_record ORDER BY issue_id, position"),
       (r) => r.issue_id,
     );
+    const linksBySource = groupBy(
+      selectAll<{
+        source_id: string;
+        target_id: string;
+        kind: string;
+        position: number;
+      }>(db, "SELECT * FROM issue_links ORDER BY source_id, position"),
+      (r) => r.source_id,
+    );
 
     return issueRows.map((row) => {
       const tasks: Task[] = (tasksByIssue.get(row.id) ?? []).map((t) => ({
@@ -709,6 +744,10 @@ export class IssueStore {
         ...(r.source !== null ? { source: r.source } : {}),
         text: r.text,
       }));
+      const links = coerceLinks(
+        (linksBySource.get(row.id) ?? []).map((l) => ({ targetId: l.target_id, kind: l.kind })),
+        row.id,
+      );
 
       return {
         id: row.id,
@@ -726,6 +765,7 @@ export class IssueStore {
         attachments,
         statusHistory,
         record,
+        links,
       };
     });
   }
@@ -795,6 +835,18 @@ export class IssueStore {
       db.run(
         "INSERT INTO issue_record (issue_id, position, at, author, source, text) VALUES (?, ?, ?, ?, ?, ?)",
         [issue.id, i, r.at, r.author, r.source ?? null, r.text],
+      );
+    });
+
+    db.run("DELETE FROM issue_links WHERE source_id = ?", [issue.id]);
+    (issue.links ?? []).forEach((l, i) => {
+      // Foreign-key constraints on target_id will reject unknown targets at
+      // INSERT time. We expect callers to have already filtered via
+      // validateLinks; INSERT OR IGNORE keeps a stray bad entry from rolling
+      // back the entire transaction.
+      db.run(
+        "INSERT OR IGNORE INTO issue_links (source_id, target_id, kind, position) VALUES (?, ?, ?, ?)",
+        [issue.id, l.targetId, l.kind, i],
       );
     });
   }

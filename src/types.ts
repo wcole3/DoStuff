@@ -72,6 +72,64 @@ export interface Attachment {
 /** Hard cap on a single attachment, enforced at the host upload edge and at MCP read. */
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
 
+/**
+ * Stored relationship kinds from a source ticket to a target ticket. Only these
+ * three "outbound" kinds persist; the matching inbound labels are derived for
+ * display via `INVERSE_LINK_KIND` (see below). `relates-to` is symmetric and
+ * maps to itself.
+ */
+export const LINK_KINDS = ["blocks", "child-of", "relates-to"] as const;
+export type LinkKind = (typeof LINK_KINDS)[number];
+
+export type InverseLinkLabel = "blocked-by" | "parent-of" | "relates-to";
+
+/** Labels rendered on derived inbound chips ("Linked by"). */
+export const INVERSE_LINK_KIND: Record<LinkKind, InverseLinkLabel> = {
+  "blocks": "blocked-by",
+  "child-of": "parent-of",
+  "relates-to": "relates-to",
+};
+
+export function isLinkKind(v: unknown): v is LinkKind {
+  return typeof v === "string" && (LINK_KINDS as readonly string[]).includes(v);
+}
+
+export interface TicketLink {
+  /** Always a `DS-NNN`-style id of an existing ticket. Unknown ids are dropped
+   *  at the host edge (in `mergeIssueUpdate` and MCP `create_ticket`). */
+  targetId: string;
+  kind: LinkKind;
+}
+
+const DS_ID_RE = /^DS-\d+$/;
+
+/**
+ * Validate + dedupe a raw `links` value into a clean `TicketLink[]`. Mirrors
+ * `coerceTags` / `coerceAttachments`: forgiving (returns `[]` on bad shapes),
+ * dedupes by `(targetId, kind)` pair, drops self-links.
+ *
+ * Unknown-target validation is NOT done here (no store access). That belongs
+ * to host-side `validateLinks` in `extension.ts` so we keep this module pure.
+ */
+export function coerceLinks(input: unknown, currentIssueId?: string): TicketLink[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const out: TicketLink[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const rawTarget = typeof r.targetId === "string" ? r.targetId.toUpperCase() : "";
+    if (!DS_ID_RE.test(rawTarget)) continue;
+    if (currentIssueId && rawTarget === currentIssueId) continue;
+    if (!isLinkKind(r.kind)) continue;
+    const key = `${rawTarget}|${r.kind}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ targetId: rawTarget, kind: r.kind });
+  }
+  return out;
+}
+
 export interface Issue {
   id: string;
   /** Short, human-readable, monotonically-increasing reference number.
@@ -98,6 +156,10 @@ export interface Issue {
   /** Files & images attached to this issue. The bytes are stored on disk
    *  alongside the ticket JSON; this list carries only metadata. */
   attachments: Attachment[];
+  /** Outbound relationships to other tickets. Single-source: B's "linked by"
+   *  view is derived by scanning all issues and inverting the kind via
+   *  `INVERSE_LINK_KIND`. There is no dual-write. */
+  links: TicketLink[];
 }
 
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
@@ -126,19 +188,28 @@ export type HostToWebview =
   // list; nothing has been written to disk yet — the actual write happens
   // after the modal submits and the host expands these into appendAttachment
   // calls against the freshly-created ticket.
-  | { type: "attachmentStaged"; name: string; mimeType: string; bytes: number[] };
+  | { type: "attachmentStaged"; name: string; mimeType: string; bytes: number[] }
+  // Broadcast from the host telling open webviews to surface a particular
+  // ticket's IssueDetail. Originates from a graph node click; the host
+  // routes it back to sidebar (open the detail overlay) and board (scroll
+  // to the lane + open the detail).
+  | { type: "revealTicket"; id: string };
 
 export type WebviewToHost =
   | { type: "ready" }
   | {
       type: "createIssue";
-      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments"> & {
+      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links"> & {
         tasks?: Task[];
         // Inline attachments staged in the new-issue modal. The host loops
         // these through the regular appendAttachment chokepoint after upserting
         // the new ticket, so the size cap and workspace precondition still
         // apply uniformly.
         attachments?: Array<{ name: string; mimeType: string; bytes: number[] }>;
+        // Inline links staged in the new-issue modal. Host validates against
+        // the store (dropping unknown targetIds and self-links) before
+        // persisting alongside the freshly-created ticket.
+        links?: TicketLink[];
       };
     }
   | { type: "updateIssue"; issue: Issue }
@@ -171,7 +242,14 @@ export type WebviewToHost =
   | { type: "pickAttachmentForStaging" }
   // New-issue modal staging fallback for Remote-WSL URI drops. Host reads the
   // URI and replies with `attachmentStaged`.
-  | { type: "stageAttachmentByUri"; uri: string };
+  | { type: "stageAttachmentByUri"; uri: string }
+  // Webview-initiated request to surface a ticket's IssueDetail across all
+  // open webviews. Originates from a graph node click; host re-broadcasts as
+  // a `revealTicket` HostToWebview message.
+  | { type: "revealTicket"; id: string }
+  // Sidebar/board toolbar button — routes through the registered
+  // `dostuff.openGraph` command on the host.
+  | { type: "openGraph" };
 
 export interface Settings {
   storagePath: string;

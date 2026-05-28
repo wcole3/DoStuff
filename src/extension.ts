@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
+import { GraphPanel } from "./graphProvider";
 import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
 import {
@@ -13,6 +14,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
   coerceAttachments,
+  coerceLinks,
   coerceTags,
   isPriority,
   isStatus,
@@ -21,6 +23,7 @@ import {
   type Issue,
   type Status,
   type StatusEvent,
+  type TicketLink,
 } from "./types";
 
 
@@ -66,11 +69,42 @@ export function inferMimeType(filename: string): string {
  * already-done ticket), `resolvedAt` is cleared. This is intentional — humans
  * can correct mistakes; the MCP layer enforces a stricter contract for agents.
  */
+/**
+ * Drop links whose `targetId` isn't in `knownIds` (issues that don't exist) or
+ * that equal `currentIssueId` (self-link). The caller is responsible for
+ * coercing the array shape via `coerceLinks` first; this step is the
+ * cross-issue validity check that needs store access.
+ *
+ * Returns `{ kept, dropped }` so the caller can decide whether to log; both
+ * arrays preserve the original order.
+ */
+export function validateLinks(
+  links: TicketLink[],
+  currentIssueId: string,
+  knownIds: ReadonlySet<string>,
+): { kept: TicketLink[]; dropped: TicketLink[] } {
+  const kept: TicketLink[] = [];
+  const dropped: TicketLink[] = [];
+  for (const l of links) {
+    if (l.targetId === currentIssueId) {
+      dropped.push(l);
+      continue;
+    }
+    if (!knownIds.has(l.targetId)) {
+      dropped.push(l);
+      continue;
+    }
+    kept.push(l);
+  }
+  return { kept, dropped };
+}
+
 export function mergeIssueUpdate(
   prior: Issue,
   incoming: Partial<Issue>,
   by: UpdateBy,
   now: () => string = () => new Date().toISOString(),
+  knownIds?: ReadonlySet<string>,
 ): { next: Issue } | { error: string } {
   if (incoming.status !== undefined && !isStatus(incoming.status)) {
     return { error: `Invalid status: ${JSON.stringify(incoming.status)}` };
@@ -104,6 +138,20 @@ export function mergeIssueUpdate(
     attachments = next;
   }
 
+  // Links: coerce shape first, then drop unknown-id targets + self-links if a
+  // knownIds set was supplied. When no knownIds is passed (e.g. unit tests),
+  // we skip the cross-issue validation and trust coerceLinks' format check.
+  let links = prior.links;
+  if (Array.isArray(incoming.links)) {
+    const coerced = coerceLinks(incoming.links, prior.id);
+    if (knownIds) {
+      const { kept } = validateLinks(coerced, prior.id, knownIds);
+      links = kept;
+    } else {
+      links = coerced;
+    }
+  }
+
   const next: Issue = {
     ...prior,
     title:          typeof incoming.title === "string" ? incoming.title : prior.title,
@@ -112,6 +160,7 @@ export function mergeIssueUpdate(
     tasks:          Array.isArray(incoming.tasks) ? incoming.tasks : prior.tasks,
     tags:           Array.isArray(incoming.tags) ? coerceTags(incoming.tags) : prior.tags,
     attachments,
+    links,
     type:           incoming.type ?? prior.type,
     priority:       incoming.priority ?? prior.priority,
     status:         incoming.status ?? prior.status,
@@ -168,6 +217,9 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       tasks: Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [],
       tags: coerceTags(e.tags),
       attachments: coerceAttachments(e.attachments),
+      // Cross-issue validation happens in the caller (after the full set is
+      // assembled) so we can drop links whose targets aren't in the import.
+      links: coerceLinks(e.links, e.id),
       createdAt: e.createdAt,
       resolvedAt: typeof e.resolvedAt === "string" ? e.resolvedAt : null,
       statusHistory: Array.isArray(e.statusHistory)
@@ -176,6 +228,14 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
     };
     valid.push(issue);
+  }
+  // Drop links to ids that didn't make it into the import set; we don't want
+  // dangling references after replaceAll.
+  const knownIds = new Set(valid.map((i) => i.id));
+  for (const issue of valid) {
+    if (issue.links.length === 0) continue;
+    const { kept } = validateLinks(issue.links, issue.id, knownIds);
+    issue.links = kept;
   }
   return { valid, skipped };
 }
@@ -223,11 +283,16 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
-    const merged = mergeIssueUpdate(prior, incoming, "user");
+    // Pass knownIds so link targets that don't exist (or self-links) get
+    // dropped at the merge chokepoint. The UI picker only offers real tickets,
+    // but this guards the import/round-trip + any future programmatic caller.
+    const knownIds = new Set(store.list().map((i) => i.id));
+    const merged = mergeIssueUpdate(prior, incoming, "user", undefined, knownIds);
     if ("error" in merged) {
       vscode.window.showWarningMessage(`DoStuff: ${merged.error}`);
       sidebar.broadcast();
       BoardPanel.broadcast(store.list());
+      GraphPanel.broadcast(store.list());
       return;
     }
     const next = merged.next;
@@ -239,6 +304,7 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage(`DoStuff: ${check}`);
         sidebar.broadcast();
         BoardPanel.broadcast(store.list());
+        GraphPanel.broadcast(store.list());
         return;
       }
     }
@@ -561,6 +627,19 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand("dostuff.openBoard", () => {
       BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
+    }),
+
+    vscode.commands.registerCommand("dostuff.openGraph", () => {
+      GraphPanel.showOrCreate(context.extensionUri, store, openLink);
+    }),
+
+    // Single broadcaster for "surface this ticket's detail". Invoked by a
+    // link-chip click (sidebar/board IssueDetail) or a graph node click; fans
+    // the request out to every open webview so whichever is focused responds.
+    vscode.commands.registerCommand("dostuff.revealTicket", (id: unknown) => {
+      if (typeof id !== "string" || !/^DS-\d+$/.test(id)) return;
+      sidebar.revealTicket(id);
+      BoardPanel.revealTicket(id);
     }),
 
     vscode.commands.registerCommand("dostuff.newIssue", () => {

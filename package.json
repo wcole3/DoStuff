@@ -27,6 +27,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@types/vscode": "^1.120.0",
+    "d3-force": "^3.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-window": "^1.8.11",
@@ -39,6 +40,7 @@
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
     "@types/bun": "^1.3.14",
+    "@types/d3-force": "^3.0.10",
     "@types/node": "^20.19.41",
     "@types/react": "^18.3.28",
     "@types/react-dom": "^18.3.7",
@@ -53,6 +55,7 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:dostuff.openBoard",
+    "onCommand:dostuff.openGraph",
     "onCommand:dostuff.newIssue",
     "onView:dostuff.sidebar"
   ],
@@ -83,6 +86,12 @@
         "title": "Show Board",
         "category": "DoStuff",
         "icon": "$(layout)"
+      },
+      {
+        "command": "dostuff.openGraph",
+        "title": "Show Graph",
+        "category": "DoStuff",
+        "icon": "$(type-hierarchy)"
       },
       {
         "command": "dostuff.newIssue",
@@ -141,6 +150,9 @@
           "command": "dostuff.openBoard"
         },
         {
+          "command": "dostuff.openGraph"
+        },
+        {
           "command": "dostuff.newIssue"
         },
         {
@@ -175,6 +187,11 @@
           "command": "dostuff.openBoard",
           "when": "view == dostuff.sidebar",
           "group": "navigation@2"
+        },
+        {
+          "command": "dostuff.openGraph",
+          "when": "view == dostuff.sidebar",
+          "group": "navigation@3"
         },
         {
           "command": "dostuff.importJson",

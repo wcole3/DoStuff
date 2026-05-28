@@ -89,6 +89,12 @@ export class BoardPanel {
     BoardPanel.current?.panel.webview.postMessage({ type: "externalDragStart", issueId });
   }
 
+  /** Ask the open board (if any) to surface a ticket's detail. No-op when the
+   *  board isn't open — the sidebar still handles its own reveal. */
+  static revealTicket(id: string): void {
+    BoardPanel.current?.panel.webview.postMessage({ type: "revealTicket", id });
+  }
+
   private constructor(
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
@@ -252,6 +258,18 @@ export class BoardPanel {
         await this.attachments.onOpen(m.issueId, m.attachmentId);
         break;
       }
+      case "revealTicket": {
+        const id = (msg as { id?: unknown }).id;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected revealTicket: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        vscode.commands.executeCommand("dostuff.revealTicket", id);
+        break;
+      }
+      case "openGraph":
+        vscode.commands.executeCommand("dostuff.openGraph");
+        break;
       // The board view ignores message types only the sidebar handles
       // (e.g. "createIssue", "openBoard", "openSettings"). Log + drop.
       default: {

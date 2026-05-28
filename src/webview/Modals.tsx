@@ -7,7 +7,9 @@ import {
   type IssueType,
   type Priority,
   type Task,
+  type TicketLink,
 } from "../types";
+import { LinkEditor } from "./LinkEditor";
 import { Icon } from "./Icons";
 import {
   newTaskId,
@@ -83,6 +85,7 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
   const [verifyCriteria, setVerifyCriteria] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [tags, setTags] = useState<string[]>([]);
+  const [links, setLinks] = useState<TicketLink[]>([]);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [attDragOver, setAttDragOver] = useState(false);
   const newTaskInputRef = useRef<HTMLInputElement>(null);
@@ -195,6 +198,7 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
       status: "Thinking",
       tasks: tasks.filter((t) => t.text.trim()).map((t) => ({ ...t, text: t.text.trim() })),
       tags,
+      links: links.length ? links : undefined,
       attachments: pendingAttachments.length
         ? pendingAttachments.map((a) => ({
             name: a.name,
@@ -275,6 +279,10 @@ export function AddIssueModal({ onClose }: AddIssueModalProps) {
         <div className="ds-form-row">
           <span>Tags</span>
           <TagEditor tags={tags} onChange={setTags} suggestions={tagSuggestions} />
+        </div>
+        <div className="ds-form-row">
+          <span>Links</span>
+          <LinkEditor value={links} onChange={setLinks} allIssues={issues} />
         </div>
         <label className="ds-form-row">
           <span>Description</span>

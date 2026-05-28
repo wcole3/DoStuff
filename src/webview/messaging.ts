@@ -9,7 +9,7 @@ interface VsCodeApi {
 
 declare global {
   interface Window {
-    __DOSTUFF_MODE__?: "sidebar" | "board";
+    __DOSTUFF_MODE__?: "sidebar" | "board" | "graph";
     __VSCODE_API__?: VsCodeApi;
     acquireVsCodeApi?: () => VsCodeApi;
   }
@@ -121,6 +121,14 @@ export function startMessageBridge(): void {
           }),
         );
         break;
+      case "revealTicket":
+        // Routed through a window event for the same reason as attachmentStaged:
+        // the consumers (Sidebar IssueDetail overlay, Board) own the UX of
+        // surfacing the ticket, but the message bridge has no React refs.
+        window.dispatchEvent(
+          new CustomEvent("dostuff:revealTicket", { detail: { id: msg.id } }),
+        );
+        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;
@@ -164,6 +172,14 @@ export function postCreateIssue(
 
 export function postPickAttachmentForStaging(): void {
   vscodeApi.postMessage({ type: "pickAttachmentForStaging" });
+}
+
+export function postRevealTicket(id: string): void {
+  vscodeApi.postMessage({ type: "revealTicket", id });
+}
+
+export function postOpenGraph(): void {
+  vscodeApi.postMessage({ type: "openGraph" });
 }
 
 export function postStageAttachmentByUri(uri: string): void {

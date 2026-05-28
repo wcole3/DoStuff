@@ -1,7 +1,14 @@
 // Tests for pure helpers in src/types.ts.
 
 import { describe, expect, test } from "bun:test";
-import { coerceAttachments, type Attachment } from "./types";
+import {
+  INVERSE_LINK_KIND,
+  LINK_KINDS,
+  coerceAttachments,
+  coerceLinks,
+  isLinkKind,
+  type Attachment,
+} from "./types";
 
 function valid(overrides: Partial<Attachment> = {}): Attachment {
   return {
@@ -72,5 +79,136 @@ describe("coerceAttachments", () => {
   test("ignores nulls and primitives mixed in", () => {
     const out = coerceAttachments([valid(), null, "string", 42, true]);
     expect(out).toHaveLength(1);
+  });
+});
+
+describe("coerceLinks", () => {
+  test("returns [] for non-array input", () => {
+    expect(coerceLinks(undefined)).toEqual([]);
+    expect(coerceLinks(null)).toEqual([]);
+    expect(coerceLinks("nope")).toEqual([]);
+    expect(coerceLinks(42)).toEqual([]);
+    expect(coerceLinks({ targetId: "DS-001", kind: "blocks" })).toEqual([]);
+  });
+
+  test("happy path: well-formed entries pass through verbatim", () => {
+    expect(
+      coerceLinks([
+        { targetId: "DS-001", kind: "blocks" },
+        { targetId: "DS-042", kind: "relates-to" },
+      ]),
+    ).toEqual([
+      { targetId: "DS-001", kind: "blocks" },
+      { targetId: "DS-042", kind: "relates-to" },
+    ]);
+  });
+
+  test("uppercases lower-cased target ids so equality is stable", () => {
+    expect(coerceLinks([{ targetId: "ds-007", kind: "blocks" }])).toEqual([
+      { targetId: "DS-007", kind: "blocks" },
+    ]);
+  });
+
+  test("drops entries with malformed target ids", () => {
+    expect(
+      coerceLinks([
+        { targetId: "not-a-ticket", kind: "blocks" },
+        { targetId: "", kind: "blocks" },
+        { targetId: "DS-", kind: "blocks" },
+        { targetId: "DS-001", kind: "blocks" },
+      ]),
+    ).toEqual([{ targetId: "DS-001", kind: "blocks" }]);
+  });
+
+  test("drops entries with unknown kinds", () => {
+    expect(
+      coerceLinks([
+        { targetId: "DS-001", kind: "blocks" },
+        { targetId: "DS-002", kind: "duplicates" },
+        { targetId: "DS-003", kind: "" },
+        { targetId: "DS-004", kind: 7 },
+      ]),
+    ).toEqual([{ targetId: "DS-001", kind: "blocks" }]);
+  });
+
+  test("dedupes by (targetId, kind) pair, keeping first occurrence", () => {
+    const out = coerceLinks([
+      { targetId: "DS-001", kind: "blocks" },
+      { targetId: "DS-001", kind: "blocks" },
+      { targetId: "DS-001", kind: "relates-to" },
+      { targetId: "DS-002", kind: "blocks" },
+    ]);
+    expect(out).toEqual([
+      { targetId: "DS-001", kind: "blocks" },
+      { targetId: "DS-001", kind: "relates-to" },
+      { targetId: "DS-002", kind: "blocks" },
+    ]);
+  });
+
+  test("drops self-links when currentIssueId supplied", () => {
+    expect(
+      coerceLinks(
+        [
+          { targetId: "DS-001", kind: "blocks" },
+          { targetId: "DS-002", kind: "blocks" },
+        ],
+        "DS-001",
+      ),
+    ).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+  });
+
+  test("drops self-links even when current id arrives lower-cased on the entry", () => {
+    expect(
+      coerceLinks(
+        [
+          { targetId: "ds-001", kind: "blocks" },
+          { targetId: "DS-002", kind: "blocks" },
+        ],
+        "DS-001",
+      ),
+    ).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+  });
+
+  test("drops malformed entry shapes", () => {
+    expect(
+      coerceLinks([
+        null,
+        undefined,
+        "not-an-object",
+        { kind: "blocks" },
+        { targetId: "DS-001" },
+        { targetId: "DS-002", kind: "blocks" },
+      ]),
+    ).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+  });
+});
+
+describe("INVERSE_LINK_KIND", () => {
+  test("covers every LinkKind in LINK_KINDS", () => {
+    for (const kind of LINK_KINDS) {
+      expect(INVERSE_LINK_KIND[kind]).toBeDefined();
+    }
+  });
+  test("relates-to is symmetric", () => {
+    expect(INVERSE_LINK_KIND["relates-to"]).toBe("relates-to");
+  });
+  test("blocks inverts to blocked-by", () => {
+    expect(INVERSE_LINK_KIND["blocks"]).toBe("blocked-by");
+  });
+  test("child-of inverts to parent-of", () => {
+    expect(INVERSE_LINK_KIND["child-of"]).toBe("parent-of");
+  });
+});
+
+describe("isLinkKind", () => {
+  test("accepts every kind in LINK_KINDS", () => {
+    for (const k of LINK_KINDS) expect(isLinkKind(k)).toBe(true);
+  });
+  test("rejects unknown strings and non-strings", () => {
+    expect(isLinkKind("duplicates")).toBe(false);
+    expect(isLinkKind("")).toBe(false);
+    expect(isLinkKind(undefined)).toBe(false);
+    expect(isLinkKind(null)).toBe(false);
+    expect(isLinkKind(42)).toBe(false);
   });
 });

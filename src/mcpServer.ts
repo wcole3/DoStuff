@@ -47,13 +47,18 @@ import {
   ACTIVE_LANES,
   AGENT_VISIBLE_STATUSES,
   AGENT_WRITABLE_STATUSES,
+  INVERSE_LINK_KIND,
+  LINK_KINDS,
   MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
+  coerceLinks,
   coerceTags,
   type Issue,
+  type LinkKind,
   type RecordEntry,
   type Status,
 } from "./types";
+import { validateLinks } from "./extension";
 
 // The default workflow prompt lives in its own small module so the extension
 // host can import it without dragging the full MCP SDK + zod into its bundle.
@@ -85,6 +90,15 @@ const NEW_TICKET_INPUT = {
   verifyCriteria: z.string().max(10_000).optional().default(""),
   tasks: z.array(z.string().min(1).max(500)).optional().default([]),
   tags: z.array(z.string().max(64)).optional().default([]),
+  links: z
+    .array(
+      z.object({
+        targetId: z.string().regex(/^DS-\d+$/i, "Expected an id like DS-001"),
+        kind: z.enum(LINK_KINDS),
+      }),
+    )
+    .optional()
+    .default([]),
 };
 
 const STATUS_INPUT = {
@@ -141,7 +155,19 @@ const ListIssuesSchema  = z.object(LIST_ISSUES_INPUT).strict();
 
 // ----- Helpers ---------------------------------------------------------------
 
-export function publicView(issue: Issue) {
+export function publicView(issue: Issue, allIssues: Issue[] = []) {
+  // Derive inbound links by scanning every other issue's outbound list and
+  // inverting the kind via INVERSE_LINK_KIND. Single-source — no dual-write.
+  const inboundLinks = allIssues.flatMap((other) => {
+    if (other.id === issue.id) return [];
+    return other.links
+      .filter((l) => l.targetId === issue.id)
+      .map((l) => ({
+        sourceId: other.id,
+        sourceTitle: other.title,
+        kind: INVERSE_LINK_KIND[l.kind],
+      }));
+  });
   return {
     id: issue.id,
     number: issue.number,
@@ -167,6 +193,8 @@ export function publicView(issue: Issue) {
       addedAt: a.addedAt,
       uri: `dostuff://attachments/${issue.id}/${a.id}`,
     })),
+    links: issue.links.map((l) => ({ targetId: l.targetId, kind: l.kind })),
+    inboundLinks,
     createdAt: issue.createdAt,
   };
 }
@@ -226,6 +254,8 @@ export type CreateTicketInput = {
   priority?: "Critical" | "High" | "Regular" | "Low";
   verifyCriteria?: string;
   tasks?: string[];
+  tags?: string[];
+  links?: Array<{ targetId: string; kind: LinkKind }>;
 };
 export type UpdateStatusInput = { id: string; status: Status; note?: string };
 export type UpdateProgressInput = {
@@ -309,7 +339,7 @@ export async function runGetTicket(
 
   return ToolResultOk(
     JSON.stringify(
-      { workspace: getWorkspaceContext(), workflow: readWorkflowPrompt(), ticket: publicView(match) },
+      { workspace: getWorkspaceContext(), workflow: readWorkflowPrompt(), ticket: publicView(match, all) },
       null,
       2,
     ),
@@ -382,6 +412,21 @@ export async function runCreateTicket(
   const now = new Date().toISOString();
   const number = store.nextNumber();
   const id = `DS-${String(number).padStart(3, "0")}`;
+  // Normalize the agent-supplied links: coerce shape first, then drop entries
+  // whose targetId doesn't exist (logged) and self-links (which `coerceLinks`
+  // already filters when given the current id).
+  const knownIds = new Set(store.list().map((i) => i.id));
+  const { kept: validatedLinks, dropped: droppedLinks } = validateLinks(
+    coerceLinks(validated.links ?? [], id),
+    id,
+    knownIds,
+  );
+  if (droppedLinks.length) {
+    // Surface via the store's own log channel for symmetry with the host path.
+    store.appendLog(
+      `MCP create_ticket on ${id} dropped ${droppedLinks.length} unknown-target link(s).`,
+    );
+  }
   const issue: Issue = {
     id,
     number,
@@ -398,6 +443,7 @@ export async function runCreateTicket(
     })),
     tags: coerceTags(validated.tags ?? []),
     attachments: [],
+    links: validatedLinks,
     createdAt: now,
     resolvedAt: null,
     statusHistory: [{ status: "Thinking", at: now, by: "agent" }],
@@ -878,10 +924,10 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
       mimeType: "application/json",
     },
     async (uri) => {
-      const servable = store
-        .list()
+      const all = store.list();
+      const servable = all
         .filter((i) => AGENT_VISIBLE_STATUSES.includes(i.status))
-        .map(publicView);
+        .map((i) => publicView(i, all));
       return {
         contents: [
           {
@@ -931,7 +977,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
             text: JSON.stringify(
               {
                 workflow: readWorkflowPrompt(),
-                ticket: publicView(issue),
+                ticket: publicView(issue, store.list()),
               },
               null,
               2,
@@ -1073,7 +1119,10 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       title: "Create ticket",
       description:
         "File a new ticket. It lands in 'Thinking' for the human to triage. " +
-        "Use this when you discover follow-up work that doesn't belong on the current ticket.",
+        "Use this when you discover follow-up work that doesn't belong on the current ticket. " +
+        "Optionally supply `links` to record relationships at creation time " +
+        "(kinds: blocks, child-of, relates-to). Unknown target ids are dropped " +
+        "with a warning; links cannot be edited afterwards via the MCP server.",
       inputSchema: NEW_TICKET_INPUT,
     },
     async (args) => runCreateTicket(store, args as CreateTicketInput),

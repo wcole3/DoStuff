@@ -40,6 +40,7 @@ export function makeIssue(overrides: Partial<Issue> = {}): Issue {
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
+    links: overrides.links ?? [],
   };
 }
 

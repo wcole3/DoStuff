@@ -10,7 +10,7 @@
 //   - Backdrop click closes either modal.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
 import {
@@ -361,5 +361,39 @@ describe("DeleteConfirmModal", () => {
     const backdrop = document.querySelector(".ds-modal-backdrop") as HTMLElement;
     await userEvent.click(backdrop);
     expect(closed).toBe(true);
+  });
+});
+
+describe("AddIssueModal: links staging", () => {
+  test("submit packs staged links into createIssue.partial.links", async () => {
+    // Seed an existing ticket so the LinkEditor typeahead has something to find.
+    pushInit([makeIssue({ id: "DS-002", number: 2, title: "CSV export" })]);
+    render(<AddIssueModal onClose={() => {}} />);
+
+    await userEvent.type(screen.getByPlaceholderText(/short summary/i), "Needs CSV");
+    // Add a link via the editor typeahead.
+    await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "csv");
+    const opt = within(screen.getByRole("listbox")).getByRole("option");
+    fireEvent.mouseDown(within(opt).getByRole("button"));
+
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+
+    const msg = api.posted.find((m) => m.type === "createIssue") as
+      | { type: "createIssue"; partial: { links?: Array<{ targetId: string; kind: string }> } }
+      | undefined;
+    expect(msg).toBeDefined();
+    expect(msg!.partial.links).toEqual([{ targetId: "DS-002", kind: "relates-to" }]);
+  });
+
+  test("submit without staged links omits the links key", async () => {
+    pushInit([makeIssue({ id: "DS-002", number: 2, title: "CSV export" })]);
+    render(<AddIssueModal onClose={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/short summary/i), "No links");
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    const msg = api.posted.find((m) => m.type === "createIssue") as
+      | { type: "createIssue"; partial: { links?: unknown } }
+      | undefined;
+    expect(msg).toBeDefined();
+    expect(msg!.partial.links).toBeUndefined();
   });
 });

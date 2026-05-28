@@ -5,8 +5,8 @@
 // in or out of "Complete".
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { mergeIssueUpdate, type UpdateBy } from "./extension";
-import type { Issue, IssueType, Priority, Status, StatusEvent } from "./types";
+import { mergeIssueUpdate, validateLinks, type UpdateBy } from "./extension";
+import type { Issue, IssueType, Priority, Status, StatusEvent, TicketLink } from "./types";
 
 let issueCounter = 0;
 function makeIssue(overrides: Partial<Issue> = {}): Issue {
@@ -31,6 +31,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
       overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
+    links: overrides.links ?? [],
   };
 }
 
@@ -379,5 +380,100 @@ describe("mergeIssueUpdate attachments allow-list", () => {
     });
     const next = ok(mergeIssueUpdate(prior, { title: "rename only" }, "user"));
     expect(next.attachments).toBe(prior.attachments);
+  });
+});
+
+describe("validateLinks", () => {
+  test("keeps every link whose target is in knownIds and isn't self", () => {
+    const links: TicketLink[] = [
+      { targetId: "DS-002", kind: "blocks" },
+      { targetId: "DS-003", kind: "relates-to" },
+    ];
+    const { kept, dropped } = validateLinks(links, "DS-001", new Set(["DS-002", "DS-003"]));
+    expect(kept).toEqual(links);
+    expect(dropped).toEqual([]);
+  });
+
+  test("drops links to unknown targets", () => {
+    const links: TicketLink[] = [
+      { targetId: "DS-002", kind: "blocks" },
+      { targetId: "DS-999", kind: "blocks" }, // unknown
+    ];
+    const { kept, dropped } = validateLinks(links, "DS-001", new Set(["DS-002"]));
+    expect(kept).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+    expect(dropped).toEqual([{ targetId: "DS-999", kind: "blocks" }]);
+  });
+
+  test("drops self-links", () => {
+    const links: TicketLink[] = [
+      { targetId: "DS-001", kind: "blocks" }, // self
+      { targetId: "DS-002", kind: "blocks" },
+    ];
+    const { kept, dropped } = validateLinks(links, "DS-001", new Set(["DS-001", "DS-002"]));
+    expect(kept).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]!.targetId).toBe("DS-001");
+  });
+});
+
+describe("mergeIssueUpdate — links reconciliation", () => {
+  test("when incoming.links is missing, prior.links is preserved verbatim", () => {
+    const prior = makeIssue({
+      id: "DS-001",
+      links: [{ targetId: "DS-002", kind: "blocks" }],
+    });
+    const r = mergeIssueUpdate(prior, { title: "still mergeable" }, "user");
+    if ("error" in r) throw new Error(r.error);
+    expect(r.next.links).toBe(prior.links);
+  });
+
+  test("when knownIds NOT supplied, accepts coerced shape without store check", () => {
+    const prior = makeIssue({ id: "DS-001", links: [] });
+    const links: TicketLink[] = [
+      { targetId: "DS-002", kind: "blocks" },
+      { targetId: "DS-999", kind: "relates-to" }, // unknown but no store check
+    ];
+    const r = mergeIssueUpdate(prior, { links }, "user");
+    if ("error" in r) throw new Error(r.error);
+    expect(r.next.links).toEqual(links);
+  });
+
+  test("when knownIds supplied, drops links to unknown targets", () => {
+    const prior = makeIssue({ id: "DS-001", links: [] });
+    const incoming: Partial<Issue> = {
+      links: [
+        { targetId: "DS-002", kind: "blocks" },
+        { targetId: "DS-999", kind: "relates-to" }, // unknown
+      ],
+    };
+    const knownIds = new Set(["DS-001", "DS-002"]);
+    const r = mergeIssueUpdate(prior, incoming, "user", undefined, knownIds);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.next.links).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+  });
+
+  test("drops self-links even with knownIds", () => {
+    const prior = makeIssue({ id: "DS-001", links: [] });
+    const r = mergeIssueUpdate(
+      prior,
+      { links: [{ targetId: "DS-001", kind: "blocks" }] },
+      "user",
+      undefined,
+      new Set(["DS-001"]),
+    );
+    if ("error" in r) throw new Error(r.error);
+    expect(r.next.links).toEqual([]);
+  });
+
+  test("malformed incoming.links shapes are dropped by coerceLinks", () => {
+    const prior = makeIssue({ id: "DS-001", links: [] });
+    const r = mergeIssueUpdate(
+      prior,
+      // @ts-expect-error -- test deliberately bad shape
+      { links: [null, { targetId: "ds-002", kind: "blocks" }, { kind: "blocks" }] },
+      "user",
+    );
+    if ("error" in r) throw new Error(r.error);
+    expect(r.next.links).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
   });
 });

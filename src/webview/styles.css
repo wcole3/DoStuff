@@ -1192,3 +1192,192 @@ button { font: inherit; color: inherit; }
   color: var(--vsc-fg);
   border: 1px solid color-mix(in srgb, #89d185 40%, transparent);
 }
+
+/* ── Ticket links ──────────────────────────────────────────────────────── */
+.ds-link-edit { display: flex; flex-direction: column; gap: 6px; }
+.ds-link-chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
+.ds-link-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 4px 1px 6px;
+  height: 18px;
+  border-radius: 4px;
+  font-size: 10px;
+  background: color-mix(in srgb, var(--link-color, var(--accent)) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--link-color, var(--accent)) 45%, transparent);
+  max-width: 240px;
+}
+.ds-link-chip-inbound {
+  --link-color: var(--vsc-border-2);
+  opacity: 0.92;
+}
+.ds-link-kind {
+  font-weight: 600;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  opacity: .75;
+  white-space: nowrap;
+}
+.ds-link-chip-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 0;
+  color: var(--vsc-fg);
+  font: inherit;
+  cursor: pointer;
+  padding: 0;
+  min-width: 0;
+}
+.ds-link-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 150px;
+}
+.ds-link-chip-main:hover .ds-link-chip-label { text-decoration: underline; }
+.ds-link-status-dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+.ds-link-chip-rm {
+  background: transparent; border: 0; color: inherit;
+  display: inline-flex; align-items: center;
+  padding: 0 2px; cursor: pointer; opacity: .6;
+}
+.ds-link-chip-rm:hover { opacity: 1; }
+
+.ds-link-edit-controls { display: flex; gap: 6px; align-items: stretch; }
+.ds-link-kind-select { flex: 0 0 auto; max-width: 120px; }
+.ds-link-typeahead { position: relative; flex: 1 1 auto; min-width: 0; }
+.ds-link-search { width: 100%; }
+.ds-link-results {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 2px);
+  left: 0; right: 0;
+  margin: 0; padding: 4px;
+  list-style: none;
+  background: var(--vsc-card);
+  border: 1px solid var(--vsc-border-2);
+  border-radius: 4px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.35);
+  max-height: 220px;
+  overflow-y: auto;
+}
+.ds-link-result {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: var(--vsc-fg);
+  font: inherit;
+  text-align: left;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.ds-link-result:hover { background: var(--vsc-card-2); }
+.ds-link-result-num { opacity: .6; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.ds-link-result-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── Graph webview ─────────────────────────────────────────────────────── */
+/* Full-height flex column. Without an explicit height the viewBox'd SVG would
+   size to its intrinsic aspect ratio and overflow the (overflow:hidden) body —
+   that overflow showed up as a cut-off black strip at the bottom. */
+.ds-graph-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--vsc-editor-bg);
+  color: var(--vsc-fg);
+}
+.ds-graph-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--vsc-border-2);
+  background: var(--vsc-sidebar-bg);
+}
+.ds-graph-count { color: var(--vsc-fg-muted); font-size: 11px; white-space: nowrap; }
+.ds-graph-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.ds-graph-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--vsc-fg-muted);
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+.ds-graph-legend-line { display: block; flex: 0 0 auto; }
+.ds-graph-reset { margin-left: auto; }
+
+.ds-graph-svg {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: var(--vsc-editor-bg);
+  cursor: grab;
+  touch-action: none;
+}
+.ds-graph-svg:active { cursor: grabbing; }
+.ds-graph-svg text { user-select: none; }
+
+.ds-graph-node { cursor: pointer; outline: none; }
+.ds-graph-node-circle {
+  fill: var(--vsc-card);
+  stroke: color-mix(in srgb, var(--accent) 70%, transparent);
+  stroke-width: 1.5;
+}
+.ds-graph-node:hover .ds-graph-node-circle {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.ds-graph-node:focus-visible .ds-graph-node-circle {
+  stroke: var(--accent);
+  stroke-width: 3;
+}
+.ds-graph-node-icon { color: var(--vsc-fg); fill: var(--vsc-fg); }
+.ds-graph-node-num {
+  fill: var(--vsc-fg);
+  font-weight: 600;
+  font-size: 11px;
+}
+/* Title sits below the node and may overlap edges/other nodes — a stroke halo
+   in the background color guarantees legibility regardless of what's behind. */
+.ds-graph-node-title {
+  fill: var(--vsc-fg);
+  font-size: 11px;
+  paint-order: stroke;
+  stroke: var(--vsc-editor-bg);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.ds-graph-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 100%;
+  padding: 24px;
+  text-align: center;
+  color: var(--vsc-fg-muted);
+  background: var(--vsc-editor-bg);
+}
+.ds-graph-empty p { margin: 0; }
+.ds-graph-empty-sub { font-size: 12px; color: var(--vsc-fg-dim); max-width: 360px; }
