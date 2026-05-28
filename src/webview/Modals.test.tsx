@@ -10,16 +10,31 @@
 //   - Backdrop click closes either modal.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
 import {
+  dispatchHost,
   installVsCodeApi,
   makeIssue,
+  pushInit,
   resetCounter,
   restoreVsCodeApi,
   type FakeVsCodeApi,
 } from "./__tests__/testUtils";
+
+/**
+ * Push an `init` that opts attachments in by giving the modal a non-null
+ * attachmentsBaseUri. Mirrors the helper pattern in IssueDetail.test.tsx.
+ */
+function enableAttachments(): void {
+  pushInit([], {
+    storagePath: ".vscode/dostuff",
+    autoSave: true,
+    activeLaneCap: 6,
+    attachmentsBaseUri: "vscode-webview://atts",
+  });
+}
 
 let api: FakeVsCodeApi;
 
@@ -102,6 +117,215 @@ describe("AddIssueModal", () => {
     render(<AddIssueModal onClose={() => {}} />);
     const backdrop = document.querySelector(".ds-modal-backdrop") as HTMLElement;
     expect(backdrop.classList.contains("ds-panel-style")).toBe(true);
+  });
+});
+
+describe("AddIssueModal: attachment staging", () => {
+  test("+ button posts pickAttachmentForStaging when a workspace is open", async () => {
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    const attachBtn = screen.getByRole("button", { name: /attach a file/i });
+    expect((attachBtn as HTMLButtonElement).disabled).toBe(false);
+    await userEvent.click(attachBtn);
+
+    expect(api.posted.find((m) => m.type === "pickAttachmentForStaging")).toBeDefined();
+  });
+
+  test("+ button is disabled and empty-state copy nudges to open a folder when no workspace", () => {
+    // pushInit defaults attachmentsBaseUri to null in testUtils.
+    pushInit([]);
+    render(<AddIssueModal onClose={() => {}} />);
+
+    const attachBtn = screen.getByRole("button", { name: /attach a file/i }) as HTMLButtonElement;
+    expect(attachBtn.disabled).toBe(true);
+
+    const empty = document.querySelector(".ds-att-empty")!;
+    expect(empty.textContent).toMatch(/open a workspace folder/i);
+  });
+
+  test("dropping a file with bytes stages a chip locally (no host post)", async () => {
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    const zone = document.querySelector(".ds-attachments") as HTMLDivElement;
+    const file = new File([new Uint8Array([0x68, 0x69])], "notes.txt", { type: "text/plain" });
+    await act(async () => {
+      fireEvent.drop(zone, {
+        dataTransfer: { files: [file], getData: () => "" },
+      });
+      // f.arrayBuffer() resolves on a microtask — yield so React commits the
+      // setPendingAttachments call before we read the DOM.
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    const chipName = document.querySelector(".ds-att-name")!;
+    expect(chipName.textContent).toBe("notes.txt");
+    // Staging is purely local — no host message should go out for bytes drops.
+    expect(api.posted.find((m) => m.type === "addAttachmentBytes")).toBeUndefined();
+    expect(api.posted.find((m) => m.type === "stageAttachmentByUri")).toBeUndefined();
+  });
+
+  test("dropping with empty files but text/uri-list posts stageAttachmentByUri", async () => {
+    // Remote-WSL fallback: webview can't read bytes itself, so it ships the
+    // URI to the host for the round-trip.
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    const zone = document.querySelector(".ds-attachments") as HTMLDivElement;
+    fireEvent.drop(zone, {
+      dataTransfer: {
+        files: [],
+        getData: (fmt: string) =>
+          fmt === "text/uri-list"
+            ? "file:///C:/Users/me/screenshot.png\r\nfile:///C:/Users/me/notes.txt"
+            : "",
+      },
+    });
+
+    const uriMsgs = api.posted.filter((m) => m.type === "stageAttachmentByUri") as Array<{
+      type: "stageAttachmentByUri";
+      uri: string;
+    }>;
+    expect(uriMsgs.map((m) => m.uri)).toEqual([
+      "file:///C:/Users/me/screenshot.png",
+      "file:///C:/Users/me/notes.txt",
+    ]);
+  });
+
+  test("drop is a no-op when attachments are disabled", async () => {
+    pushInit([]); // attachmentsBaseUri: null
+    render(<AddIssueModal onClose={() => {}} />);
+
+    const zone = document.querySelector(".ds-attachments") as HTMLDivElement;
+    const file = new File([new Uint8Array([0x00])], "noop.bin", { type: "application/octet-stream" });
+    await act(async () => {
+      fireEvent.drop(zone, {
+        dataTransfer: {
+          files: [file],
+          getData: (fmt: string) =>
+            fmt === "text/uri-list" ? "file:///should/be/ignored" : "",
+        },
+      });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // No chip rendered, no host posts.
+    expect(document.querySelector(".ds-att-chip")).toBeNull();
+    expect(api.posted.find((m) => m.type === "stageAttachmentByUri")).toBeUndefined();
+  });
+
+  test("host attachmentStaged event appends a chip with the bytes", () => {
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    act(() => {
+      dispatchHost({
+        type: "attachmentStaged",
+        name: "from-picker.txt",
+        mimeType: "text/plain",
+        bytes: [104, 105],
+      });
+    });
+
+    const chipName = document.querySelector(".ds-att-name")!;
+    expect(chipName.textContent).toBe("from-picker.txt");
+    const size = document.querySelector(".ds-att-size")!;
+    // 2 bytes formatted by formatBytes() — "2 B".
+    expect(size.textContent).toBe("2 B");
+  });
+
+  test("clicking a chip's × removes it from staging", async () => {
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    act(() => {
+      dispatchHost({
+        type: "attachmentStaged",
+        name: "to-remove.txt",
+        mimeType: "text/plain",
+        bytes: [1, 2, 3],
+      });
+    });
+    expect(document.querySelector(".ds-att-name")!.textContent).toBe("to-remove.txt");
+
+    const removeBtn = screen.getByRole("button", { name: /remove attachment/i });
+    await userEvent.click(removeBtn);
+
+    expect(document.querySelector(".ds-att-chip")).toBeNull();
+  });
+
+  test("submit packs staged attachments into createIssue.partial.attachments", async () => {
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    act(() => {
+      dispatchHost({
+        type: "attachmentStaged",
+        name: "a.txt",
+        mimeType: "text/plain",
+        bytes: [10, 11],
+      });
+      dispatchHost({
+        type: "attachmentStaged",
+        name: "b.png",
+        mimeType: "image/png",
+        bytes: [20, 21, 22],
+      });
+    });
+
+    await userEvent.type(screen.getByPlaceholderText(/short summary/i), "Has attachments");
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+
+    const msg = api.posted.find((m) => m.type === "createIssue") as
+      | {
+          type: "createIssue";
+          partial: {
+            title: string;
+            attachments?: Array<{ name: string; mimeType: string; bytes: number[] }>;
+          };
+        }
+      | undefined;
+    expect(msg).toBeDefined();
+    expect(msg!.partial.title).toBe("Has attachments");
+    expect(msg!.partial.attachments).toEqual([
+      { name: "a.txt", mimeType: "text/plain", bytes: [10, 11] },
+      { name: "b.png", mimeType: "image/png", bytes: [20, 21, 22] },
+    ]);
+  });
+
+  test("submit without staged attachments omits the attachments key", async () => {
+    enableAttachments();
+    render(<AddIssueModal onClose={() => {}} />);
+
+    await userEvent.type(screen.getByPlaceholderText(/short summary/i), "No attachments");
+    await userEvent.click(screen.getByRole("button", { name: /^create$/i }));
+
+    const msg = api.posted.find((m) => m.type === "createIssue") as
+      | { type: "createIssue"; partial: { attachments?: unknown } }
+      | undefined;
+    expect(msg).toBeDefined();
+    expect(msg!.partial.attachments).toBeUndefined();
+  });
+
+  test("Esc-closing the modal with staged attachments discards them silently", () => {
+    enableAttachments();
+    let closed = false;
+    render(<AddIssueModal onClose={() => (closed = true)} />);
+
+    act(() => {
+      dispatchHost({
+        type: "attachmentStaged",
+        name: "discarded.txt",
+        mimeType: "text/plain",
+        bytes: [9, 9, 9],
+      });
+    });
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(closed).toBe(true);
+    // No createIssue went out — the bytes only lived in modal state.
+    expect(api.posted.find((m) => m.type === "createIssue")).toBeUndefined();
   });
 });
 
