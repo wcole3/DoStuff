@@ -209,4 +209,68 @@ describe("validateImportList sanity (defense-in-depth at import boundary)", () =
     expect(valid[0]!.type).toBe("Chore");
     expect(valid[0]!.priority).toBe("Regular");
   });
+
+  test("keeps in-set links, drops links to ids not in the import + self-links", () => {
+    const base = (id: string, links: unknown[]) => ({
+      id,
+      number: parseInt(id.slice(3), 10),
+      title: id,
+      type: "Bug",
+      priority: "Regular",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      tasks: [],
+      tags: [],
+      createdAt: "2025-01-01T00:00:00.000Z",
+      resolvedAt: null,
+      statusHistory: [],
+      record: [],
+      attachments: [],
+      links,
+    });
+    const raw: unknown[] = [
+      base("DS-001", [
+        { targetId: "DS-002", kind: "blocks" }, // in-set -> kept
+        { targetId: "DS-900", kind: "relates-to" }, // not in import -> dropped
+        { targetId: "DS-001", kind: "child-of" }, // self -> dropped
+      ]),
+      base("DS-002", []),
+    ];
+    const { valid } = validateImportList(raw);
+    const one = valid.find((i) => i.id === "DS-001")!;
+    expect(one.links).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+  });
+
+  test("coerces malformed link entries before the cross-issue check", () => {
+    const raw: unknown[] = [
+      {
+        id: "DS-001",
+        number: 1,
+        title: "x",
+        type: "Bug",
+        priority: "Regular",
+        status: "Planned",
+        description: "",
+        verifyCriteria: "",
+        tasks: [],
+        tags: [],
+        createdAt: "2025-01-01T00:00:00.000Z",
+        resolvedAt: null,
+        statusHistory: [],
+        record: [],
+        attachments: [],
+        links: [
+          { targetId: "ds-002", kind: "blocks" }, // lower-case id -> normalized + kept
+          { kind: "blocks" }, // missing targetId -> dropped
+          { targetId: "DS-002", kind: "bogus" }, // bad kind -> dropped
+        ],
+      },
+      { id: "DS-002", number: 2, title: "y", createdAt: "2025-01-01T00:00:00.000Z" },
+    ];
+    const { valid } = validateImportList(raw);
+    expect(valid.find((i) => i.id === "DS-001")!.links).toEqual([
+      { targetId: "DS-002", kind: "blocks" },
+    ]);
+  });
 });

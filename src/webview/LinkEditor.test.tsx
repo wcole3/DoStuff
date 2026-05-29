@@ -89,6 +89,19 @@ describe("LinkEditor typeahead", () => {
       .join(" ");
     expect(text).toContain("OAuth refresh tokens");
   });
+
+  test("caps rendered rows at 50 so a broad query can't render unbounded DOM", async () => {
+    // 60 tickets all matching "task" — the dropdown should render at most 50;
+    // the rest are reachable by narrowing the query. The visible ~20-row height
+    // + scroll is CSS (not assertable in happy-dom).
+    const many: Issue[] = Array.from({ length: 60 }, (_, i) =>
+      makeIssue({ id: `DS-${String(i + 1).padStart(3, "0")}`, number: i + 1, title: `task ${i + 1}` }),
+    );
+    render(<LinkEditor value={[]} onChange={() => {}} allIssues={many} currentIssueId="DS-999" />);
+    await userEvent.type(screen.getByPlaceholderText(/link a ticket/i), "task");
+    const options = within(screen.getByRole("listbox")).getAllByRole("option");
+    expect(options).toHaveLength(50);
+  });
 });
 
 describe("LinkEditor commit + kind", () => {

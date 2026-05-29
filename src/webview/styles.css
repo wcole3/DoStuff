@@ -1267,7 +1267,9 @@ button { font: inherit; color: inherit; }
   border: 1px solid var(--vsc-border-2);
   border-radius: 4px;
   box-shadow: 0 4px 14px rgba(0,0,0,.35);
-  max-height: 220px;
+  /* Show ~20 rows, then scroll. Row height is pinned on `.ds-link-result`
+     below so this stays exactly 20 rows + the list's own 8px padding. */
+  max-height: calc(24px * 20 + 8px);
   overflow-y: auto;
 }
 .ds-link-result {
@@ -1275,6 +1277,7 @@ button { font: inherit; color: inherit; }
   align-items: center;
   gap: 6px;
   width: 100%;
+  min-height: 24px;
   background: transparent;
   border: 0;
   color: var(--vsc-fg);

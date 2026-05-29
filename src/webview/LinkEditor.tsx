@@ -14,6 +14,12 @@ import {
   type RelLabel,
 } from "./linkModel";
 
+// Upper bound on rendered typeahead rows. The visible area is capped at ~20
+// rows in CSS (`.ds-link-results`) and scrolls; this just bounds the DOM so an
+// empty query in a large workspace can't render thousands of nodes. Narrow the
+// query to reach anything past this.
+const MAX_RESULTS = 50;
+
 interface LinkEditorProps {
   /** The current ticket's outbound (forward) links. */
   value: TicketLink[];
@@ -65,7 +71,7 @@ export function LinkEditor({
   }, [local, opt]);
 
   const results = useMemo(
-    () => searchIssuesForLink(draft, allIssues, currentIssueId, excludedIds).slice(0, 8),
+    () => searchIssuesForLink(draft, allIssues, currentIssueId, excludedIds).slice(0, MAX_RESULTS),
     [draft, allIssues, currentIssueId, excludedIds],
   );
 

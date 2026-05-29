@@ -183,6 +183,26 @@ describe("get_ticket", () => {
     expect(body.ticket).not.toHaveProperty("resolvedAt");
   });
 
+  test("includes outbound links + derived inboundLinks (inverted kind)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, title: "blocker", status: "Planned", links: [{ targetId: "DS-002", kind: "blocks" }] }),
+      makeIssue({ id: "DS-002", number: 2, title: "blocked", status: "Planned" }),
+    ]);
+    const a = payload(await runGetTicket(store, { query: "1" })) as {
+      ticket: { links: unknown; inboundLinks: unknown };
+    };
+    expect(a.ticket.links).toEqual([{ targetId: "DS-002", kind: "blocks" }]);
+    expect(a.ticket.inboundLinks).toEqual([]);
+
+    const b = payload(await runGetTicket(store, { query: "2" })) as {
+      ticket: { links: unknown; inboundLinks: unknown };
+    };
+    expect(b.ticket.links).toEqual([]);
+    expect(b.ticket.inboundLinks).toEqual([
+      { sourceId: "DS-001", sourceTitle: "blocker", kind: "blocked-by" },
+    ]);
+  });
+
   test("Thinking ticket is fetchable (agents may read drafts they just filed)", async () => {
     const store = await makeStore([
       makeIssue({ number: 9, id: "DS-009", title: "Brainstorm idea", status: "Thinking" }),
