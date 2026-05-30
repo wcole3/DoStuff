@@ -1315,6 +1315,23 @@ button { font: inherit; color: inherit; }
 }
 .ds-graph-filter { flex: 0 1 240px; min-width: 120px; }
 .ds-graph-count { color: var(--vsc-fg-muted); font-size: 11px; white-space: nowrap; }
+
+.ds-graph-forces {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 14px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--vsc-border-2);
+  background: var(--vsc-card-2);
+}
+.ds-graph-force {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--vsc-fg-muted); white-space: nowrap;
+}
+.ds-graph-force input[type="range"] { width: 100px; }
+.ds-graph-force-val {
+  min-width: 30px; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .ds-graph-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
 .ds-graph-legend-item {
   display: inline-flex;

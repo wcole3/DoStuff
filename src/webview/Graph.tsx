@@ -16,6 +16,9 @@ import {
   forceLink,
   forceManyBody,
   forceSimulation,
+  type ForceCollide,
+  type ForceLink,
+  type ForceManyBody,
   type Simulation,
 } from "d3-force";
 import type { LinkKind } from "../types";
@@ -54,6 +57,20 @@ const MIN_SCALE = 0.25;
 const MAX_SCALE = 4;
 const DRAG_THRESHOLD = 5;
 
+/**
+ * Default force-simulation tuning, surfaced as toolbar sliders. Each value maps
+ * to one d3-force parameter in the layout effect; "Reset" restores these.
+ */
+const DEFAULT_FORCES = {
+  /** Target link length — d3 `forceLink.distance`. */
+  linkDistance: 120,
+  /** Node repulsion magnitude — applied as a negative `forceManyBody.strength`. */
+  repulsion: 340,
+  /** Extra spacing past `NODE_R` — `forceCollide.radius`. */
+  collide: 8,
+};
+type Forces = typeof DEFAULT_FORCES;
+
 export function Graph() {
   const { issues } = useIssues();
   const model = useMemo(() => buildGraphModel(issues), [issues]);
@@ -87,6 +104,12 @@ export function Graph() {
   const [nodes, setNodes] = useState<SimNode[]>([]);
   const [edges, setEdges] = useState<SimEdge[]>([]);
   const simRef = useRef<Simulation<SimNode, undefined> | null>(null);
+
+  // Force-tuning sliders (toolbar). `forcesReady` gates the live-tune effect so
+  // it skips its first run and doesn't reheat the freshly-settled mount layout.
+  const [forces, setForces] = useState<Forces>(DEFAULT_FORCES);
+  const [showForces, setShowForces] = useState(false);
+  const forcesReady = useRef(false);
   const titleById = useMemo(
     () => new Map(model.nodes.map((n) => [n.id, `#${n.number} — ${n.title}`])),
     [model],
@@ -107,16 +130,16 @@ export function Graph() {
       .filter((e) => e.source && e.target);
 
     const sim = forceSimulation(simNodes)
-      .force("charge", forceManyBody().strength(-340))
+      .force("charge", forceManyBody().strength(-forces.repulsion))
       .force(
         "link",
         forceLink<SimNode, SimEdge>(simEdges)
           .id((n) => n.id)
-          .distance(120)
+          .distance(forces.linkDistance)
           .strength(0.5),
       )
       .force("center", forceCenter(VIEW_W / 2, VIEW_H / 2))
-      .force("collide", forceCollide(NODE_R + 8))
+      .force("collide", forceCollide(NODE_R + forces.collide))
       .stop();
 
     // Compute the bulk of the layout synchronously so the first paint is
@@ -138,6 +161,23 @@ export function Graph() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signature]);
+
+  // Live-tune the forces without rebuilding the graph: mutate the running sim's
+  // force params in place and gently reheat so nodes resettle from their current
+  // positions (preserving manual drags) rather than reseeding on the circle.
+  // The first run is skipped so the settled mount layout isn't disturbed.
+  useEffect(() => {
+    if (!forcesReady.current) {
+      forcesReady.current = true;
+      return;
+    }
+    const sim = simRef.current;
+    if (!sim) return;
+    (sim.force("charge") as ForceManyBody<SimNode> | undefined)?.strength(-forces.repulsion);
+    (sim.force("link") as ForceLink<SimNode, SimEdge> | undefined)?.distance(forces.linkDistance);
+    (sim.force("collide") as ForceCollide<SimNode> | undefined)?.radius(NODE_R + forces.collide);
+    sim.alpha(0.6).restart();
+  }, [forces]);
 
   // ── viewport (pan + zoom) ──────────────────────────────────────────────
   const [view, setView] = useState({ tx: 0, ty: 0, scale: 1 });
@@ -367,7 +407,60 @@ export function Graph() {
         <button className="ds-btn ds-graph-reset" onClick={fitView}>
           Fit to view
         </button>
+        <button
+          className="ds-btn"
+          aria-pressed={showForces}
+          onClick={() => setShowForces((s) => !s)}
+        >
+          {showForces ? "Hide forces" : "Forces"}
+        </button>
       </div>
+      {showForces && (
+        <div className="ds-graph-forces">
+          <label className="ds-graph-force">
+            <span>Link distance</span>
+            <input
+              type="range"
+              min={40}
+              max={300}
+              step={5}
+              value={forces.linkDistance}
+              onChange={(e) => setForces((f) => ({ ...f, linkDistance: +e.target.value }))}
+              aria-label="Link distance"
+            />
+            <span className="ds-graph-force-val">{forces.linkDistance}</span>
+          </label>
+          <label className="ds-graph-force">
+            <span>Repulsion</span>
+            <input
+              type="range"
+              min={50}
+              max={1200}
+              step={10}
+              value={forces.repulsion}
+              onChange={(e) => setForces((f) => ({ ...f, repulsion: +e.target.value }))}
+              aria-label="Repulsion"
+            />
+            <span className="ds-graph-force-val">{forces.repulsion}</span>
+          </label>
+          <label className="ds-graph-force">
+            <span>Spacing</span>
+            <input
+              type="range"
+              min={0}
+              max={60}
+              step={2}
+              value={forces.collide}
+              onChange={(e) => setForces((f) => ({ ...f, collide: +e.target.value }))}
+              aria-label="Spacing"
+            />
+            <span className="ds-graph-force-val">{forces.collide}</span>
+          </label>
+          <button className="ds-btn" onClick={() => setForces(DEFAULT_FORCES)}>
+            Reset
+          </button>
+        </div>
+      )}
       <svg
         ref={svgRef}
         className="ds-graph-svg"
