@@ -50,7 +50,7 @@ Relate tickets to each other from the detail panel's **Links** field. Pick a rel
 
 ### Graph view
 
-Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear. Edges are colored and arrowed by kind. **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket. *Fit to view* frames everything currently shown.
+Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear. Edges are colored and arrowed by kind, and the legend doubles as a filter: click a relationship type to hide or show its edges (tickets left with no visible link drop out too). **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket. *Fit to view* frames everything currently shown, and **Forces** opens sliders to tune link distance, repulsion, and node spacing on the fly.
 
 Use the **filter** box (by `#id`, title, or tag) to focus on part of the network. Filtering preserves context: a matched ticket keeps its whole connected chain so you never see it stripped of its blockers, children, or related tickets — matches render normally while the surrounding chain dims. The view auto-fits to the matching cluster.
 
@@ -258,6 +258,30 @@ bun run package
 ```
 
 `bun run package` produces a `.vsix`. In VSCode, right-click the file and choose **Install Extension VSIX**.
+
+## Changelog
+
+<details>
+<summary><strong>v1.1.0</strong> — graph view, ticket links, MCP draft editing</summary>
+
+**Added**
+
+- **Graph view** (**DoStuff: Show Graph**) — an interactive node-link diagram of linked tickets, with a chain-preserving filter, relationship-type toggles in the legend, and live force-tuning sliders.
+- **Ticket links** — relate tickets via *blocks / blocked by / child of / parent of / relates to*. Relationships are stored once and the **Linked by** view is derived, so deleting a link (or a ticket) cleans up both ends. The new-issue dialog can stage links — and attachments — before the ticket exists.
+
+**Changed**
+
+- **MCP** — new `update_ticket_draft` tool reshapes a Thinking draft's tags/links/tasks; `create_ticket` now accepts `links[]`; agents can read and annotate Thinking drafts (and the `dostuff://tickets` resource now lists them).
+
+**Fixed**
+
+- Status-dropdown moves now honor `dostuff.activeLaneCap` instead of a hardcoded cap of 6 — matching board drag-and-drop.
+
+**Docs**
+
+- Split architecture and workflow internals into [docs/architecture.md](docs/architecture.md) and [docs/workflow-rules.md](docs/workflow-rules.md).
+
+</details>
 
 ## License
 
