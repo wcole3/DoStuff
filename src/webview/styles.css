@@ -1343,6 +1343,21 @@ button { font: inherit; color: inherit; }
   white-space: nowrap;
 }
 .ds-graph-legend-line { display: block; flex: 0 0 auto; }
+/* Legend entries double as relationship-type toggles. Reset the button chrome
+   so they read as legend text until hovered, and dim+strike the off state. */
+.ds-graph-legend-toggle {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  color: var(--vsc-fg-muted);
+}
+.ds-graph-legend-toggle:hover { background: var(--vsc-hover); }
+.ds-graph-legend-toggle:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.ds-graph-legend-toggle.is-off { opacity: 0.4; text-decoration: line-through; }
 .ds-graph-reset { margin-left: auto; }
 
 .ds-graph-svg {

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type DragEvent } from "react";
 import {
+  ACTIVE_LANE_CAP,
   MAX_ATTACHMENT_BYTES,
   PRIORITIES,
   STATUSES,
@@ -174,9 +175,14 @@ export function IssueDetail({ issue }: IssueDetailProps) {
     setEditingVerify(false);
   };
 
+  // Respect the configurable lane cap (settings override, else the default);
+  // without the cap arg canMoveToActiveLane falls back to the hardcoded
+  // ACTIVE_LANE_CAP, which is the bug the board's setStatus already avoids.
+  const laneCap = settings?.activeLaneCap ?? ACTIVE_LANE_CAP;
+
   const setStatus = (newStatus: Status) => {
     if (newStatus === issue.status) return;
-    const guard = canMoveToActiveLane(issues, newStatus, issue.id);
+    const guard = canMoveToActiveLane(issues, newStatus, issue.id, laneCap);
     if (guard !== true) {
       setStatusWarning(guard);
       return;

@@ -21,7 +21,7 @@ import {
   type ForceManyBody,
   type Simulation,
 } from "d3-force";
-import type { LinkKind } from "../types";
+import { LINK_KINDS, type LinkKind } from "../types";
 import { Icon, TYPE_ICON } from "./Icons";
 import { LINK_KIND_COLOR } from "./Links";
 import {
@@ -85,12 +85,35 @@ export function Graph() {
     for (const n of model.nodes) if (graphNodeMatchesQuery(n, filter)) s.add(n.id);
     return s;
   }, [model, filter]);
+
+  // Relationship-type toggles — the legend doubles as a row of checkboxes. An
+  // edge whose kind is switched off drops out of the graph entirely, and any
+  // node left with no surviving edge drops out with it. Defaults to all shown.
+  const [shownKinds, setShownKinds] = useState<Set<LinkKind>>(() => new Set(LINK_KINDS));
+  const allKindsShown = shownKinds.size === LINK_KINDS.length;
+  const toggleKind = (k: LinkKind) =>
+    setShownKinds((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+
+  // Edges surviving the kind toggles. Drives both the node set and the rendered
+  // edges, so hiding a kind also hides nodes whose only links were of that kind.
+  const activeEdges = useMemo(
+    () => model.edges.filter((e) => shownKinds.has(e.kind)),
+    [model.edges, shownKinds],
+  );
+
+  // Node visibility = (text filter, chain-preserving) ∩ (kind toggles). With no
+  // text filter, every node that still has a surviving edge is shown.
   const visibleIds = useMemo(
     () =>
       filterActive
-        ? visibleGraphNodeIds(matchedIds, model.edges)
-        : new Set(model.nodes.map((n) => n.id)),
-    [filterActive, matchedIds, model],
+        ? visibleGraphNodeIds(matchedIds, activeEdges)
+        : new Set(activeEdges.flatMap((e) => [e.sourceId, e.targetId])),
+    [filterActive, matchedIds, activeEdges],
   );
 
   // Stable signature: only re-run the layout when the set of nodes/edges
@@ -380,29 +403,39 @@ export function Graph() {
           aria-label="Filter graph"
         />
         <span className="ds-graph-count">
-          {filterActive
+          {filterActive || !allKindsShown
             ? `${visibleIds.size} of ${model.nodes.length} shown`
             : `${model.nodes.length} linked ticket${model.nodes.length === 1 ? "" : "s"} · ${model.edges.length} link${model.edges.length === 1 ? "" : "s"}`}
         </span>
-        <div className="ds-graph-legend" aria-label="Edge color legend">
-          {(Object.keys(LINK_KIND_COLOR) as LinkKind[]).map((k) => (
-            <span key={k} className="ds-graph-legend-item">
-              {/* A line sample matching the actual edge (solid, or dashed for
-                  relates-to) so the legend reads as the edge coloring. */}
-              <svg className="ds-graph-legend-line" width="24" height="8" aria-hidden="true">
-                <line
-                  x1="1"
-                  y1="4"
-                  x2="23"
-                  y2="4"
-                  stroke={LINK_KIND_COLOR[k]}
-                  strokeWidth="2"
-                  strokeDasharray={k === "relates-to" ? "4 3" : undefined}
-                />
-              </svg>
-              {LINK_KIND_LABEL[k]}
-            </span>
-          ))}
+        <div className="ds-graph-legend" role="group" aria-label="Toggle relationship types">
+          {LINK_KINDS.map((k) => {
+            const shown = shownKinds.has(k);
+            return (
+              <button
+                key={k}
+                type="button"
+                className={`ds-graph-legend-item ds-graph-legend-toggle${shown ? "" : " is-off"}`}
+                aria-pressed={shown}
+                onClick={() => toggleKind(k)}
+                title={`${shown ? "Hide" : "Show"} ${LINK_KIND_LABEL[k]} relationships`}
+              >
+                {/* A line sample matching the actual edge (solid, or dashed for
+                    relates-to) so the legend reads as the edge coloring. */}
+                <svg className="ds-graph-legend-line" width="24" height="8" aria-hidden="true">
+                  <line
+                    x1="1"
+                    y1="4"
+                    x2="23"
+                    y2="4"
+                    stroke={LINK_KIND_COLOR[k]}
+                    strokeWidth="2"
+                    strokeDasharray={k === "relates-to" ? "4 3" : undefined}
+                  />
+                </svg>
+                {LINK_KIND_LABEL[k]}
+              </button>
+            );
+          })}
         </div>
         <button className="ds-btn ds-graph-reset" onClick={fitView}>
           Fit to view
@@ -490,7 +523,12 @@ export function Graph() {
         </defs>
         <g transform={`translate(${view.tx} ${view.ty}) scale(${view.scale})`}>
           {edges
-            .filter((e) => visibleIds.has(e.source.id) && visibleIds.has(e.target.id))
+            .filter(
+              (e) =>
+                shownKinds.has(e.kind) &&
+                visibleIds.has(e.source.id) &&
+                visibleIds.has(e.target.id),
+            )
             .map((e, i) => (
               <Edge key={i} edge={e} />
             ))}
@@ -510,8 +548,12 @@ export function Graph() {
             ))}
         </g>
       </svg>
-      {filterActive && visibleIds.size === 0 && (
-        <div className="ds-graph-no-match">No linked tickets match “{filter.trim()}”.</div>
+      {visibleIds.size === 0 && (
+        <div className="ds-graph-no-match">
+          {filterActive
+            ? `No linked tickets match “${filter.trim()}”.`
+            : "No relationships of the selected type are shown."}
+        </div>
       )}
     </div>
   );

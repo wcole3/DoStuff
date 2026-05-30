@@ -120,6 +120,59 @@ describe("Graph rendering", () => {
   });
 });
 
+describe("Graph relationship-type toggles", () => {
+  // DS-001 --blocks--> DS-002 --child-of--> DS-003. Each node's sole edge is a
+  // distinct kind, so hiding one kind strands exactly one node.
+  function seedLinked() {
+    pushInit([
+      makeIssue({ id: "DS-001", number: 1, title: "blocker", links: [{ targetId: "DS-002", kind: "blocks" }] }),
+      makeIssue({ id: "DS-002", number: 2, title: "middle", links: [{ targetId: "DS-003", kind: "child-of" }] }),
+      makeIssue({ id: "DS-003", number: 3, title: "leaf" }),
+    ]);
+  }
+
+  const toggle = (label: RegExp) => screen.getByRole("button", { name: label });
+
+  test("every relationship type is shown (pressed) by default", () => {
+    seedLinked();
+    render(<Graph />);
+    expect(toggle(/blocks/i).getAttribute("aria-pressed")).toBe("true");
+    expect(toggle(/child of/i).getAttribute("aria-pressed")).toBe("true");
+    expect(toggle(/relates to/i).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  test("hiding a kind drops its edges and any now-isolated node", () => {
+    seedLinked();
+    render(<Graph />);
+    fireEvent.click(toggle(/blocks/i));
+    // DS-001's only link was the blocks edge, so it disappears with it.
+    expect(document.querySelector('[data-node="DS-001"]')).toBeNull();
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(2);
+    expect(document.querySelectorAll(".ds-graph-svg line")).toHaveLength(1);
+    expect(toggle(/blocks/i).getAttribute("aria-pressed")).toBe("false");
+  });
+
+  test("re-showing a kind restores its edges and nodes", () => {
+    seedLinked();
+    render(<Graph />);
+    fireEvent.click(toggle(/blocks/i));
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(2);
+    fireEvent.click(toggle(/blocks/i));
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(3);
+    expect(document.querySelectorAll(".ds-graph-svg line")).toHaveLength(2);
+  });
+
+  test("hiding every kind shows the empty-selection message", () => {
+    seedLinked();
+    render(<Graph />);
+    fireEvent.click(toggle(/blocks/i));
+    fireEvent.click(toggle(/child of/i));
+    fireEvent.click(toggle(/relates to/i));
+    expect(document.querySelectorAll("[data-node]")).toHaveLength(0);
+    expect(screen.getByText(/no relationships of the selected type/i)).toBeDefined();
+  });
+});
+
 describe("Graph filtering", () => {
   // Two separate chains: A-B-C (the "auth" cluster) and D-E (unrelated).
   function seedTwoChains() {

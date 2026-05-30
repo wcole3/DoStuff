@@ -83,6 +83,60 @@ describe("IssueDetail", () => {
     expect(api.posted.find((m) => m.type === "updateIssue")).toBeUndefined();
   });
 
+  // Regression (DS-003): the status dropdown's lane-cap check was calling
+  // canMoveToActiveLane without the cap arg, so it always used the hardcoded
+  // ACTIVE_LANE_CAP (6) and ignored a configured activeLaneCap. With a cap of
+  // 8, a 7th ticket into Working must be allowed.
+  test("status dropdown honors a configured activeLaneCap above the default", () => {
+    const seed: Issue[] = [];
+    for (let i = 1; i <= 6; i++) {
+      seed.push(makeIssue({ id: `DS-${String(i).padStart(3, "0")}`, number: i, status: "Working" }));
+    }
+    const planned = makeIssue({ id: "DS-099", number: 99, status: "Planned" });
+    seed.push(planned);
+    pushInit(seed, {
+      storagePath: ".vscode/dostuff",
+      autoSave: true,
+      activeLaneCap: 8,
+      attachmentsBaseUri: null,
+    });
+    render(<IssueDetail issue={planned} />);
+
+    const select = document.querySelector(".ds-d-select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "Working" } });
+
+    // Cap is 8 and Working holds 6 — the move is allowed, no warning.
+    expect(document.querySelector(".ds-d-warning")).toBeNull();
+    const msg = api.posted.find((m) => m.type === "updateIssue") as
+      | { type: "updateIssue"; issue: Issue }
+      | undefined;
+    expect(msg?.issue.status).toBe("Working");
+  });
+
+  test("status dropdown warning reflects the configured cap (8/8), not the default 6", () => {
+    const seed: Issue[] = [];
+    for (let i = 1; i <= 8; i++) {
+      seed.push(makeIssue({ id: `DS-${String(i).padStart(3, "0")}`, number: i, status: "Working" }));
+    }
+    const planned = makeIssue({ id: "DS-099", number: 99, status: "Planned" });
+    seed.push(planned);
+    pushInit(seed, {
+      storagePath: ".vscode/dostuff",
+      autoSave: true,
+      activeLaneCap: 8,
+      attachmentsBaseUri: null,
+    });
+    render(<IssueDetail issue={planned} />);
+
+    const select = document.querySelector(".ds-d-select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "Working" } });
+
+    const warn = document.querySelector(".ds-d-warning");
+    expect(warn).not.toBeNull();
+    expect(warn?.textContent).toContain("8/8");
+    expect(api.posted.find((m) => m.type === "updateIssue")).toBeUndefined();
+  });
+
   test("task text edits buffer locally and only post one updateIssue on blur", async () => {
     // Regression: keystroke-per-postMessage caused dropped chars at high WPM
     // because the controlled <input value={task.text}> snapped back to the
