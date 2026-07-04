@@ -248,6 +248,14 @@ Legacy `<id>.json` ticket files from earlier versions are migrated into the DB o
 
 On first use, DoStuff writes a nested `.gitignore` inside the storage folder so the DB and attachments are excluded from Git even when `.vscode/` is tracked. The gitignore itself is kept trackable (via `!.gitignore`) so teammates can see why their tickets aren't there. Disable via `dostuff.writeStorageGitignore: false`.
 
+**Known limitation**: the ticket DB is single-writer. Each clone keeps its own local board, and opening the *same* workspace in two VSCode windows at once can silently overwrite edits (last save wins). Multi-clone sync is planned — see [Roadmap](#roadmap).
+
+## Roadmap
+
+**Shared ticket boards via git (planned, not yet shipped).** The next major feature syncs the ticket DB across clones and contributors with zero infrastructure: ticket state is stored as git objects under a hidden ref (`refs/dostuff/state`) — no files in your working tree, no PR noise, no server, no new dependencies. You push and pull tickets through the same remote you already use; conflicts resolve automatically (per-ticket last-write-wins with deterministic id-collision renumbering), and MCP-connected agents keep working against the local board, which converges with everyone else's. It also fixes the two-windows-clobbering limitation above. Opt-in via a `dostuff.sync.enabled` setting; off means exactly today's behavior.
+
+Full design docs live in [docs/plans/ticket-sync/](docs/plans/ticket-sync/00-overview.md).
+
 ## Building from source
 
 ```bash

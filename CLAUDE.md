@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-DoStuff is a VSCode extension built with Bun + esbuild. Two bundles ship from one source tree: `dist/extension.cjs` for the extension host (CommonJS, required by VSCode's loader) and `media/index.js` + `media/styles.css` for the webview UI (browser IIFE). The webview is React 18 with `react-window` v1.8.x for list virtualization. The extension also runs an HTTP MCP server on `127.0.0.1:3947` exposing the active ticket queue to coding agents.
+DoStuff is a VSCode extension built with Bun + esbuild. Two bundles ship from one source tree: `dist/extension.cjs` for the extension host (CommonJS, required by VSCode's loader) and `media/index.js` + `media/styles.css` for the webview UI (browser IIFE). The webview is React 18 with `react-window` v1.8.x for list virtualization. The extension also runs a loopback-only HTTP MCP server exposing the active ticket queue to coding agents — the port is OS-assigned by default (`dostuff.mcp.port`, default `0`); agents discover it via the registry at `~/.config/dostuff/instances.json` (see README "Multi-workspace agent discovery").
 
 ## Commands
 
@@ -30,9 +30,11 @@ Press `F5` in VSCode (or `Run and Debug > Run Extension`) to launch an Extension
 
 ## Architecture
 
-DoStuff has three parts: an **extension host** (`src/*.ts`) that owns activation, the `IssueStore` (SQLite via `sql.js`, with a `globalState` fallback and one-shot legacy-JSON migration), the sidebar/board/graph providers, and the HTTP MCP server on `127.0.0.1:3947`; a **webview bundle** (`src/webview/*.tsx`, React 18) that renders the sidebar, board, and graph modes and talks to the host over the typed `HostToWebview` / `WebviewToHost` message protocol; and a two-config **esbuild pipeline** (CommonJS extension + browser-IIFE webview). `src/types.ts` is the canonical schema.
+DoStuff has three parts: an **extension host** (`src/*.ts`) that owns activation, the `IssueStore` (SQLite via `sql.js`, with a `globalState` fallback and one-shot legacy-JSON migration), the sidebar/board/graph providers, and the loopback HTTP MCP server (ephemeral port + `instances.json` registry); a **webview bundle** (`src/webview/*.tsx`, React 18) that renders the sidebar, board, and graph modes and talks to the host over the typed `HostToWebview` / `WebviewToHost` message protocol; and a two-config **esbuild pipeline** (CommonJS extension + browser-IIFE webview). `src/types.ts` is the canonical schema.
 
 See [docs/architecture.md](docs/architecture.md) for the full breakdown — per-module responsibilities, cross-webview drag, list virtualization, and the `vscode` mock aliasing used in tests.
+
+**Known constraint — single-writer storage.** The `IssueStore` assumes one extension-host process owns the DB: sql.js is in-memory, every mutation rewrites `dostuff.db` wholesale, and nothing detects external changes to the file. Two VSCode windows on the same workspace silently clobber each other (last flush wins), and `DS-NNN` ids are minted from the local `max+1` so independent writers mint colliding ids. A git-native sync design that fixes both (hidden ref `refs/dostuff/state`, LWW merge, new `guid`/`updatedAt` fields) is fully planned but **not implemented** — see [docs/plans/ticket-sync/00-overview.md](docs/plans/ticket-sync/00-overview.md). If you touch `IssueStore` mutators, id minting, or persistence, read that plan first so the change doesn't fight it.
 
 ### Agent write boundaries (MCP) — non-negotiable
 
@@ -55,4 +57,4 @@ The remaining UI/implementation rules — Thinking-drawer click vs. Shift+Click,
 
 ## Testing the webview manually
 
-There is no headless test harness for the React UI. `bun test` and `bunx tsc --noEmit` only catch host-side, MCP, and schema regressions — they do not exercise the webview. After any non-trivial webview change, walk through `SMOKE-TEST.md` in an Extension Development Host (F5). The smoke test covers the sidebar, board drag-and-drop, lane cap enforcement, import/export, and the MCP HTTP endpoint end-to-end.
+There is no headless test harness for the React UI. `bun test` and `bunx tsc --noEmit` only catch host-side, MCP, and schema regressions — they do not exercise the webview. After any non-trivial webview change, walk through `SMOKE-TEST.md` in an Extension Development Host (F5), covering the sidebar, board drag-and-drop, lane cap enforcement, import/export, and the MCP HTTP endpoint end-to-end. (Note: `SMOKE-TEST.md` does not exist yet — creating it is tracked in [docs/plans/ticket-sync/06-testing-and-docs.md](docs/plans/ticket-sync/06-testing-and-docs.md); until then, cover those areas manually.)
