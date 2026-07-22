@@ -1,6 +1,6 @@
 # Ticket Sync — Plan 03: Git Plumbing (Phase 3)
 
-> Series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · **03** · [04-controller-wiring](04-controller-wiring.md) · [05-attachments](05-attachments.md) · [06-testing-and-docs](06-testing-and-docs.md)
+> Series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · **03** · [04-controller-wiring](04-controller-wiring.md) · [05-attachments](05-attachments.md) · [06-testing-and-docs](06-testing-and-docs.md) · [07-workflow-prompt](07-workflow-prompt.md)
 
 Phase 3 builds `src/gitPlumbing.ts`: a vscode-free wrapper around the `git` CLI (pure node — unit-testable with real git in temp dirs). Zero npm deps: every invocation is `child_process.execFile("git", [args], { cwd, env })` with **argv arrays, never a shell** — which eliminates Windows/WSL quoting concerns entirely.
 
@@ -13,7 +13,9 @@ Tree at each commit tip:
 
 ```
 meta.json                       { "formatVersion": 1 }
-tickets/<guid>.json             canonical-JSON WireTicket (see 02-merge-spec §1–2)
+tickets/<guid>.json             canonical-JSON WireTicket (see 02-merge-spec §1–2; carries
+                                pendingClose + deletedTasks/deletedAttachments — additive
+                                fields, coerceWireTicket defaults them, formatVersion stays 1)
 tombstones/<guid>.json          { "guid", "deletedAt", "lastId" }
 attachments/<guid>/<attId>      raw bytes, no extension (name/mime live in ticket metadata; see 05)
 ```

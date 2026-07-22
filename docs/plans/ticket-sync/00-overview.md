@@ -1,8 +1,8 @@
 # Ticket Sync — Plan 00: Overview & Decision Record
 
-> Plan series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · [03-git-plumbing](03-git-plumbing.md) · [04-controller-wiring](04-controller-wiring.md) · [05-attachments](05-attachments.md) · [06-testing-and-docs](06-testing-and-docs.md)
+> Plan series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · [03-git-plumbing](03-git-plumbing.md) · [04-controller-wiring](04-controller-wiring.md) · [05-attachments](05-attachments.md) · [06-testing-and-docs](06-testing-and-docs.md) · [07-workflow-prompt](07-workflow-prompt.md)
 >
-> Status: **planned, not implemented** (as of 2026-07-04). Each doc is self-contained enough to hand to a fresh implementation session. Line numbers reference the tree at commit `e853d6d`; re-verify before editing.
+> Status: **in progress** (revised 2026-07-22 against commit `d0efe31`, "Lower restrictions on agents interacting with tickets"). Each doc is self-contained enough to hand to a fresh implementation session. Line numbers reference the tree at `d0efe31`; re-verify before editing.
 
 ## Problem statement
 
@@ -26,7 +26,7 @@ Key properties:
 - **Clean worktree, no PR noise.** The ref is invisible to `git status`, PRs, and collaborators who never enable sync.
 - **Merge is state-level in JS, never git content merge.** Per-ticket last-write-wins on a new `updatedAt` field, id-keyed union merges for collections, tombstones for deletes, deterministic renumbering for `DS-NNN` collisions. See [02-merge-spec](02-merge-spec.md).
 - **Opt-in.** `dostuff.sync.enabled` defaults to `false`; off means exactly current behavior.
-- **MCP untouched.** Agents keep talking to the local store through the existing tools and write boundaries; the store now converges with everyone else's. Applying remote state is *not* an agent write (no status gating), but every inbound ticket is shape-checked and normalized.
+- **MCP untouched — but the agent contract is broader than when this plan was first written.** Since `d0efe31`, agents promote/demote/shuffle all non-terminal statuses (`AGENT_WRITABLE_STATUSES` includes `Thinking`, `src/types.ts:189`), edit descriptions on any non-terminal ticket (`update_ticket_description`), and file close requests (`request_ticket_close` → the additive `pendingClose` field). Sync stays transparent to agents: they keep talking to the local store through the existing tools and write boundaries, and the store converges with everyone else's. Applying remote state is *not* an agent write (no status gating), but every inbound ticket is shape-checked and normalized. The design must NOT lean on "MCP freezes scope after Thinking" — that lock is now soft (demote → reshape → re-promote, auditable via `statusHistory`).
 - **Fixes today's two-window clobbering** as a side effect: both windows commit to the same local ref with compare-and-swap, and a tip poll picks up the other window's changes.
 
 ## Alternatives considered and rejected
@@ -42,22 +42,25 @@ Key properties:
 
 Verified against the current tree; re-verify line numbers before implementing.
 
-- **All writes funnel through 4 `IssueStore` mutators** — `upsert` (`src/storage.ts:260`), `remove` (`:273`), `replaceAll` (`:302`), `mergeAll` (`:318`) — each firing the `onChange` `EventEmitter<Issue[]>` (`:206`) with the full cache. Single tap point for outbound sync; single funnel for stamping `updatedAt`.
-- **`Issue` has no `updatedAt`, no revision field, no stable cross-writer identity** (`src/types.ts:133-163`). `id`/`number` come from `nextNumber()` = local `max+1` (`src/storage.ts:348`). Task ids and attachment ids already use uuids.
-- **`replaceAll` wipes the attachments root** (`src/storage.ts:311`) and `mergeAll` cannot delete → sync needs a new `applySync()` mutator ([01-schema-groundwork](01-schema-groundwork.md)).
-- **`normalize()`** (`src/storage.ts:139`) is the migration chokepoint for object-shaped input — new fields get defaults there per the CLAUDE.md backward-compat tenet.
-- **`mergeIssueUpdate`** (`src/extension.ts:102`) builds the next issue from `...prior` plus an explicit allow-list — the webview cannot spoof `guid`/`updatedAt`. Lock this in with a test.
+- **All writes funnel through 4 `IssueStore` mutators** — `upsert` (`src/storage.ts:270`), `remove` (`:283`), `replaceAll` (`:312`), `mergeAll` (`:328`) — each firing the `onChange` `EventEmitter<Issue[]>` (`:216`) with the full cache. Single tap point for outbound sync; single funnel for stamping `updatedAt` and recording deletion tombstones.
+- **`Issue` has no `updatedAt`, no revision field, no stable cross-writer identity** (`src/types.ts:149-183`; it *does* now carry `pendingClose: PendingClose | null` — the wire model must include it). `id`/`number` come from `nextNumber()` = local `max+1` (`src/storage.ts:358`). Task ids and attachment ids already use uuids.
+- **Upsert call-site inventory** (all funnel through `store.upsert`): **6 MCP sites** (`src/mcpServer.ts:526/625/685/757/813/878` — create, status, progress, draft, description, close-request), plus `src/extension.ts` (`applyIssueUpdate` :350, `resolveClose` :370, `appendAttachment` :431, attachment onDelete :514) and `src/sidebarProvider.ts:322`.
+- **`replaceAll` wipes the attachments root** and `mergeAll` cannot delete → sync needs a new `applySync()` mutator ([01-schema-groundwork](01-schema-groundwork.md)).
+- **`normalize()`** (`src/storage.ts:148`) is the migration chokepoint for object-shaped input — new fields get defaults there per the CLAUDE.md backward-compat tenet.
+- **`mergeIssueUpdate`** (`src/extension.ts:103`) builds the next issue from `...prior` plus an explicit allow-list — the webview cannot spoof `guid`/`updatedAt`. Lock this in with a test (the `pendingClose`-forgery test at `src/extension.test.ts:275-291` is the exact shape to copy).
+- **`issue_pending_close`** (`src/storage.ts:129-134`) is the additive-`CREATE TABLE IF NOT EXISTS` precedent to copy for the new `sync_tombstones` table.
 - **No file watching anywhere**; `mocks/vscode.ts` has no `createFileSystemWatcher`, and packed refs make watching loose ref files unreliable → poll `git rev-parse <ref>` on a timer instead.
-- **MCP server**: loopback-only raw node HTTP, ephemeral port by default (`dostuff.mcp.port` = 0), discovery via `~/.config/dostuff/instances.json` (`src/mcpRegistry.ts`). The `127.0.0.1:3947` claims in CLAUDE.md and docs/architecture.md are **stale** — fix during [06-testing-and-docs](06-testing-and-docs.md).
-- **Single-flight pattern precedent**: `reconcilePromise` (`src/mcpServer.ts:757`) — the sync controller's op chain mirrors it.
+- **MCP server**: loopback-only raw node HTTP, ephemeral port by default (`dostuff.mcp.port` = 0), discovery via `~/.config/dostuff/instances.json` (`src/mcpRegistry.ts`). (The stale `127.0.0.1:3947` claims in CLAUDE.md / docs/architecture.md were fixed in `d0efe31`.)
+- **Single-flight pattern precedent**: `reconcilePromise` (`src/mcpServer.ts:899`) — the sync controller's op chain mirrors it.
 - **`SMOKE-TEST.md` is referenced by CLAUDE.md but does not exist** — create it in phase 6.
-- **Settings gotcha**: `package.json` declares `dostuff.mcp.enabled` default `false` but code reads default `true` (`src/extension.ts:810`, `src/mcpServer.ts:788`). Do not repeat this mismatch for sync settings — code defaults must match declared defaults.
+- **Settings gotcha**: `package.json` declares `dostuff.mcp.enabled` default `false` but code reads default `true` (`src/extension.ts:878/:909`). Do not repeat this mismatch for sync settings — code defaults must match declared defaults.
 
 ## Phase roadmap
 
 | Phase | Doc | Deliverable | Shippable alone? |
 |---|---|---|---|
-| 1 | [01-schema-groundwork](01-schema-groundwork.md) | `guid` + `updatedAt` fields, deterministic backfill, guarded ALTERs, `upsert` stamping, `applySync()` | Yes — pure schema prep, no sync behavior |
+| 0 | [07-workflow-prompt](07-workflow-prompt.md) | Slimmer workflow prompt + MCP initialize-`instructions` wiring | Yes — independent of sync; execute first |
+| 1 | [01-schema-groundwork](01-schema-groundwork.md) | `guid` + `updatedAt` fields (+ per-task `updatedAt`), deterministic backfill, guarded ALTERs, `sync_tombstones`, `upsert` stamping, `applySync()` | Yes — pure schema prep, no sync behavior |
 | 2 | [02-merge-spec](02-merge-spec.md) | `src/syncMerge.ts` pure merge module + tests | Yes — no runtime wiring |
 | 3 | [03-git-plumbing](03-git-plumbing.md) | `src/gitPlumbing.ts` (no vscode imports) + tests against real git | Yes — library only |
 | 4 | [04-controller-wiring](04-controller-wiring.md) | `src/gitSync.ts` controller, settings, commands, status bar | First user-visible phase |
@@ -67,6 +70,8 @@ Verified against the current tree; re-verify line numbers before implementing.
 ## Accepted risks
 
 - **Downgrade edit-loss window**: an older build rewriting a row NULLs `updated_at` → the value falls back to `createdAt` → that edit loses LWW against any concurrent remote edit. Ticket *identity* stays safe because the guid re-derives deterministically. Low likelihood (requires downgrade + concurrent remote edit); document in the CLAUDE.md tenet.
-- **Element resurrect semantics**: a task/attachment deleted on one side concurrent with any edit on the other side resurrects (union merge). Acceptable v1 trade — MCP freezes scope after Thinking, and losing a teammate's added task is worse. v2 escape hatch: per-element timestamps (additive field).
+- **Element delete-vs-edit resolves by LWW** — per-element `updatedAt` on tasks plus persisted element tombstones (the former v2 escape hatch, promoted to v1 because the soft scope lock makes concurrent agent reshaping of triaged tickets likely; see [02-merge-spec §5](02-merge-spec.md)). Residual risk: an edit made by an old build carries no element timestamp, defaults to ticket `createdAt`, and loses to any explicitly-timestamped delete — mirrors the downgrade caveat above.
+- **`pendingClose` merges wholesale with the winning ticket** (LWW). A close request set concurrently with a losing-side ticket edit can be dropped; accepted because `request_ticket_close` is idempotent and the agent's poll loop naturally re-requests.
+- **Tombstone GC**: ticket and element tombstones older than 90 days (relative to the newest timestamp in the merged state — deterministic, no wall clock) are pruned; a replica offline longer than the TTL can resurrect a deleted ticket. Standard trade; documented.
 - **Clock skew** biases LWW between machines; deterministic tiebreak prevents divergence (both sides converge to the *same* winner, even if it's the "wrong" one). Tolerable for a ticket board.
 - **Ref history growth**: every debounced edit is a commit. Content addressing dedupes unchanged blobs/trees; history still grows. v2: periodic squash (`commit-tree` with no parents + coordinated reset). `refs/dostuff/*` roots keep objects alive through `git gc` — safe by default.

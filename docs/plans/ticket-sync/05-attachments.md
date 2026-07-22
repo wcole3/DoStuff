@@ -1,6 +1,6 @@
 # Ticket Sync — Plan 05: Attachments in the Ref Tree (Phase 5)
 
-> Series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · [03-git-plumbing](03-git-plumbing.md) · [04-controller-wiring](04-controller-wiring.md) · **05** · [06-testing-and-docs](06-testing-and-docs.md)
+> Series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · [03-git-plumbing](03-git-plumbing.md) · [04-controller-wiring](04-controller-wiring.md) · **05** · [06-testing-and-docs](06-testing-and-docs.md) · [07-workflow-prompt](07-workflow-prompt.md)
 
 Phase 5 syncs attachment **bytes** through the same ref. Attachment *metadata* already syncs in phase 2/4 (it lives on the ticket); this phase makes the binary payloads follow. Optional enhancement — the system is fully functional without it (missing bytes show the existing "attachment file is missing" UX, `src/extension.ts:462`).
 
@@ -30,10 +30,10 @@ Order matters — after the renumber dir-renames from [04-controller-wiring §2]
 For each merged ticket's attachment metadata:
 
 1. If the local file exists (`store.findAttachmentUri` non-null) → nothing to do.
-2. Else if the merged tree has `attachments/<guid>/<attId>` → stream `git cat-file blob <oid>` stdout directly to the destination file (`catBlobToFile`, avoids `maxBuffer`), writing via the attachment-dir convention `<storagePath>/attachments/<issueId>/<attId><ext>`.
+2. Else if the merged tree has `attachments/<guid>/<attId>` **and** the id is not listed in the merged ticket's `deletedAttachments` (belt-and-braces — a tombstoned id is already absent from metadata) → stream `git cat-file blob <oid>` stdout directly to the destination file (`catBlobToFile`, avoids `maxBuffer`), writing via the attachment-dir convention `<storagePath>/attachments/<issueId>/<attId><ext>`.
 3. Else → leave missing; existing missing-file UX covers it.
 
-Deletion side: when a tombstoned ticket is removed, `applySync` deletes its attachment dir (see [01-schema-groundwork §8](01-schema-groundwork.md)); the blobs age out of the ref tree at the next `commitLocal` because the ticket entry is gone (git objects persist in history — acceptable, same story as any committed-then-deleted file).
+Deletion side: when a tombstoned ticket is removed, `applySync` deletes its attachment dir (see [01-schema-groundwork §9](01-schema-groundwork.md)); the blobs age out of the ref tree at the next `commitLocal` because the ticket entry is gone (git objects persist in history — acceptable, same story as any committed-then-deleted file).
 
 ## 4. Tests (extend `src/gitSync.test.ts`)
 
