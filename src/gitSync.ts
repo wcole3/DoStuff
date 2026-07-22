@@ -10,6 +10,8 @@
 // `preserveTimestamps` semantics (01-schema-groundwork).
 
 import * as vscode from "vscode";
+import * as fsp from "node:fs/promises";
+import * as nodePath from "node:path";
 import { normalize } from "./storage";
 import type { IssueStore } from "./storage";
 import { findRepoRoot, GitError, GitRepo, type GitRepoOptions, type TreeEntry } from "./gitPlumbing";
@@ -58,7 +60,15 @@ export interface SyncResult {
  */
 export type SyncStoreLike = Pick<
   IssueStore,
-  "list" | "get" | "getSyncTombstones" | "applySync" | "onChange" | "appendLog" | "attachmentsDir"
+  | "list"
+  | "get"
+  | "getSyncTombstones"
+  | "applySync"
+  | "onChange"
+  | "appendLog"
+  | "attachmentsDir"
+  | "readAttachment"
+  | "findAttachmentUri"
 >;
 
 export interface GitSyncOptions {
@@ -66,6 +76,12 @@ export interface GitSyncOptions {
   ref: string; // e.g. "refs/dostuff/state"; validated ^refs/
   intervalMinutes: number; // 0 = manual network sync only
   activeLaneCap: number;
+  /** Sync attachment bytes through the ref tree (default true; metadata
+   *  always syncs). See docs/plans/ticket-sync/05-attachments.md. */
+  syncAttachments?: boolean;
+  /** Per-file byte cap for attachment sync (default 5 MiB); larger files
+   *  sync metadata only, logged — no silent caps. */
+  maxAttachmentSyncBytes?: number;
   debounceMs?: number; // outbound debounce (default 2000)
   pushFollowUpMs?: number; // one coalesced push after a local commit (default 30000)
   tipPollMs?: number; // same-machine tip poll (default 15000)
@@ -299,7 +315,68 @@ export class GitSyncController implements vscode.Disposable {
     return { tickets, tombstones };
   }
 
-  private async writeState(state: SyncState): Promise<string> {
+  /** path (`attachments/<guid>/<attId>`) → blob oid map at a tip. */
+  private async attachmentOidsAt(tip: string | null): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (!tip || !this.repo) return out;
+    for (const e of await this.repo.readTree(tip)) {
+      if (e.type === "blob" && e.path.startsWith("attachments/")) out.set(e.path, e.oid);
+    }
+    return out;
+  }
+
+  /**
+   * Attachment-bytes tree entries (05-attachments §2): skip entirely when
+   * disabled; over-cap files sync metadata only (logged — no silent caps);
+   * previously-committed blobs reuse their OID without touching the file
+   * (attachments are immutable per id), keeping commits O(changed bytes);
+   * a missing local file never fails the commit.
+   */
+  private async buildAttachmentEntries(
+    state: SyncState,
+    prevOids: Map<string, string>,
+  ): Promise<TreeEntry[]> {
+    if (this.opts.syncAttachments === false) return [];
+    const repo = this.repo!;
+    const cap = this.opts.maxAttachmentSyncBytes ?? 5 * 1024 * 1024;
+    const perGuid: TreeEntry[] = [];
+    for (const [guid, t] of [...state.tickets.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      const files: TreeEntry[] = [];
+      for (const att of t.attachments) {
+        if (att.sizeBytes > cap) {
+          this.store.appendLog(
+            `Sync: attachment ${t.id}/${att.name} (${att.sizeBytes} bytes) exceeds dostuff.sync.maxAttachmentSyncBytes — metadata only.`,
+          );
+          continue;
+        }
+        const treePath = `attachments/${guid}/${att.id}`;
+        const reused = prevOids.get(treePath);
+        if (reused) {
+          files.push({ mode: "100644", type: "blob", oid: reused, path: att.id });
+          continue;
+        }
+        try {
+          const bytes = await this.store.readAttachment(t.id, att.id);
+          files.push({
+            mode: "100644",
+            type: "blob",
+            oid: await repo.hashObjectStdin(Buffer.from(bytes)),
+            path: att.id,
+          });
+        } catch {
+          this.store.appendLog(
+            `Sync: attachment file missing for ${t.id}/${att.id} — metadata only.`,
+          );
+        }
+      }
+      if (files.length) {
+        perGuid.push({ mode: "040000", type: "tree", oid: await repo.mkTree(files), path: guid });
+      }
+    }
+    return perGuid;
+  }
+
+  private async writeState(state: SyncState, prevAttachmentOids?: Map<string, string>): Promise<string> {
     const repo = this.repo!;
     const ticketEntries: TreeEntry[] = [];
     for (const [guid, t] of [...state.tickets.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
@@ -345,6 +422,15 @@ export class GitSyncController implements vscode.Disposable {
         path: "tombstones",
       });
     }
+    const attEntries = await this.buildAttachmentEntries(state, prevAttachmentOids ?? new Map());
+    if (attEntries.length) {
+      rootEntries.push({
+        mode: "040000",
+        type: "tree",
+        oid: await repo.mkTree(attEntries),
+        path: "attachments",
+      });
+    }
     return repo.mkTree(rootEntries);
   }
 
@@ -366,7 +452,7 @@ export class GitSyncController implements vscode.Disposable {
         outbound = mergeStates(await this.readState(oldTip), local);
       }
       const { state: settled, renames } = renumber(outbound);
-      const rootTree = await this.writeState(settled);
+      const rootTree = await this.writeState(settled, await this.attachmentOidsAt(oldTip));
 
       if (oldTip) {
         // No-op detection: unchanged root tree → nothing to commit.
@@ -374,7 +460,7 @@ export class GitSyncController implements vscode.Disposable {
         if (oldTree === rootTree) {
           this.lastSeenTip = oldTip;
           if (renames.length || this.stateDiffersFromCache(settled)) {
-            await this.applyState(settled, renames);
+            await this.applyState(settled, renames, oldTip);
           }
           return;
         }
@@ -393,7 +479,7 @@ export class GitSyncController implements vscode.Disposable {
       this.lastSeenTip = commit;
       // The commit may have folded in tip-side state we hadn't applied.
       if (renames.length || this.stateDiffersFromCache(settled)) {
-        await this.applyState(settled, renames);
+        await this.applyState(settled, renames, commit);
       }
       this.schedulePushFollowUp();
       return;
@@ -409,7 +495,7 @@ export class GitSyncController implements vscode.Disposable {
     const { state: settled, renames } = renumber(merged);
     this.lastSeenTip = tip;
     if (renames.length || this.stateDiffersFromCache(settled)) {
-      await this.applyState(settled, renames);
+      await this.applyState(settled, renames, tip);
       // Our cache may have had state the tip lacked — fold it back in.
       await this.commitLocalOp();
     }
@@ -445,7 +531,7 @@ export class GitSyncController implements vscode.Disposable {
             await repo.updateRefCas(this.opts.ref, remoteTip, localTip);
             this.lastSeenTip = remoteTip;
             const { state: settled, renames } = renumber(await this.readState(remoteTip));
-            const applied = await this.applyState(settled, renames);
+            const applied = await this.applyState(settled, renames, remoteTip);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
             result.laneOverflow = applied.laneOverflow;
@@ -455,12 +541,17 @@ export class GitSyncController implements vscode.Disposable {
             const localState = localTip ? await this.readState(localTip) : this.buildLocalState();
             const merged = mergeStates(localState, await this.readState(remoteTip));
             const { state: settled, renames } = renumber(merged);
-            const rootTree = await this.writeState(settled);
+            // Blob OIDs reusable from either parent tip.
+            const prevOids = new Map([
+              ...(await this.attachmentOidsAt(localTip)),
+              ...(await this.attachmentOidsAt(remoteTip)),
+            ]);
+            const rootTree = await this.writeState(settled, prevOids);
             const parents = localTip ? [localTip, remoteTip] : [remoteTip];
             const commit = await repo.commitTree(rootTree, parents, "dostuff: merge");
             await repo.updateRefCas(this.opts.ref, commit, localTip);
             this.lastSeenTip = commit;
-            const applied = await this.applyState(settled, renames);
+            const applied = await this.applyState(settled, renames, commit);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
             result.laneOverflow = applied.laneOverflow;
@@ -510,11 +601,15 @@ export class GitSyncController implements vscode.Disposable {
               await this.readState(remoteTip),
             );
             const { state: settled, renames } = renumber(merged);
-            const rootTree = await this.writeState(settled);
+            const prevOids = new Map([
+              ...(await this.attachmentOidsAt(localTip)),
+              ...(await this.attachmentOidsAt(remoteTip)),
+            ]);
+            const rootTree = await this.writeState(settled, prevOids);
             const commit = await repo.commitTree(rootTree, [localTip, remoteTip], "dostuff: merge");
             await repo.updateRefCas(this.opts.ref, commit, localTip);
             this.lastSeenTip = commit;
-            await this.applyState(settled, renames);
+            await this.applyState(settled, renames, commit);
           }
           continue;
         }
@@ -574,19 +669,21 @@ export class GitSyncController implements vscode.Disposable {
   private async applyState(
     state: SyncState,
     renames: Array<{ guid: string; oldId: string; newId: string }>,
+    tip?: string | null,
   ): Promise<SyncResult> {
     const cache = this.store.list();
     const guidToId = new Map([...state.tickets.values()].map((t) => [t.guid, t.id]));
 
-    // Attachment dir renames before any restore (and before removal of old rows).
+    // Attachment dir renames before any restore (and before removal of old
+    // rows). Node fs, not vscode fs — attachment bytes always live on the
+    // extension host's disk (same posture as gitPlumbing's blob streaming).
     const attRoot = this.store.attachmentsDir();
     if (attRoot) {
       for (const r of renames) {
         try {
-          await vscode.workspace.fs.rename(
-            vscode.Uri.joinPath(attRoot, r.oldId),
-            vscode.Uri.joinPath(attRoot, r.newId),
-            { overwrite: false },
+          await fsp.rename(
+            nodePath.join(attRoot.fsPath, r.oldId),
+            nodePath.join(attRoot.fsPath, r.newId),
           );
         } catch {
           // Dir may simply not exist — the common case.
@@ -623,6 +720,18 @@ export class GitSyncController implements vscode.Disposable {
       this.applyingRemote -= 1;
     }
 
+    // Restore genuinely-missing attachment bytes from the ref tree — after
+    // the renumber dir-renames, before notifications (05-attachments §3).
+    if (tip && attRoot && this.opts.syncAttachments !== false) {
+      try {
+        await this.restoreAttachments(state, tip, attRoot.fsPath);
+      } catch (e) {
+        this.store.appendLog(
+          `Sync: attachment restore failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+
     // Notifications.
     if (renames.length) {
       this.notify(
@@ -649,6 +758,35 @@ export class GitSyncController implements vscode.Disposable {
       renames: renames.map((r) => ({ oldId: r.oldId, newId: r.newId })),
       laneOverflow,
     };
+  }
+
+  /**
+   * Fill only genuinely-missing attachment files from the tree at `tip`
+   * (05-attachments §3): existing local files are left alone; ids listed in
+   * a ticket's `deletedAttachments` are skipped (belt-and-braces — they are
+   * already absent from metadata); anything else stays missing and falls
+   * back to the existing missing-file UX.
+   */
+  private async restoreAttachments(state: SyncState, tip: string, attRootPath: string): Promise<void> {
+    const repo = this.repo;
+    if (!repo) return;
+    const oids = await this.attachmentOidsAt(tip);
+    if (oids.size === 0) return;
+    for (const wire of state.tickets.values()) {
+      if (wire.attachments.length === 0) continue;
+      const deleted = new Set(wire.deletedAttachments.map((d) => d.id));
+      for (const att of wire.attachments) {
+        if (deleted.has(att.id)) continue;
+        const oid = oids.get(`attachments/${wire.guid}/${att.id}`);
+        if (!oid) continue; // bytes were never synced (cap/skip) — leave missing
+        if (await this.store.findAttachmentUri(wire.id, att.id)) continue; // already present
+        const dot = att.name.lastIndexOf(".");
+        const ext = dot >= 0 ? att.name.slice(dot) : "";
+        const dir = nodePath.join(attRootPath, wire.id);
+        await fsp.mkdir(dir, { recursive: true });
+        await repo.catBlobToFile(oid, nodePath.join(dir, `${att.id}${ext}`));
+      }
+    }
   }
 
   private computeLaneOverflow(): string[] {

@@ -1041,6 +1041,8 @@ export function activate(context: vscode.ExtensionContext) {
         ref: cfg.get<string>("sync.ref", "refs/dostuff/state"),
         intervalMinutes: cfg.get<number>("sync.intervalMinutes", 5),
         activeLaneCap: cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP),
+        syncAttachments: cfg.get<boolean>("sync.syncAttachments", true),
+        maxAttachmentSyncBytes: cfg.get<number>("sync.maxAttachmentSyncBytes", 5242880),
       },
     );
     sync = controller;

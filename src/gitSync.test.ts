@@ -49,6 +49,10 @@ class FakeStore {
   private readonly emitter = new vscode.EventEmitter<Issue[]>();
   readonly onChange = this.emitter.event;
   applySyncCalls = 0;
+  logs: string[] = [];
+  /** Real on-disk attachments root (`<dir>/<issueId>/<attId><ext>`), or null. */
+  attachRoot: string | null = null;
+  readAttachmentCalls = 0;
 
   list(): Issue[] {
     return [...this.cache];
@@ -56,9 +60,36 @@ class FakeStore {
   get(id: string): Issue | undefined {
     return this.cache.find((i) => i.id === id);
   }
-  appendLog(_line: string): void {}
+  appendLog(line: string): void {
+    this.logs.push(line);
+  }
   attachmentsDir(): vscode.Uri | null {
+    return this.attachRoot ? vscode.Uri.file(this.attachRoot) : null;
+  }
+  private attachmentPath(issueId: string, attachmentId: string): string | null {
+    if (!this.attachRoot) return null;
+    const dir = path.join(this.attachRoot, issueId);
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return null;
+    }
+    for (const name of names) {
+      const dot = name.indexOf(".");
+      if ((dot >= 0 ? name.slice(0, dot) : name) === attachmentId) return path.join(dir, name);
+    }
     return null;
+  }
+  async readAttachment(issueId: string, attachmentId: string): Promise<Uint8Array> {
+    this.readAttachmentCalls += 1;
+    const p = this.attachmentPath(issueId, attachmentId);
+    if (!p) throw new Error(`Attachment file not found for ${issueId}/${attachmentId}`);
+    return fs.readFileSync(p);
+  }
+  async findAttachmentUri(issueId: string, attachmentId: string): Promise<vscode.Uri | null> {
+    const p = this.attachmentPath(issueId, attachmentId);
+    return p ? vscode.Uri.file(p) : null;
   }
   getSyncTombstones() {
     return {
@@ -160,10 +191,18 @@ interface Clone {
   notifications: Array<{ kind: string; message: string }>;
 }
 
-function mkClone(name: string, bare: string): Clone {
+function mkClone(
+  name: string,
+  bare: string,
+  opts: { attachments?: boolean; syncAttachments?: boolean; maxAttachmentSyncBytes?: number } = {},
+): Clone {
   const dir = mkRepo(name);
   git(dir, "remote", "add", "origin", bare);
   const store = new FakeStore();
+  if (opts.attachments) {
+    store.attachRoot = path.join(dir, ".attachments");
+    fs.mkdirSync(store.attachRoot, { recursive: true });
+  }
   const notifications: Array<{ kind: string; message: string }> = [];
   const controller = new GitSyncController(store as unknown as SyncStoreLike, () => dir, {
     remote: "origin",
@@ -174,6 +213,10 @@ function mkClone(name: string, bare: string): Clone {
     tipPollMs: 3_600_000, // effectively off — tests drive syncNow directly
     pushFollowUpMs: 3_600_000,
     startupSync: false,
+    ...(opts.syncAttachments !== undefined ? { syncAttachments: opts.syncAttachments } : {}),
+    ...(opts.maxAttachmentSyncBytes !== undefined
+      ? { maxAttachmentSyncBytes: opts.maxAttachmentSyncBytes }
+      : {}),
     notify: (kind, message) => notifications.push({ kind, message }),
   });
   return { dir, store, controller, notifications };
@@ -415,6 +458,67 @@ describe("GitSyncController: failure modes & plumbing behavior", () => {
     await new Promise((r) => setTimeout(r, 80));
     await b.controller.syncNow("manual"); // no-op cycle
     expect(git(b.dir, "rev-parse", REF).trim()).toBe(tipAfterApply);
+  });
+
+  test("attachment bytes propagate; over-cap files sync metadata only; OIDs are reused", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare, { attachments: true, maxAttachmentSyncBytes: 64 }));
+    const b = track(mkClone("cloneB", bare, { attachments: true, maxAttachmentSyncBytes: 64 }));
+
+    const smallBytes = Buffer.from([1, 2, 3, 250, 251, 252]);
+    fs.mkdirSync(path.join(a.store.attachRoot!, "DS-001"), { recursive: true });
+    fs.writeFileSync(path.join(a.store.attachRoot!, "DS-001", "att-small.png"), smallBytes);
+
+    a.store.put(
+      makeIssue({
+        guid: "g-1",
+        number: 1,
+        createdAt: T(1),
+        updatedAt: T(1),
+        attachments: [
+          { id: "att-small", name: "pic.png", mimeType: "image/png", sizeBytes: smallBytes.length, addedAt: T(1) },
+          { id: "att-big", name: "huge.bin", mimeType: "application/octet-stream", sizeBytes: 999_999, addedAt: T(1) },
+        ],
+      }),
+    );
+    a.controller.start();
+    b.controller.start();
+    await a.controller.syncNow("manual");
+    await b.controller.syncNow("manual");
+
+    // Small file restored in B, byte-identical; big file metadata-only.
+    const restored = path.join(b.store.attachRoot!, "DS-001", "att-small.png");
+    expect(fs.existsSync(restored)).toBe(true);
+    expect(Buffer.compare(fs.readFileSync(restored), smallBytes)).toBe(0);
+    expect(b.store.get("DS-001")!.attachments).toHaveLength(2);
+    expect(fs.existsSync(path.join(b.store.attachRoot!, "DS-001", "att-big.bin"))).toBe(false);
+    expect(a.store.logs.some((l) => l.includes("maxAttachmentSyncBytes"))).toBe(true);
+
+    // OID reuse: an unrelated edit + sync must not re-read the file bytes.
+    const readsBefore = a.store.readAttachmentCalls;
+    expect(readsBefore).toBeGreaterThan(0);
+    a.store.put({ ...a.store.get("DS-001")!, updatedAt: T(5), title: "unrelated edit" });
+    await a.controller.syncNow("manual");
+    expect(a.store.readAttachmentCalls).toBe(readsBefore);
+  });
+
+  test("syncAttachments: false keeps the ref tree free of attachment blobs", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare, { attachments: true, syncAttachments: false }));
+    fs.mkdirSync(path.join(a.store.attachRoot!, "DS-001"), { recursive: true });
+    fs.writeFileSync(path.join(a.store.attachRoot!, "DS-001", "att-1.png"), Buffer.from([9]));
+    a.store.put(
+      makeIssue({
+        guid: "g-1",
+        number: 1,
+        attachments: [{ id: "att-1", name: "p.png", mimeType: "image/png", sizeBytes: 1, addedAt: T(1) }],
+      }),
+    );
+    a.controller.start();
+    await a.controller.syncNow("manual");
+    const paths = git(a.dir, "ls-tree", "-r", "--name-only", REF);
+    expect(paths).toContain("tickets/g-1.json");
+    expect(paths).not.toContain("attachments/");
   });
 
   test("no-op cycles do not grow history", async () => {
