@@ -116,6 +116,64 @@ Two clones that filed tickets independently will collide on `DS-NNN` numbers: th
 
 Enabling sync also fixes same-machine clobbering: two VSCode windows on one workspace converge within ~15 seconds instead of overwriting each other.
 
+<details>
+<summary><strong>How the sync mechanism works</strong> (click to expand)</summary>
+
+### Where the data lives
+
+Your ticket board's source of truth stays the local SQLite DB (`<storagePath>/dostuff.db`). Sync adds a second representation: every ticket serialized as one canonical-JSON blob inside a git **tree**, committed under the hidden ref `refs/dostuff/state`. The tree looks like:
+
+```
+meta.json                        { "formatVersion": 1 }
+tickets/<guid>.json              one ticket per blob, keyed by a stable guid
+tombstones/<guid>.json           deletion witnesses (which ticket died, when)
+attachments/<guid>/<attId>       raw attachment bytes (optional, capped)
+```
+
+Because it's a ref — not files in your worktree — `git status` stays clean, branches and PRs never see it, and collaborators who don't enable sync never notice it exists. Fetches land in a second hidden ref (`refs/dostuff/remote`) that's deliberately kept out of `refs/remotes/` so branch pickers don't show it.
+
+### Identity: guid vs DS-NNN
+
+`DS-NNN` numbers are minted locally, so two clones will mint the same number for different tickets. Sync therefore gives every ticket a `guid` — random for new tickets, *derived deterministically* from `id + createdAt` for tickets that predate sync. Derivation matters: a ticket you copied between machines via JSON export/import derives the **same** guid on both sides, so the first sync merges it instead of duplicating it. The wire format stores ticket links by target guid, which is why renumbering never breaks links.
+
+### The sync cycle
+
+**Outbound** — every local edit already funnels through one store chokepoint, which stamps the ticket's `updatedAt` (and per-task stamps) and records tombstones for anything deleted. About 2 seconds after your last edit, the controller serializes the board, merges it with whatever the local ref tip already holds, and commits — a compare-and-swap ref update, retried with a re-merge if another window won the race. This works fully offline.
+
+**Inbound** — on a timer (`dostuff.sync.intervalMinutes`), on demand, and at startup: fetch the remote ref, then decide with two ancestry checks:
+
+1. Remote is behind → nothing to apply; just push.
+2. Remote is ahead → fast-forward the local ref and apply its state. No new commit.
+3. Histories diverged → **merge in JavaScript, never as a git content merge**: compute the merged state, write it as a new tree, commit it with both tips as parents, apply, push.
+
+A cheap 15-second `rev-parse` poll also watches the local ref tip, which is how two VSCode windows on the same clone converge without any network.
+
+### How the merge decides
+
+The merge is a pure function with three properties — commutative, associative, idempotent — which means any two replicas that have seen the same edits compute **byte-identical** state, no matter the order they synced in. No merge base needed. Rules:
+
+- **Ticket vs ticket** — last-writer-wins on `(updatedAt, content-hash)`. The hash breaks exact-timestamp ties the same way on every machine. The winner supplies title/description/status/tags/links/pendingClose wholesale; `createdAt` takes the min, `updatedAt` the max (never "now" — a merge must not look newer than its inputs).
+- **Tasks** — merged per element. Each task carries its own `updatedAt`, and deletions leave per-task tombstones, so "you toggled a task done while I deleted it" resolves to whichever happened later, instead of the deleted task silently resurrecting.
+- **History and record** — pure union. These are append-only logs; nothing ever deletes an entry, so merging is just dedup + sort.
+- **Deletes** — a deleted ticket leaves a tombstone. A tombstone kills the ticket only if the delete is *newer* than the ticket's last edit; otherwise the edit wins and the tombstone is discarded (so it can't re-kill later). Tombstones expire after 90 days — a replica offline longer than that can resurrect a deleted ticket, which is the standard trade for not keeping tombstones forever.
+- **Numbers** — after merging, any `DS-NNN` claimed by two guids is resolved deterministically: oldest `createdAt` keeps it, the loser gets the next free number, and both machines compute the identical assignment independently.
+
+### Attachments
+
+Attachment bytes ride the same tree, keyed by guid (immune to renumbering). Files over `dostuff.sync.maxAttachmentSyncBytes` (default 5 MiB) sync metadata only. Blobs already committed are reused by object id — commits cost O(changed bytes), not O(total attachments). On the receiving side only *missing* files are restored; nothing local is ever overwritten.
+
+### Failure behavior
+
+| Situation | What happens |
+| --- | --- |
+| Offline / push fails | Local commits keep landing on the ref; status shows `pendingPush`; retried next sync. |
+| Someone pushed first | Push rejects (no force, ever) → fetch → re-merge → retry, a few times, then `pendingPush`. |
+| No remote configured | Local-only mode: ref history + same-machine convergence still work. |
+| Not a git repo / no git | Sync goes inert; the extension behaves exactly as with sync off. |
+| Newer wire format from a future build | Refuses to merge rather than corrupt; upgrade to sync. |
+
+</details>
+
 ## Using the MCP server
 
 DoStuff runs an HTTP MCP server on `127.0.0.1:<port>/mcp`. Each VSCode window binds its **own** port and writes a registry entry so agents can discover which port serves which workspace — no port collision with multiple windows open. The server is **disabled by default** — enable it with **DoStuff: Toggle MCP Server** or by setting `dostuff.mcp.enabled: true`.
