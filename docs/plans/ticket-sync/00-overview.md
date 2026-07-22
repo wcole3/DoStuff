@@ -2,7 +2,7 @@
 
 > Plan series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · [03-git-plumbing](03-git-plumbing.md) · [04-controller-wiring](04-controller-wiring.md) · [05-attachments](05-attachments.md) · [06-testing-and-docs](06-testing-and-docs.md) · [07-workflow-prompt](07-workflow-prompt.md)
 >
-> Status: **in progress** (revised 2026-07-22 against commit `d0efe31`, "Lower restrictions on agents interacting with tickets"). Each doc is self-contained enough to hand to a fresh implementation session. Line numbers reference the tree at `d0efe31`; re-verify before editing.
+> Status: **implemented** (phases 0–6 landed 2026-07-22; plan revised the same day against commit `d0efe31`, "Lower restrictions on agents interacting with tickets"). These docs remain the design record — the merge rules, gating language, and accepted risks here are authoritative. Line numbers reference the tree at `d0efe31`; re-verify before editing.
 
 ## Problem statement
 

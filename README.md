@@ -98,7 +98,23 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | `dostuff.mcp.enabled` | boolean | `false` | Run an in-process MCP server that exposes the active ticket queue to local agents. |
 | `dostuff.mcp.port` | number | `0` | Localhost port for this workspace's MCP server. `0` lets the OS pick an ephemeral port each session. Set a fixed value to keep `mcp.json` URLs stable. Easiest set: **DoStuff: Pin MCP Port to Workspace**. Window-scoped. |
 | `dostuff.mcp.workspaceOverride` | string | `""` | Absolute path to advertise in the multi-workspace registry. Leave blank to use the first workspace folder. Window-scoped. |
-| `dostuff.mcp.instructions` | string | (built-in workflow prompt) | System-level workflow prompt served alongside every ticket. Leave blank to use the default. User-level only. |
+| `dostuff.mcp.instructions` | string | (built-in workflow prompt) | System-level workflow prompt served as MCP initialize instructions and at `dostuff://instructions/workflow`. Leave blank to use the default. User-level only. |
+| `dostuff.sync.enabled` | boolean | `false` | Sync the ticket board across clones through a hidden git ref. Off = exactly current single-writer behavior. Window-scoped. |
+| `dostuff.sync.remote` | string | `origin` | Git remote used to fetch/push the sync ref. |
+| `dostuff.sync.ref` | string | `refs/dostuff/state` | Full ref name the ticket state is stored under (must start with `refs/`). |
+| `dostuff.sync.intervalMinutes` | number | `5` | Minutes between automatic network syncs. `0` = manual network sync only (local ref commits still happen). |
+| `dostuff.sync.syncAttachments` | boolean | `true` | Sync attachment bytes through the ref tree (metadata always syncs). |
+| `dostuff.sync.maxAttachmentSyncBytes` | number | `5242880` | Per-file cap for attachment byte sync. Larger files sync metadata only. |
+
+## Sharing tickets across clones (git sync)
+
+Share your ticket board across clones via git — no server. Tickets sync through a hidden git ref (`refs/dostuff/state`) that never touches your worktree, branches, or PRs: enable `dostuff.sync.enabled` (or run **DoStuff: Toggle Git Ticket Sync**), and everyone pushes/pulls tickets over the remote you already use. Offline-first — local edits always commit to the ref; pushes retry on the next sync. **DoStuff: Sync Tickets Now** forces a cycle; the `$(sync)` status-bar item shows state and doubles as the button.
+
+How conflicts resolve: state-level last-writer-wins on a per-ticket `updatedAt` (with a deterministic tiebreak, so replicas never diverge), per-task/attachment LWW for concurrent delete-vs-edit, and append-only union for history/records. Clock skew between machines biases who wins a concurrent edit but never causes divergence. Deletes propagate via tombstones (kept 90 days).
+
+Two clones that filed tickets independently will collide on `DS-NNN` numbers: the first sync renumbers deterministically (oldest ticket keeps its number) and both sides toast the rename list. **Agent note:** after such a merge, a `DS-NNN` handle an agent memorized mid-session can change — agents recover via `list_issues` / `get_ticket` by title. Sync is otherwise invisible to MCP agents; all write boundaries hold unchanged.
+
+Enabling sync also fixes same-machine clobbering: two VSCode windows on one workspace converge within ~15 seconds instead of overwriting each other.
 
 ## Using the MCP server
 
