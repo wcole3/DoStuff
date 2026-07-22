@@ -20,8 +20,10 @@
 //     update_ticket_description edit the description of any non-terminal ticket
 //     update_ticket_progress    toggle task[].done and append a record entry
 //     update_ticket_draft       reshape a Thinking draft's tags/links/tasks
-//     request_ticket_close      ask a human to close a ticket (sets pendingClose;
-//                               a human approves/denies in the DoStuff UI)
+//     request_ticket_close      ask a human to close an OBE ticket (sets
+//                               pendingClose target "Closed"; human approves/denies)
+//     request_ticket_complete   ask a human to accept finished work (sets
+//                               pendingClose target "Complete"; Verification-only)
 //
 // Constraints enforced by the server (not just the schema):
 //   - Tickets in Complete or Closed are never returned by the read APIs.
@@ -39,8 +41,10 @@
 //   - update_ticket_draft can replace tags/links/tasks, but ONLY while the
 //     ticket is in Thinking (untriaged). Title/priority/type/verifyCriteria
 //     remain UI-only (description is editable via update_ticket_description).
-//   - request_ticket_close never changes status itself; it flags pendingClose,
-//     and a human's approval in the UI is what moves the ticket to Closed.
+//   - request_ticket_close / request_ticket_complete never change status
+//     themselves; they flag pendingClose (target "Closed" = OBE won't-do,
+//     target "Complete" = finished work, Verification-only), and a human's
+//     approval in the UI is what moves the ticket to the target state.
 
 import * as http from "http";
 import type { AddressInfo } from "node:net";
@@ -166,8 +170,9 @@ const DESCRIPTION_INPUT = {
   note: z.string().max(2_000).optional(),
 };
 
-// Request a human close a ticket. Sets pendingClose; the actual Close is a
-// human action in the DoStuff UI. Allowed on any non-terminal ticket.
+// Shared input for the two terminal-request tools (request_ticket_close /
+// request_ticket_complete). Both set pendingClose with a target; the actual
+// state change is a human action in the DoStuff UI.
 const CLOSE_REQUEST_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
   note: z.string().max(2_000).optional(),
@@ -820,16 +825,67 @@ export async function runUpdateTicketDescription(
 }
 
 /**
- * Request that a human close a ticket. This does NOT change status — it flags
- * `pendingClose` so the ticket surfaces for human approval in the DoStuff UI,
- * where a human approves (→ Closed) or denies (clears the flag).
+ * Shared core of the two terminal-request tools. Neither changes status — they
+ * flag `pendingClose` (with a `target`) so the ticket surfaces for human
+ * approval in the DoStuff UI, where a human approves (status → target) or
+ * denies (clears the flag). The two flows are deliberately distinct so a
+ * ticket's history records *why* it left the board:
+ * - target "Closed"   → OBE / no longer needed ("won't do").
+ * - target "Complete" → work finished, awaiting acceptance.
  *
- * Returns `{ id, pendingClose: true, message }` on success.
+ * Idempotent per target: re-requesting with the same target returns the same
+ * "awaiting approval" result without a second record entry. A request with the
+ * *other* target replaces the flag and appends a record entry — the switch is
+ * auditable.
+ */
+async function runRequestTerminal(
+  store: IssueStore,
+  issue: Issue,
+  target: "Closed" | "Complete",
+  note: string | undefined,
+): Promise<ToolResult> {
+  const label = target === "Complete" ? "Completion" : "Close";
+  const message =
+    `${label} requested for ${issue.id}. A human must approve it in DoStuff. ` +
+    `Poll get_ticket: the ticket becomes ${target} on approval, or the request clears on denial.`;
+
+  const existingTarget = issue.pendingClose ? (issue.pendingClose.target ?? "Closed") : null;
+  if (existingTarget === target) {
+    return ToolResultOk(
+      JSON.stringify(
+        { workspace: getWorkspaceContext(), id: issue.id, pendingClose: true, target, message: `Already pending. ${message}` },
+        null,
+        2,
+      ),
+    );
+  }
+
+  const now = new Date().toISOString();
+  const switched = existingTarget !== null;
+  const recordText = switched
+    ? `${label} requested via MCP, replacing the pending ${existingTarget === "Complete" ? "completion" : "close"} request (awaiting human approval)${note ? `: ${note}` : ""}`
+    : `${label} requested via MCP (awaiting human approval)${note ? `: ${note}` : ""}`;
+  const next: Issue = {
+    ...issue,
+    pendingClose: { by: "agent", at: now, target, ...(note ? { note } : {}) },
+    record: [...issue.record, { at: now, author: "agent", text: recordText }],
+  };
+  await store.upsert(next);
+  return ToolResultOk(
+    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id, pendingClose: true, target, message }, null, 2),
+  );
+}
+
+/**
+ * Request that a human close a ticket as OBE (overtaken by events / no longer
+ * needed). Approval moves it to `Closed` — the "won't do" state. For finished
+ * work, use `request_ticket_complete` instead; the two are distinct so ticket
+ * history distinguishes "dropped" from "done".
+ *
+ * Returns `{ id, pendingClose: true, target: "Closed", message }` on success.
  *
  * - Allowed on any non-terminal ticket (Thinking / Planned / Working /
  *   Verification). Complete and Closed are rejected (already terminal).
- * - Idempotent: re-requesting a ticket that already has a pending close returns
- *   the same "awaiting approval" result without appending a second record entry.
  */
 export async function runRequestTicketClose(
   store: IssueStore,
@@ -847,41 +903,42 @@ export async function runRequestTicketClose(
       `Ticket ${issue.id} is in "${issue.status}" and is already terminal; there is nothing to close.`,
     );
   }
+  return runRequestTerminal(store, issue, "Closed", args.note);
+}
 
-  const message =
-    `Close requested for ${issue.id}. A human must approve it in DoStuff before it is closed. ` +
-    `Poll get_ticket: the ticket becomes Closed on approval, or the request clears on denial.`;
+/**
+ * Request that a human accept a ticket's finished work. Approval moves it to
+ * `Complete` (stamping `resolvedAt`). Verification-only: move the ticket to
+ * "Verification" first — completion is the outcome of review, and the gate
+ * keeps done-work flowing through that lane. For tickets that are OBE / no
+ * longer needed, use `request_ticket_close` instead.
+ *
+ * Returns `{ id, pendingClose: true, target: "Complete", message }` on success.
+ */
+export async function runRequestTicketComplete(
+  store: IssueStore,
+  args: RequestCloseInput,
+): Promise<ToolResult> {
+  const parsed = CloseRequestSchema.safeParse(args);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for request_ticket_complete: ${parsed.error.message}`);
+  args = parsed.data;
 
-  // Idempotent: an existing pending request is left as-is (no duplicate record).
-  if (issue.pendingClose) {
-    return ToolResultOk(
-      JSON.stringify(
-        { workspace: getWorkspaceContext(), id: issue.id, pendingClose: true, message: `Already pending. ${message}` },
-        null,
-        2,
-      ),
+  const issue = store.get(args.id);
+  if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
+
+  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
+    return ToolResultErr(
+      `Ticket ${issue.id} is in "${issue.status}" and is already terminal; there is nothing to complete.`,
     );
   }
-
-  const now = new Date().toISOString();
-  const next: Issue = {
-    ...issue,
-    pendingClose: { by: "agent", at: now, ...(args.note ? { note: args.note } : {}) },
-    record: [
-      ...issue.record,
-      {
-        at: now,
-        author: "agent",
-        text: args.note
-          ? `Close requested via MCP (awaiting human approval): ${args.note}`
-          : "Close requested via MCP (awaiting human approval)",
-      },
-    ],
-  };
-  await store.upsert(next);
-  return ToolResultOk(
-    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id, pendingClose: true, message }, null, 2),
-  );
+  if (issue.status !== "Verification") {
+    return ToolResultErr(
+      `Ticket ${issue.id} is in "${issue.status}". Completion requests are only allowed from ` +
+        `"Verification" — move it there with update_ticket_status when the work is ready for review. ` +
+        `(For a ticket that is no longer needed, use request_ticket_close instead.)`,
+    );
+  }
+  return runRequestTerminal(store, issue, "Complete", args.note);
 }
 
 // ----- Server lifecycle ------------------------------------------------------
@@ -1451,15 +1508,33 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
   mcp.registerTool(
     "request_ticket_close",
     {
-      title: "Request ticket close",
+      title: "Request ticket close (OBE)",
       description:
-        "Ask a human to close a ticket you believe is done or no longer needed. This does " +
-        "NOT close it — it flags the ticket for human approval in DoStuff, where a human " +
-        "approves (moving it to Closed) or denies. Allowed on any non-terminal ticket. " +
-        "Poll get_ticket to see the outcome.",
+        "Ask a human to close a ticket that is OBE — overtaken by events / no longer " +
+        "needed. This does NOT close it — it flags the ticket for human approval in " +
+        "DoStuff, where a human approves (moving it to Closed, the \"won't do\" state) or " +
+        "denies. Allowed on any non-terminal ticket. For FINISHED work use " +
+        "request_ticket_complete instead — the two are distinct so history records why a " +
+        "ticket left the board. Poll get_ticket to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
     async (args) => runRequestTicketClose(store, args as RequestCloseInput),
+  );
+
+  mcp.registerTool(
+    "request_ticket_complete",
+    {
+      title: "Request ticket completion",
+      description:
+        "Ask a human to accept a ticket's finished work. This does NOT change status — " +
+        "it flags the ticket for human approval in DoStuff, where a human approves " +
+        "(moving it to Complete) or denies. Only allowed while the ticket is in " +
+        "Verification — move it there with update_ticket_status when the work is ready " +
+        "for review. For a ticket that is no longer needed, use request_ticket_close " +
+        "instead. Poll get_ticket to see the outcome.",
+      inputSchema: CLOSE_REQUEST_INPUT,
+    },
+    async (args) => runRequestTicketComplete(store, args as RequestCloseInput),
   );
 }
 

@@ -281,7 +281,11 @@ export function IssueDetail({ issue }: IssueDetailProps) {
         <div className="ds-d-close-req" role="alert">
           <div className="ds-d-close-req-head">
             <Icon name="clock" size={12} />
-            <span>An agent requested to close this ticket.</span>
+            <span>
+              {issue.pendingClose.target === "Complete"
+                ? "An agent reports this ticket's work as finished."
+                : "An agent requested to close this ticket (no longer needed)."}
+            </span>
           </div>
           {issue.pendingClose.note && (
             <div className="ds-d-close-req-note">“{issue.pendingClose.note}”</div>
@@ -291,7 +295,7 @@ export function IssueDetail({ issue }: IssueDetailProps) {
               className="ds-d-close-req-approve"
               onClick={() => postResolveClose(issue.id, "approve")}
             >
-              Approve &amp; close
+              {issue.pendingClose.target === "Complete" ? "Accept & complete" : "Approve & close"}
             </button>
             <button
               className="ds-d-close-req-deny"

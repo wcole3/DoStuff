@@ -187,15 +187,17 @@ export function mergeIssueUpdate(
 
 /**
  * Pure core of the host `resolveClose` handler (exported for tests). Given a
- * ticket with a pending agent close request, returns the next Issue for the
- * human's verdict — approve moves it to `Closed` and clears the flag; deny
- * clears the flag and leaves status unchanged. Returns `null` when there is
- * nothing pending to resolve.
+ * ticket with a pending agent request, returns the next Issue for the human's
+ * verdict — approve moves it to the request's `target` (`"Closed"` when
+ * absent — the legacy OBE flow; `"Complete"` for the acceptance flow) and
+ * clears the flag; deny clears the flag and leaves status unchanged. Returns
+ * `null` when there is nothing pending to resolve.
  *
  * `record`/`statusHistory` are appended here (author "user"), which is exactly
  * why this can't route through {@link mergeIssueUpdate} — those fields are
- * server-derived and never taken from an incoming payload. `resolvedAt` is left
- * untouched: it tracks acceptance (Complete), and Closed is "won't do".
+ * server-derived and never taken from an incoming payload. `resolvedAt` is
+ * stamped only on the Complete path: it tracks acceptance, and Closed is
+ * "won't do".
  */
 export function resolveCloseRequest(
   prior: Issue,
@@ -204,19 +206,22 @@ export function resolveCloseRequest(
 ): Issue | null {
   if (!prior.pendingClose) return null;
   const ts = now();
+  const target: Status = prior.pendingClose.target ?? "Closed";
+  const label = target === "Complete" ? "Completion" : "Close";
   if (verdict === "approve") {
     return {
       ...prior,
-      status: "Closed",
+      status: target,
+      ...(target === "Complete" ? { resolvedAt: ts } : {}),
       pendingClose: null,
-      statusHistory: [...prior.statusHistory, { status: "Closed", at: ts, by: "user" }],
-      record: [...prior.record, { at: ts, author: "user", text: "Close request approved" }],
+      statusHistory: [...prior.statusHistory, { status: target, at: ts, by: "user" }],
+      record: [...prior.record, { at: ts, author: "user", text: `${label} request approved` }],
     };
   }
   return {
     ...prior,
     pendingClose: null,
-    record: [...prior.record, { at: ts, author: "user", text: "Close request denied" }],
+    record: [...prior.record, { at: ts, author: "user", text: `${label} request denied` }],
   };
 }
 

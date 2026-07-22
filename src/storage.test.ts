@@ -524,6 +524,48 @@ describe("IssueStore (SQLite-backed branch)", () => {
     c.dispose();
   });
 
+  test("pendingClose.target round-trips; a pre-target row loads with target absent (Closed meaning)", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(
+      makeIssue({
+        id: "DS-090",
+        number: 90,
+        status: "Verification",
+        pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+      }),
+    );
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-090")?.pendingClose).toEqual({
+      by: "agent",
+      at: "2026-05-18T00:00:00.000Z",
+      target: "Complete",
+    });
+    // Simulate a pre-target build's row: NULL the column directly, re-open.
+    // Loader must degrade to the legacy meaning — target absent, not lost row.
+    // (Direct SQL through a fresh store's db is not exposed; emulate by
+    // writing a target-less pendingClose, which persists NULL.)
+    await b.upsert({
+      ...b.get("DS-090")!,
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
+    });
+    b.dispose();
+
+    const c = makeSqlStore(ctx);
+    await c.init();
+    const pc = c.get("DS-090")?.pendingClose;
+    expect(pc).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z" });
+    expect(pc && "target" in pc).toBe(false);
+    c.dispose();
+  });
+
   test("migrates pre-existing JSON tickets into the DB and moves them to legacy-json-backup/", async () => {
     const goodIssue = makeIssue({
       id: "DS-001",
@@ -1335,6 +1377,18 @@ describe("sync schema groundwork", () => {
       db.run(
         "INSERT INTO issue_tasks (issue_id, task_id, position, text, done) VALUES ('DS-001', 't1', 0, 'old task', 1)",
       );
+      // Pre-target shape of issue_pending_close (as it stood at d0efe31) —
+      // the guarded ALTER must add `target` and the row must load with the
+      // legacy Closed meaning.
+      db.run(`CREATE TABLE issue_pending_close (
+        issue_id TEXT PRIMARY KEY REFERENCES issues(id) ON DELETE CASCADE,
+        by       TEXT NOT NULL,
+        note     TEXT,
+        at       TEXT NOT NULL
+      )`);
+      db.run(
+        "INSERT INTO issue_pending_close (issue_id, by, note, at) VALUES ('DS-001', 'agent', NULL, '2025-02-02T00:00:00.000Z')",
+      );
       db.run("INSERT INTO schema_meta (key, value) VALUES ('version', '1')");
     });
     const { handles: h } = installVirtualFs({ "/ws/.vscode/dostuff/dostuff.db": bytes });
@@ -1349,6 +1403,9 @@ describe("sync schema groundwork", () => {
     expect(loaded?.guid).toBe(deriveGuid("DS-001", "2025-02-01T00:00:00.000Z"));
     expect(loaded?.updatedAt).toBe("2025-02-01T00:00:00.000Z");
     expect(loaded?.tasks).toEqual([{ id: "t1", text: "old task", done: true }]);
+    // Pre-target pendingClose row: loads, target absent (= legacy Closed).
+    expect(loaded?.pendingClose).toEqual({ by: "agent", at: "2025-02-02T00:00:00.000Z" });
+    expect(loaded?.pendingClose && "target" in loaded.pendingClose).toBe(false);
     // sync_tombstones was created by SCHEMA_DDL — readable and empty.
     expect(store.getSyncTombstones()).toEqual({ tickets: [], elements: [] });
     store.dispose();

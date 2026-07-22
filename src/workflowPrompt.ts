@@ -38,9 +38,13 @@ Rules:
   6. Reshape a ticket's tags, links, or task list with \`update_ticket_draft\` —
      Thinking only. Once triaged, scope locks; demote the ticket back to Thinking
      first if its scope genuinely needs reshaping.
-  7. When a ticket is done or no longer needed, call \`request_ticket_close\`. It
-     does not close the ticket — a human approves (→ Closed) or denies in DoStuff.
-     Poll \`get_ticket\` for the outcome.
+  7. When the work is finished, move the ticket to "Verification" and call
+     \`request_ticket_complete\`. It does not change status — a human accepts
+     (→ Complete) or denies in DoStuff. Poll \`get_ticket\` for the outcome.
+  8. When a ticket is OBE — no longer needed, superseded, or won't be done —
+     call \`request_ticket_close\` instead. Same approval flow, but approval
+     moves it to Closed ("won't do"). Keep the two distinct: close is for
+     dropped work, complete is for finished work.
 
 You may NOT modify a ticket's title, priority, type, or verify criteria via
 MCP. If those are wrong, file a new ticket.`;

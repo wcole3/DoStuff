@@ -150,9 +150,16 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
             {issue.pendingClose && (
               <>
                 <span className="ds-row-dot">·</span>
-                <span className="ds-row-pending-close" title="An agent requested to close this ticket">
+                <span
+                  className="ds-row-pending-close"
+                  title={
+                    issue.pendingClose.target === "Complete"
+                      ? "An agent reports this ticket's work as finished (awaiting acceptance)"
+                      : "An agent requested to close this ticket (no longer needed)"
+                  }
+                >
                   <Icon name="clock" size={10} />
-                  awaiting close
+                  {issue.pendingClose.target === "Complete" ? "awaiting acceptance" : "awaiting close"}
                 </span>
               </>
             )}
@@ -342,7 +349,7 @@ export function Sidebar() {
               marginLeft: 8,
               cursor: "pointer",
             }}
-            title="Show only tickets an agent has asked to close"
+            title="Show only tickets with a pending agent request (close or completion)"
           >
             <input
               type="checkbox"
@@ -350,7 +357,7 @@ export function Sidebar() {
               onChange={(e) => setPendingCloseOnly(e.target.checked)}
               style={{ margin: 0 }}
             />
-            Awaiting close ({pendingCloseCount})
+            Awaiting decision ({pendingCloseCount})
           </label>
         )}
       </div>

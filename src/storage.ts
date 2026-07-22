@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS issue_pending_close (
   issue_id TEXT PRIMARY KEY REFERENCES issues(id) ON DELETE CASCADE,
   by       TEXT NOT NULL,
   note     TEXT,
-  at       TEXT NOT NULL
+  at       TEXT NOT NULL,
+  target   TEXT
 );
 
 -- Deletion witnesses for git-native sync (docs/plans/ticket-sync/01 §6).
@@ -759,6 +760,7 @@ export class IssueStore {
       "ALTER TABLE issues ADD COLUMN guid TEXT",
       "ALTER TABLE issues ADD COLUMN updated_at TEXT",
       "ALTER TABLE issue_tasks ADD COLUMN updated_at TEXT",
+      "ALTER TABLE issue_pending_close ADD COLUMN target TEXT",
     ]) {
       try {
         db.exec(ddl);
@@ -975,13 +977,21 @@ export class IssueStore {
     // 0-or-1 relation, so a plain Map rather than groupBy. A main-era DB has no
     // such table row for any issue → the map is empty → all pendingClose null.
     const pendingCloseByIssue = new Map<string, PendingClose>();
-    for (const r of selectAll<{ issue_id: string; by: string; note: string | null; at: string }>(
-      db,
-      "SELECT * FROM issue_pending_close",
-    )) {
-      const pc = coercePendingClose(
-        r.note !== null ? { by: r.by, at: r.at, note: r.note } : { by: r.by, at: r.at },
-      );
+    for (const r of selectAll<{
+      issue_id: string;
+      by: string;
+      note: string | null;
+      at: string;
+      target: string | null;
+    }>(db, "SELECT * FROM issue_pending_close")) {
+      const pc = coercePendingClose({
+        by: r.by,
+        at: r.at,
+        ...(r.note !== null ? { note: r.note } : {}),
+        // NULL (pre-target rows / older-build writes) → coercer drops the
+        // field → legacy meaning "Closed".
+        ...(r.target !== null ? { target: r.target } : {}),
+      });
       if (pc) pendingCloseByIssue.set(r.issue_id, pc);
     }
 
@@ -1131,8 +1141,14 @@ export class IssueStore {
     db.run("DELETE FROM issue_pending_close WHERE issue_id = ?", [issue.id]);
     if (issue.pendingClose) {
       db.run(
-        "INSERT INTO issue_pending_close (issue_id, by, note, at) VALUES (?, ?, ?, ?)",
-        [issue.id, issue.pendingClose.by, issue.pendingClose.note ?? null, issue.pendingClose.at],
+        "INSERT INTO issue_pending_close (issue_id, by, note, at, target) VALUES (?, ?, ?, ?, ?)",
+        [
+          issue.id,
+          issue.pendingClose.by,
+          issue.pendingClose.note ?? null,
+          issue.pendingClose.at,
+          issue.pendingClose.target ?? null,
+        ],
       );
     }
   }

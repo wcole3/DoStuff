@@ -252,6 +252,25 @@ describe("coercePendingClose", () => {
     expect(coercePendingClose({ by: "agent", at: ISO, note: 5 })).toEqual({ by: "agent", at: ISO });
   });
 
+  test("keeps a valid target (both flavors)", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, target: "Closed" })).toEqual({
+      by: "agent",
+      at: ISO,
+      target: "Closed",
+    });
+    expect(coercePendingClose({ by: "agent", at: ISO, target: "Complete" })).toEqual({
+      by: "agent",
+      at: ISO,
+      target: "Complete",
+    });
+  });
+
+  test("drops an invalid target but keeps the request (degrades to legacy Closed meaning)", () => {
+    const out = coercePendingClose({ by: "agent", at: ISO, target: "Banana" });
+    expect(out).toEqual({ by: "agent", at: ISO });
+    expect(out && "target" in out).toBe(false);
+  });
+
   test("ignores extra keys", () => {
     expect(coercePendingClose({ by: "agent", at: ISO, extra: "x" })).toEqual({ by: "agent", at: ISO });
   });

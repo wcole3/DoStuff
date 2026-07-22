@@ -286,7 +286,14 @@ const BoardCard = memo(function BoardCard({
           </span>
           <span className="bd-card-spacer" />
           {issue.pendingClose && (
-            <span className="bd-card-pending-close" title="An agent requested to close this ticket">
+            <span
+              className="bd-card-pending-close"
+              title={
+                issue.pendingClose.target === "Complete"
+                  ? "An agent reports this ticket's work as finished (awaiting acceptance)"
+                  : "An agent requested to close this ticket (no longer needed)"
+              }
+            >
               <Icon name="clock" size={11} />
             </span>
           )}

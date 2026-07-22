@@ -26,6 +26,7 @@ import {
   runUpdateTicketDraft,
   runUpdateTicketDescription,
   runRequestTicketClose,
+  runRequestTicketComplete,
   registerMcpTools,
   getWorkspaceContext,
   DoStuffMcpServer,
@@ -1484,6 +1485,67 @@ describe("request_ticket_close", () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("not found");
   });
+
+  test("stamps target 'Closed' so history distinguishes OBE from finished work", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", record: [] })]);
+    await runRequestTicketClose(store, { id: "DS-001" });
+    expect(store.get("DS-001")!.pendingClose?.target).toBe("Closed");
+  });
+});
+
+describe("request_ticket_complete", () => {
+  test("flags pendingClose with target 'Complete' on a Verification ticket, status unchanged", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification", record: [] })]);
+    const res = await runRequestTicketComplete(store, { id: "DS-001", note: "criteria met" });
+    expect(res.isError).toBeFalsy();
+    const u = store.get("DS-001")!;
+    expect(u.status).toBe("Verification");
+    expect(u.pendingClose).toMatchObject({ by: "agent", target: "Complete", note: "criteria met" });
+    expect(u.record).toHaveLength(1);
+    expect(res.content[0].text).toContain("Complete");
+    expect(res.content[0].text).toContain("get_ticket");
+  });
+
+  for (const status of ["Thinking", "Planned", "Working"] as const) {
+    test(`rejects a ${status} ticket — Verification-only, error points at the workflow`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status })]);
+      const res = await runRequestTicketComplete(store, { id: "DS-001" });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain("Verification");
+      expect(res.content[0].text).toContain("update_ticket_status");
+      expect(store.get("DS-001")!.pendingClose).toBeNull();
+    });
+  }
+
+  for (const status of ["Complete", "Closed"] as const) {
+    test(`rejects a ${status} ticket (already terminal)`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status })]);
+      const res = await runRequestTicketComplete(store, { id: "DS-001" });
+      expect(res.isError).toBe(true);
+    });
+  }
+
+  test("is idempotent per target: repeat completion request adds no record", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification", record: [] })]);
+    await runRequestTicketComplete(store, { id: "DS-001" });
+    const res = await runRequestTicketComplete(store, { id: "DS-001" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain("Already pending");
+    expect(store.get("DS-001")!.record).toHaveLength(1);
+  });
+
+  test("a completion request replaces a pending close request (auditable switch)", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification", record: [] })]);
+    await runRequestTicketClose(store, { id: "DS-001" });
+    expect(store.get("DS-001")!.pendingClose?.target).toBe("Closed");
+
+    const res = await runRequestTicketComplete(store, { id: "DS-001" });
+    expect(res.isError).toBeFalsy();
+    const u = store.get("DS-001")!;
+    expect(u.pendingClose?.target).toBe("Complete");
+    expect(u.record).toHaveLength(2);
+    expect(u.record[1]!.text).toContain("replacing the pending close request");
+  });
 });
 
 // ----- HTTP integration tests -----------------------------------------------
@@ -2062,6 +2124,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       "get_ticket",
       "list_issues",
       "request_ticket_close",
+      "request_ticket_complete",
       "update_ticket_description",
       "update_ticket_draft",
       "update_ticket_progress",
@@ -2084,6 +2147,7 @@ describe("DoStuffMcpServer HTTP (live)", () => {
         "get_ticket",
         "list_issues",
         "request_ticket_close",
+        "request_ticket_complete",
         "update_ticket_description",
         "update_ticket_draft",
         "update_ticket_progress",

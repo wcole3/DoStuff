@@ -107,20 +107,32 @@ export interface TicketLink {
   kind: LinkKind;
 }
 
+/** Terminal state an agent's pending request resolves to on approval. */
+export const PENDING_CLOSE_TARGETS = ["Closed", "Complete"] as const;
+export type PendingCloseTarget = (typeof PENDING_CLOSE_TARGETS)[number];
+
 /**
- * An agent's pending request to close a ticket, awaiting a human verdict. Set
- * by the MCP `request_ticket_close` tool; cleared when a human approves (which
- * also sets status to `Closed`) or denies via the host `resolveClose` handler.
- * Additive field — legacy tickets load with `pendingClose: null`.
+ * An agent's pending request to move a ticket to a terminal state, awaiting a
+ * human verdict. Two distinct flows share this flag, distinguished by
+ * `target`:
+ * - `"Closed"` (the default when absent — legacy rows keep their meaning):
+ *   the ticket is OBE / no longer needed. Set by MCP `request_ticket_close`.
+ * - `"Complete"`: the work is done and ready for acceptance. Set by MCP
+ *   `request_ticket_complete` (Verification only).
+ * Cleared when a human approves (status → `target`) or denies via the host
+ * `resolveClose` handler. Additive field — legacy tickets load with
+ * `pendingClose: null`.
  */
 export interface PendingClose {
-  /** Who requested the close. Agents set "agent"; kept as a union for a
-   *  possible future human-initiated request flow. */
+  /** Who requested it. Agents set "agent"; kept as a union for a possible
+   *  future human-initiated request flow. */
   by: "agent";
   /** Optional rationale supplied by the requesting agent. */
   note?: string;
-  /** ISO 8601 — when the close was requested. */
+  /** ISO 8601 — when the request was filed. */
   at: string;
+  /** Terminal state on approval. Absent = "Closed" (pre-target rows). */
+  target?: PendingCloseTarget;
 }
 
 const DS_ID_RE = /^DS-\d+$/;
@@ -402,6 +414,11 @@ export function coercePendingClose(input: unknown): PendingClose | null {
   if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return null;
   const out: PendingClose = { by: "agent", at: r.at };
   if (typeof r.note === "string") out.note = r.note;
+  // Unrecognized target values are dropped, not failed: the request degrades
+  // to the legacy meaning (Closed) instead of vanishing.
+  if ((PENDING_CLOSE_TARGETS as readonly unknown[]).includes(r.target)) {
+    out.target = r.target as PendingCloseTarget;
+  }
   return out;
 }
 

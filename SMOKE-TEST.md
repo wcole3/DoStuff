@@ -7,11 +7,11 @@ sections relevant to your change; run everything before a release.
 
 ## 1. Sidebar CRUD
 
-- [ ] Activity-bar icon opens the sidebar; sample ticket visible on first run.
+- [X] Activity-bar icon opens the sidebar; sample ticket visible on first run.
 - [ ] `Ctrl+Shift+I` files a new ticket → lands in **Thinking**; appears without reload.
 - [ ] Open a ticket's detail; edit title, description, priority, type, verify criteria; changes persist after closing/reopening the detail.
 - [ ] Add/toggle/remove tasks; add/remove tags (chips render with stable colors).
-- [ ] Search filters the list; status filter chips work, including **Closed** and **Awaiting close**.
+- [ ] Search filters the list; status filter chips work, including **Closed** and **Awaiting decision**.
 - [ ] Delete a ticket → gone from every view; links pointing at it disappear.
 
 ## 2. Board: drag + lane caps + close requests
@@ -21,7 +21,8 @@ sections relevant to your change; run everything before a release.
 - [ ] Thinking-drawer: click vs. Shift+Click behavior per [docs/workflow-rules.md](docs/workflow-rules.md).
 - [ ] Fill a lane to the cap (default 6) → further drops into it are rejected with the toast; demoting one out re-opens capacity.
 - [ ] Sidebar→board cross-webview drag: dragging a sidebar card opens/focuses the board and shows the "Move to *lane*" overlay; Esc cancels.
-- [ ] A ticket with a pending agent close request shows the awaiting-close badge; **approve** moves it to Closed (vanishes from the board), **deny** clears the badge and leaves status alone.
+- [ ] A ticket with a pending agent **close** request shows the "no longer needed" badge; **Approve & close** moves it to Closed (vanishes from the board), **Deny** clears the badge and leaves status alone.
+- [ ] A ticket with a pending agent **completion** request shows the "work finished" badge with **Accept & complete**; accepting moves it to Complete (with `resolvedAt` set), denying clears the badge.
 
 ## 3. Import / export
 
@@ -35,7 +36,9 @@ Setup: enable the server (**DoStuff: Toggle MCP Server**), pin or read the port,
 - [ ] `list_issues` returns the compact index; response `workflow` field is the **one-line pointer**, not the full prompt.
 - [ ] `get_ticket` by number, `DS-id`, and title substring all resolve; Complete/Closed are refused.
 - [ ] `create_ticket` lands in **Thinking**.
-- [ ] The full loop: agent **promotes** the ticket to Planned (`update_ticket_status`), moves it to Working, **demotes** it back to Thinking, reshapes it (`update_ticket_draft`), re-promotes, edits the description (`update_ticket_description`), ticks a task + appends a record (`update_ticket_progress`), then files `request_ticket_close` → UI shows awaiting-close; approve → ticket Closed; agent's `get_ticket` for it is now refused.
+- [ ] The full loop: agent **promotes** the ticket to Planned (`update_ticket_status`), moves it to Working, **demotes** it back to Thinking, reshapes it (`update_ticket_draft`), re-promotes, edits the description (`update_ticket_description`), ticks a task + appends a record (`update_ticket_progress`), then files `request_ticket_close` → UI shows the awaiting-decision badge; approve → ticket Closed; agent's `get_ticket` for it is now refused.
+- [ ] Completion flow: agent moves a ticket to Verification, files `request_ticket_complete` → "work finished" badge; **Accept & complete** → ticket Complete with `resolvedAt`; history records "Completion request approved".
+- [ ] `request_ticket_complete` from a non-Verification lane is rejected, pointing at `update_ticket_status`; a completion request replaces a pending close request (record entry notes the switch).
 - [ ] Lane cap: with a full lane, agent promotion into it is rejected with the cap message.
 - [ ] `update_ticket_status` to Complete/Closed is rejected, pointing at `request_ticket_close`.
 

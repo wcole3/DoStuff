@@ -328,7 +328,35 @@ describe("resolveCloseRequest", () => {
     expect(next!.status).toBe("Closed");
     expect(next!.pendingClose).toBeNull();
     expect(next!.statusHistory.at(-1)).toEqual({ status: "Closed", at: NOW(), by: "user" });
-    expect(next!.record.at(-1)).toMatchObject({ author: "user" });
+    expect(next!.record.at(-1)).toMatchObject({ author: "user", text: "Close request approved" });
+    // Closed is "won't do" — never stamps acceptance.
+    expect(next!.resolvedAt).toBe(prior.resolvedAt);
+  });
+
+  test("approve with target 'Complete' moves to Complete, stamps resolvedAt, records acceptance", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      resolvedAt: null,
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = resolveCloseRequest(prior, "approve", NOW);
+    expect(next).not.toBeNull();
+    expect(next!.status).toBe("Complete");
+    expect(next!.resolvedAt).toBe(NOW());
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.statusHistory.at(-1)).toEqual({ status: "Complete", at: NOW(), by: "user" });
+    expect(next!.record.at(-1)).toMatchObject({ author: "user", text: "Completion request approved" });
+  });
+
+  test("deny of a completion request records the completion wording, status unchanged", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = resolveCloseRequest(prior, "deny", NOW);
+    expect(next!.status).toBe("Verification");
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.record.at(-1)).toMatchObject({ text: "Completion request denied" });
   });
 
   test("deny clears the flag, leaves status + history unchanged, appends a user record", () => {

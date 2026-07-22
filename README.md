@@ -77,9 +77,9 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 - New tickets always start in **Thinking** for human triage.
 - Agents may move tickets freely among the non-terminal states — promote out of Thinking, shuffle the active lanes, or demote back to Thinking — and edit the description of any non-terminal ticket.
 - Tickets move freely between Planned, Working, and Verification.
-- Only humans can move a ticket to **Complete**. Agents can *request* a close via MCP, but a human approves it in the UI before the ticket becomes **Closed**.
+- Only humans can set the terminal states, and agents signal them through **two distinct flows**: `request_ticket_complete` (from **Verification** only) says "the work is finished — please accept" and approval moves the ticket to **Complete**; `request_ticket_close` says "this is OBE / no longer needed" and approval moves it to **Closed**. Distinct on purpose — history records whether a ticket was *done* or *dropped*.
 - Active lanes (Planned, Working, Verification) are each capped — a workflow throttle. Finish or de-scope before starting more work. Or raise `dostuff.activeLaneCap`; I'm not your supervisor.
-- **Closed** is a "won't do" state. It lives only in the sidebar (no board lane/drawer), is hidden under the **All** filter, and is reachable via its dedicated filter chip. The sidebar also has an **Awaiting close** filter that surfaces tickets with a pending agent close request.
+- **Closed** is a "won't do" state. It lives only in the sidebar (no board lane/drawer), is hidden under the **All** filter, and is reachable via its dedicated filter chip. The sidebar also has an **Awaiting decision** filter that surfaces tickets with a pending agent close/completion request.
 
 ## Keyboard shortcuts
 
@@ -205,9 +205,13 @@ Rules:
   6. Reshape a ticket's tags, links, or task list with `update_ticket_draft` —
      Thinking only. Once triaged, scope locks; demote the ticket back to Thinking
      first if its scope genuinely needs reshaping.
-  7. When a ticket is done or no longer needed, call `request_ticket_close`. It
-     does not close the ticket — a human approves (→ Closed) or denies in DoStuff.
-     Poll `get_ticket` for the outcome.
+  7. When the work is finished, move the ticket to "Verification" and call
+     `request_ticket_complete`. It does not change status — a human accepts
+     (→ Complete) or denies in DoStuff. Poll `get_ticket` for the outcome.
+  8. When a ticket is OBE — no longer needed, superseded, or won't be done —
+     call `request_ticket_close` instead. Same approval flow, but approval
+     moves it to Closed ("won't do"). Keep the two distinct: close is for
+     dropped work, complete is for finished work.
 
 You may NOT modify a ticket's title, priority, type, or verify criteria via
 MCP. If those are wrong, file a new ticket.
@@ -226,7 +230,8 @@ MCP. If those are wrong, file a new ticket.
 | `update_ticket_description` | `id`, `description`, optional `note` | Replaces the ticket's description (and appends one record entry). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Only the description changes — title, priority, type, and verifyCriteria stay locked. |
 | `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 | `update_ticket_draft` | `id`, optional `tags[]`, `links[]`, `tasks[]` | Reshapes an untriaged draft's tags, links, and/or task list. **Thinking-only** — rejected once the ticket is triaged to an active lane (use the UI after that). Omit a field to leave it unchanged; pass `[]` to clear it. Unknown link targets are dropped. |
-| `request_ticket_close` | `id`, optional `note` | Flags a ticket for closure and awaits human approval — does **not** change status. A human approves (→ Closed) or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Poll `get_ticket` for the outcome. |
+| `request_ticket_close` | `id`, optional `note` | Flags a ticket as **OBE / no longer needed** and awaits human approval — does **not** change status. A human approves (→ Closed, "won't do") or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. For finished work use `request_ticket_complete` instead. Poll `get_ticket` for the outcome. |
+| `request_ticket_complete` | `id`, optional `note` | Flags a ticket's work as **finished** and awaits human acceptance — does **not** change status. A human accepts (→ Complete, stamping `resolvedAt`) or denies in the DoStuff UI. **Verification-only** — move the ticket there first. A completion request replaces a pending close request (and vice versa), recorded in the ticket history. Poll `get_ticket` for the outcome. |
 
 ### Resources
 
