@@ -30,6 +30,7 @@ import {
   getWorkspaceContext,
   DoStuffMcpServer,
   DEFAULT_WORKFLOW_PROMPT,
+  WORKFLOW_POINTER,
   type CreateTicketInput,
   type ToolResult,
 } from "./mcpServer";
@@ -553,11 +554,21 @@ describe("workspace context and workflow in tool responses", () => {
     expect(progressBody.workspace).toBeNull();
   });
 
-  test("list_issues includes workflow field equal to DEFAULT_WORKFLOW_PROMPT when instructions unset", async () => {
-    // mock getConfiguration returns defaultValue ("") for any key → readWorkflowPrompt falls through
+  test("list_issues embeds the one-line WORKFLOW_POINTER, not the full prompt", async () => {
     const store = await makeStore([]);
     const res = payload(await runListIssues(store, {})) as { workflow: string };
-    expect(res.workflow).toBe(DEFAULT_WORKFLOW_PROMPT);
+    expect(res.workflow).toBe(WORKFLOW_POINTER);
+    expect(res.workflow.length).toBeLessThan(200);
+    expect(res.workflow).not.toContain("Rules:");
+  });
+
+  test("get_ticket embeds the one-line WORKFLOW_POINTER, not the full prompt", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, title: "Pointer check", status: "Working" }),
+    ]);
+    const res = payload(await runGetTicket(store, { query: "DS-001" })) as { workflow: string };
+    expect(res.workflow).toBe(WORKFLOW_POINTER);
+    expect(res.workflow).not.toContain("Rules:");
   });
 });
 
@@ -2153,7 +2164,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     // publicView strips statusHistory + resolvedAt.
     expect("statusHistory" in payload.ticket).toBe(false);
     expect("resolvedAt" in payload.ticket).toBe(false);
-    expect(typeof payload.workflow).toBe("string");
+    // Per-response embedding is the one-line pointer, not the full prompt.
+    expect(payload.workflow).toBe(WORKFLOW_POINTER);
   });
 
   test("resource dostuff://tickets/{id} for Thinking ticket: returns the ticket", async () => {
@@ -2219,6 +2231,35 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     });
     const contents = (json.result as { contents: Array<{ text: string }> }).contents;
     expect(contents[0].text).toBe(custom);
+  });
+
+  test("initialize result carries the workflow prompt as server instructions", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test-client", version: "0.0.0" },
+    });
+    expect(json.error).toBeUndefined();
+    const result = json.result as { instructions?: string };
+    expect(result.instructions).toBe(DEFAULT_WORKFLOW_PROMPT);
+  });
+
+  test("initialize instructions honor the dostuff.mcp.instructions override", async () => {
+    const custom = "CUSTOM INITIALIZE INSTRUCTIONS";
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store, { instructions: custom }));
+
+    const json = await mcpJsonRpc(port, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test-client", version: "0.0.0" },
+    });
+    expect(json.error).toBeUndefined();
+    const result = json.result as { instructions?: string };
+    expect(result.instructions).toBe(custom);
   });
 
   test("get_ticket payload includes attachments with dostuff://attachments/<id>/<att> uris", async () => {

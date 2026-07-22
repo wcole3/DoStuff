@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-DoStuff is a VSCode extension built with Bun + esbuild. Two bundles ship from one source tree: `dist/extension.cjs` for the extension host (CommonJS, required by VSCode's loader) and `media/index.js` + `media/styles.css` for the webview UI (browser IIFE). The webview is React 18 with `react-window` v1.8.x for list virtualization. The extension also runs a loopback-only HTTP MCP server exposing the active ticket queue to coding agents — the port is OS-assigned by default (`dostuff.mcp.port`, default `0`); agents discover it via the registry at `~/.config/dostuff/instances.json` (see README "Multi-workspace agent discovery").
+DoStuff is a VSCode extension built with Bun + esbuild. Two bundles ship from one source tree: `dist/extension.cjs` for the extension host (CommonJS, required by VSCode's loader) and `media/index.js` + `media/styles.css` for the webview UI (browser IIFE). The webview is React 18 with `react-window` v1.8.x for list virtualization. The extension also runs a loopback-only HTTP MCP server exposing the active ticket queue to coding agents — the port is OS-assigned by default (`dostuff.mcp.port`, default `0`); agents discover it via the registry at `~/.config/dostuff/instances.json` (see README "Multi-workspace agent discovery"). The agent workflow prompt (`src/workflowPrompt.ts`) is served once per connection as MCP initialize `instructions` (plus the `dostuff://instructions/workflow` resource and `workflow` MCP prompt); tool responses embed only the one-line `WORKFLOW_POINTER`.
 
 ## Commands
 

@@ -75,8 +75,8 @@ import { validateLinks } from "./extension";
 
 // The default workflow prompt lives in its own small module so the extension
 // host can import it without dragging the full MCP SDK + zod into its bundle.
-export { DEFAULT_WORKFLOW_PROMPT, buildDefaultWorkflowPrompt } from "./workflowPrompt";
-import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
+export { DEFAULT_WORKFLOW_PROMPT, buildDefaultWorkflowPrompt, WORKFLOW_POINTER } from "./workflowPrompt";
+import { buildDefaultWorkflowPrompt, WORKFLOW_POINTER } from "./workflowPrompt";
 
 // ----- Tool result helpers ---------------------------------------------------
 
@@ -406,7 +406,7 @@ export async function runGetTicket(
 
   return ToolResultOk(
     JSON.stringify(
-      { workspace: getWorkspaceContext(), workflow: readWorkflowPrompt(), ticket: publicView(match, all) },
+      { workspace: getWorkspaceContext(), workflow: WORKFLOW_POINTER, ticket: publicView(match, all) },
       null,
       2,
     ),
@@ -440,7 +440,7 @@ export async function runListIssues(
     JSON.stringify(
       {
         workspace: getWorkspaceContext(),
-        workflow: readWorkflowPrompt(),
+        workflow: WORKFLOW_POINTER,
         count: issues.length,
         issues: issues.map((i) => ({
           id:       i.id,
@@ -1100,7 +1100,15 @@ export class DoStuffMcpServer implements vscode.Disposable {
 
     const mcp = new McpServer(
       { name: "dostuff", version: "1.0.0" },
-      { capabilities: { resources: {}, prompts: {}, tools: {} } },
+      {
+        capabilities: { resources: {}, prompts: {}, tools: {} },
+        // Full workflow contract, surfaced in the initialize result. Clients
+        // like Claude Code inject it into agent context automatically; tool
+        // responses only carry the one-line WORKFLOW_POINTER. Per-request
+        // server construction means the live lane cap and any
+        // `dostuff.mcp.instructions` override are picked up without restart.
+        instructions: readWorkflowPrompt(),
+      },
     );
     registerMcpResources(mcp, this.store);
     registerMcpPrompts(mcp);
@@ -1186,7 +1194,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
             text: JSON.stringify(
               {
                 workspace: getWorkspaceContext(),
-                workflow: readWorkflowPrompt(),
+                workflow: WORKFLOW_POINTER,
                 tickets: servable,
               },
               null,
@@ -1226,7 +1234,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
             mimeType: "application/json",
             text: JSON.stringify(
               {
-                workflow: readWorkflowPrompt(),
+                workflow: WORKFLOW_POINTER,
                 ticket: publicView(issue, store.list()),
               },
               null,
