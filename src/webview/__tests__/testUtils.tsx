@@ -42,6 +42,8 @@ export function makeIssue(overrides: Partial<Issue> = {}): Issue {
     attachments: overrides.attachments ?? [],
     links: overrides.links ?? [],
     pendingClose: overrides.pendingClose ?? null,
+    guid: overrides.guid ?? `guid-${id}`,
+    updatedAt: overrides.updatedAt ?? at,
   };
 }
 

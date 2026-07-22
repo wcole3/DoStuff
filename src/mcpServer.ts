@@ -507,6 +507,7 @@ export async function runCreateTicket(
       id: `t-${randomUUID()}`,
       text,
       done: false,
+      updatedAt: now,
     })),
     tags: coerceTags(validated.tags ?? []),
     attachments: [],
@@ -514,6 +515,8 @@ export async function runCreateTicket(
     createdAt: now,
     resolvedAt: null,
     pendingClose: null,
+    guid: randomUUID(),
+    updatedAt: now,
     statusHistory: [{ status: "Thinking", at: now, by: "agent" }],
     record: [
       {

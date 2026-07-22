@@ -12,6 +12,7 @@ import {
   validateLinks,
   type UpdateBy,
 } from "./extension";
+import { deriveGuid } from "./syncMerge";
 import type { Issue, IssueType, Priority, Status, StatusEvent, TicketLink } from "./types";
 
 let issueCounter = 0;
@@ -39,6 +40,8 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     attachments: overrides.attachments ?? [],
     links: overrides.links ?? [],
     pendingClose: overrides.pendingClose ?? null,
+    guid: overrides.guid ?? `guid-${id}`,
+    updatedAt: overrides.updatedAt ?? at,
   };
 }
 
@@ -289,6 +292,27 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
     expect(next.pendingClose).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z", note: "keep" });
     expect(next.title).toBe("edit");
   });
+
+  test("incoming.guid/updatedAt are ignored; prior values survive a normal edit", () => {
+    const prior = makeIssue({
+      status: "Working",
+      guid: "real-guid",
+      updatedAt: "2026-05-18T00:00:00.000Z",
+    });
+    const incoming: Partial<Issue> = {
+      title: "edit",
+      // Forged sync identity/ordering from a stale/hostile webview payload
+      // must be ignored — both come from `...prior` by construction (and
+      // `IssueStore.upsert` then restamps `updatedAt` server-side).
+      guid: "forged-guid",
+      updatedAt: "2099-01-01T00:00:00.000Z",
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+
+    expect(next.guid).toBe("real-guid");
+    expect(next.updatedAt).toBe("2026-05-18T00:00:00.000Z");
+    expect(next.title).toBe("edit");
+  });
 });
 
 describe("resolveCloseRequest", () => {
@@ -352,6 +376,34 @@ describe("validateImportList — pendingClose", () => {
       note: "n",
     });
     expect(byId.get("DS-003")?.pendingClose).toBeNull();
+  });
+});
+
+describe("validateImportList — sync fields (guid / updatedAt / tasks[].updatedAt)", () => {
+  test("keeps well-formed provided values and derives missing ones", () => {
+    const { valid } = validateImportList([
+      {
+        id: "DS-001",
+        title: "provided",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        guid: "kept-guid",
+        updatedAt: "2025-06-01T00:00:00.000Z",
+        tasks: [{ id: "t1", text: "kept", done: false, updatedAt: "2025-05-01T00:00:00.000Z" }],
+      },
+      {
+        id: "DS-002",
+        title: "missing",
+        createdAt: "2025-02-01T00:00:00.000Z",
+        tasks: [{ id: "t2", text: "bare", done: true, updatedAt: "garbage" }],
+      },
+    ]);
+    const byId = new Map(valid.map((i) => [i.id, i]));
+    expect(byId.get("DS-001")?.guid).toBe("kept-guid");
+    expect(byId.get("DS-001")?.updatedAt).toBe("2025-06-01T00:00:00.000Z");
+    expect(byId.get("DS-001")?.tasks[0]?.updatedAt).toBe("2025-05-01T00:00:00.000Z");
+    expect(byId.get("DS-002")?.guid).toBe(deriveGuid("DS-002", "2025-02-01T00:00:00.000Z"));
+    expect(byId.get("DS-002")?.updatedAt).toBe("2025-02-01T00:00:00.000Z");
+    expect(byId.get("DS-002")?.tasks[0]).toEqual({ id: "t2", text: "bare", done: true });
   });
 });
 

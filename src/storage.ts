@@ -14,10 +14,12 @@
 // moved into `<storagePath>/legacy-json-backup/` as a recovery escape hatch.
 
 import * as vscode from "vscode";
+import { randomUUID } from "node:crypto";
 import initSqlJs, {
   type Database,
   type SqlJsStatic,
 } from "sql.js";
+import { deriveGuid, TOMBSTONE_TTL_MS } from "./syncMerge";
 import {
   coerceAttachments,
   coerceLinks,
@@ -63,7 +65,9 @@ CREATE TABLE IF NOT EXISTS issues (
   priority        TEXT NOT NULL,
   status          TEXT NOT NULL,
   created_at      TEXT NOT NULL,
-  resolved_at     TEXT
+  resolved_at     TEXT,
+  guid            TEXT,
+  updated_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_issues_status  ON issues(status);
 CREATE INDEX IF NOT EXISTS idx_issues_number  ON issues(number);
@@ -75,6 +79,7 @@ CREATE TABLE IF NOT EXISTS issue_tasks (
   position  INTEGER NOT NULL,
   text      TEXT NOT NULL,
   done      INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT,
   PRIMARY KEY (issue_id, task_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_issue ON issue_tasks(issue_id, position);
@@ -133,11 +138,30 @@ CREATE TABLE IF NOT EXISTS issue_pending_close (
   at       TEXT NOT NULL
 );
 
+-- Deletion witnesses for git-native sync (docs/plans/ticket-sync/01 §6).
+-- Written on every delete even while sync is disabled; without a persisted
+-- witness the merge cannot distinguish "deleted here" from "created there".
+-- scope 'ticket' rows use element_id = ticket_guid; last_id records the
+-- DS-NNN at deletion time (ticket scope only).
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+  scope       TEXT NOT NULL,
+  ticket_guid TEXT NOT NULL,
+  element_id  TEXT NOT NULL,
+  deleted_at  TEXT NOT NULL,
+  last_id     TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (scope, ticket_guid, element_id)
+);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
 `;
+
+/** ISO-8601-parsable string guard. Shared by `normalize` and the import path. */
+function isIsoString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && !Number.isNaN(Date.parse(v));
+}
 
 /**
  * Forward-compat: stamp missing fields on issues loaded from older versions.
@@ -176,12 +200,27 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
         : (Number.isFinite(numFromId) ? numFromId : 0),
       record: Array.isArray((issue as any).record) ? (issue as any).record : [],
       statusHistory: Array.isArray(issue.statusHistory) ? issue.statusHistory : [],
-      tasks: Array.isArray(issue.tasks) ? issue.tasks : [],
+      // Keep task `updatedAt` only when ISO-valid; strip bad values rather
+      // than throwing (legacy/garbage input must always load).
+      tasks: (Array.isArray(issue.tasks) ? issue.tasks : []).map((t) => {
+        if (t && typeof t === "object" && "updatedAt" in t && !isIsoString((t as Task).updatedAt)) {
+          const { updatedAt: _bad, ...rest } = t as Task;
+          return rest as Task;
+        }
+        return t;
+      }),
       tags: coerceTags((issue as any).tags),
       attachments: coerceAttachments((issue as any).attachments),
       links: coerceLinks((issue as any).links, (issue as any).id),
       resolvedAt: issue.resolvedAt ?? null,
       pendingClose: coercePendingClose((issue as any).pendingClose),
+      // Sync identity/ordering fields — server-derived, deterministic backfill
+      // for legacy data (docs/plans/ticket-sync/01 §2-3).
+      guid:
+        typeof (issue as any).guid === "string" && (issue as any).guid
+          ? (issue as any).guid
+          : deriveGuid(String(issue.id ?? ""), String(issue.createdAt ?? "")),
+      updatedAt: isIsoString((issue as any).updatedAt) ? (issue as any).updatedAt : issue.createdAt,
     },
     coerced,
   };
@@ -267,12 +306,37 @@ export class IssueStore {
     return this.cache.find((i) => i.id === id);
   }
 
-  async upsert(issue: Issue): Promise<void> {
-    const idx = this.cache.findIndex((i) => i.id === issue.id);
-    if (idx >= 0) this.cache[idx] = issue;
-    else this.cache.unshift(issue);
+  /**
+   * The single stamping chokepoint (docs/plans/ticket-sync/01 §5). Every UI
+   * and MCP mutation funnels through here. Default path: stamp `updatedAt`,
+   * mint/carry `guid`, diff-stamp per-task `updatedAt` against the prior
+   * ticket, and record element tombstones for tasks/attachments the incoming
+   * copy dropped. `preserveTimestamps: true` writes the issue exactly as
+   * given and records nothing — the sync controller's apply path is the only
+   * intended caller (merged remote state must keep remote timestamps).
+   */
+  async upsert(issue: Issue, opts?: { preserveTimestamps?: boolean }): Promise<void> {
+    const prior = this.cache.find((i) => i.id === issue.id);
+    let next = issue;
+    if (!opts?.preserveTimestamps) {
+      const now = new Date().toISOString();
+      next = {
+        ...issue,
+        guid: issue.guid || prior?.guid || randomUUID(),
+        updatedAt: now,
+        tasks: stampTasks(issue.tasks, prior?.tasks, now),
+      };
+    }
+    const idx = this.cache.findIndex((i) => i.id === next.id);
+    if (idx >= 0) this.cache[idx] = next;
+    else this.cache.unshift(next);
     if (this.db) {
-      this.runInTransaction(() => this.writeIssueRows(this.db!, issue));
+      this.runInTransaction(() => {
+        if (!opts?.preserveTimestamps && prior) {
+          this.recordElementTombstones(this.db!, prior, next, next.updatedAt);
+        }
+        this.writeIssueRows(this.db!, next);
+      });
       await this.exportDb();
     } else {
       await this.persistState();
@@ -281,6 +345,7 @@ export class IssueStore {
   }
 
   async remove(id: string): Promise<void> {
+    const removed = this.cache.find((i) => i.id === id);
     this.cache = this.cache
       .filter((i) => i.id !== id)
       // Inbound link cleanup: the DB cascades `issue_links` rows where this
@@ -294,6 +359,11 @@ export class IssueStore {
       );
     if (this.db) {
       this.runInTransaction(() => {
+        // Deletion witness for sync — must land in the same transaction as
+        // the delete so the two can never diverge (01 §6).
+        if (removed) {
+          this.recordTicketTombstone(this.db!, removed, new Date().toISOString());
+        }
         // Explicit inbound-link cleanup. sql.js's PRAGMA foreign_keys =
         // CASCADE setting has been historically unreliable across exports;
         // doing the DELETE ourselves guarantees no dangling rows survive
@@ -310,12 +380,23 @@ export class IssueStore {
   }
 
   async replaceAll(issues: Issue[]): Promise<void> {
-    this.cache = [...issues];
+    const prior = this.cache;
+    // Import path: stamp only-if-missing so export→import round trips keep
+    // exported timestamps/guids (01 §5).
+    const next = issues.map((i) => ensureSyncFields(i));
+    this.cache = [...next];
     this.bumpReserved(this.cache);
     if (this.db) {
+      const now = new Date().toISOString();
+      const nextById = new Map(next.map((i) => [i.id, i]));
       this.runInTransaction(() => {
+        for (const p of prior) {
+          const replacement = nextById.get(p.id);
+          if (!replacement) this.recordTicketTombstone(this.db!, p, now);
+          else this.recordElementTombstones(this.db!, p, replacement, now);
+        }
         this.db!.run("DELETE FROM issues");
-        for (const i of issues) this.writeIssueRows(this.db!, i);
+        for (const i of next) this.writeIssueRows(this.db!, i);
       });
       await this.exportDb();
       await this.wipeAttachmentsRoot();
@@ -326,19 +407,162 @@ export class IssueStore {
   }
 
   async mergeAll(issues: Issue[]): Promise<void> {
-    const byId = new Map(this.cache.map((i) => [i.id, i]));
-    for (const i of issues) byId.set(i.id, i);
+    const incoming = issues.map((i) => ensureSyncFields(i));
+    const priorById = new Map(this.cache.map((i) => [i.id, i]));
+    const byId = new Map(priorById);
+    for (const i of incoming) byId.set(i.id, i);
     this.cache = [...byId.values()];
     this.bumpReserved(this.cache);
     if (this.db) {
+      const now = new Date().toISOString();
       this.runInTransaction(() => {
-        for (const i of issues) this.writeIssueRows(this.db!, i);
+        for (const i of incoming) {
+          const p = priorById.get(i.id);
+          if (p) this.recordElementTombstones(this.db!, p, i, now);
+          this.writeIssueRows(this.db!, i);
+        }
       });
       await this.exportDb();
     } else {
       await this.persistState();
     }
     this.emitter.fire(this.cache);
+  }
+
+  /**
+   * Apply merged remote sync state: upsert fully-merged issues with
+   * `preserveTimestamps` semantics, delete specific ids, and never record
+   * tombstones (inbound state already carries its own). One transaction, one
+   * flush, one `onChange` fire (docs/plans/ticket-sync/01 §9).
+   *
+   * `removals` = tombstoned tickets + old ids of renumbered tickets;
+   * `tombstoned` marks which of those should also lose their attachment dir
+   * (a renumbered ticket's dir has already been renamed by the caller).
+   */
+  async applySync(args: {
+    upserts: Issue[];
+    removals: string[];
+    tombstoned?: string[];
+  }): Promise<void> {
+    const { upserts, removals } = args;
+    const tombstoned = new Set(args.tombstoned ?? []);
+    const removalSet = new Set(removals);
+
+    // Cache: drop removals (scrubbing inbound links to them), then upsert.
+    const upsertById = new Map(upserts.map((i) => [i.id, i]));
+    const survivors = this.cache
+      .filter((i) => !removalSet.has(i.id))
+      .map((i) =>
+        i.links.some((l) => removalSet.has(l.targetId))
+          ? { ...i, links: i.links.filter((l) => !removalSet.has(l.targetId)) }
+          : i,
+      );
+    const seen = new Set<string>();
+    const nextCache: Issue[] = survivors.map((i) => {
+      const replacement = upsertById.get(i.id);
+      if (replacement) seen.add(i.id);
+      return replacement ?? i;
+    });
+    for (const i of upserts) {
+      if (!seen.has(i.id)) nextCache.unshift(i);
+    }
+    this.cache = nextCache;
+    this.bumpReserved(this.cache);
+
+    if (this.db) {
+      this.runInTransaction(() => {
+        for (const id of removals) {
+          this.db!.run("DELETE FROM issue_links WHERE target_id = ? OR source_id = ?", [id, id]);
+          this.db!.run("DELETE FROM issues WHERE id = ?", [id]);
+        }
+        for (const i of upserts) this.writeIssueRows(this.db!, i);
+      });
+      await this.exportDb();
+    } else {
+      await this.persistState();
+    }
+    for (const id of removals) {
+      if (tombstoned.has(id)) await this.deleteIssueAttachments(id);
+    }
+    this.emitter.fire(this.cache);
+  }
+
+  /**
+   * Read all persisted deletion witnesses (01 §6). The sync controller feeds
+   * these into the outbound wire state. Empty (and never written) in the
+   * `globalState` fallback — no workspace ⇒ sync inert.
+   */
+  getSyncTombstones(): {
+    tickets: Array<{ guid: string; deletedAt: string; lastId: string }>;
+    elements: Array<{
+      ticketGuid: string;
+      scope: "task" | "attachment";
+      elementId: string;
+      deletedAt: string;
+    }>;
+  } {
+    if (!this.db) return { tickets: [], elements: [] };
+    const rows = selectAll<{
+      scope: string;
+      ticket_guid: string;
+      element_id: string;
+      deleted_at: string;
+      last_id: string;
+    }>(this.db, "SELECT * FROM sync_tombstones");
+    const tickets: Array<{ guid: string; deletedAt: string; lastId: string }> = [];
+    const elements: Array<{
+      ticketGuid: string;
+      scope: "task" | "attachment";
+      elementId: string;
+      deletedAt: string;
+    }> = [];
+    for (const r of rows) {
+      if (r.scope === "ticket") {
+        tickets.push({ guid: r.ticket_guid, deletedAt: r.deleted_at, lastId: r.last_id });
+      } else if (r.scope === "task" || r.scope === "attachment") {
+        elements.push({
+          ticketGuid: r.ticket_guid,
+          scope: r.scope,
+          elementId: r.element_id,
+          deletedAt: r.deleted_at,
+        });
+      }
+    }
+    return { tickets, elements };
+  }
+
+  /** Ticket-scope deletion witness. Caller wraps in a transaction. */
+  private recordTicketTombstone(db: Database, issue: Issue, deletedAt: string): void {
+    db.run(
+      "INSERT OR REPLACE INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('ticket', ?, ?, ?, ?)",
+      [issue.guid, issue.guid, deletedAt, issue.id],
+    );
+  }
+
+  /**
+   * Element-scope deletion witnesses: task/attachment ids present on `prior`
+   * but absent from `next`. Caller wraps in a transaction.
+   */
+  private recordElementTombstones(db: Database, prior: Issue, next: Issue, deletedAt: string): void {
+    const guid = next.guid || prior.guid;
+    const nextTaskIds = new Set(next.tasks.map((t) => t.id));
+    for (const t of prior.tasks) {
+      if (!nextTaskIds.has(t.id)) {
+        db.run(
+          "INSERT OR REPLACE INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('task', ?, ?, ?, '')",
+          [guid, t.id, deletedAt],
+        );
+      }
+    }
+    const nextAttIds = new Set(next.attachments.map((a) => a.id));
+    for (const a of prior.attachments) {
+      if (!nextAttIds.has(a.id)) {
+        db.run(
+          "INSERT OR REPLACE INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('attachment', ?, ?, ?, '')",
+          [guid, a.id, deletedAt],
+        );
+      }
+    }
   }
 
   /** Generate next monotonic ID (DS-001, DS-002, ...). */
@@ -528,6 +752,25 @@ export class IssueStore {
     const db = existing ? new SQL.Database(existing) : new SQL.Database();
     db.run("PRAGMA foreign_keys = ON");
     db.exec(SCHEMA_DDL);
+    // Additive columns on pre-existing tables. SQLite has no ADD COLUMN IF
+    // NOT EXISTS; the duplicate-column error is the expected steady state on
+    // current DBs (fresh DBs get the columns from SCHEMA_DDL directly).
+    for (const ddl of [
+      "ALTER TABLE issues ADD COLUMN guid TEXT",
+      "ALTER TABLE issues ADD COLUMN updated_at TEXT",
+      "ALTER TABLE issue_tasks ADD COLUMN updated_at TEXT",
+    ]) {
+      try {
+        db.exec(ddl);
+      } catch (e) {
+        if (!String(e).includes("duplicate column name")) throw e;
+      }
+    }
+    // Local tombstone hygiene: rows older than the sync TTL can never win a
+    // merge anyway (docs/plans/ticket-sync/02 §5 GC), so prune them here.
+    db.run("DELETE FROM sync_tombstones WHERE deleted_at < ?", [
+      new Date(Date.now() - TOMBSTONE_TTL_MS).toISOString(),
+    ]);
     this.db = db;
 
     if (!existing) {
@@ -665,6 +908,8 @@ export class IssueStore {
       status: string;
       created_at: string;
       resolved_at: string | null;
+      guid: string | null;
+      updated_at: string | null;
     }>(db, "SELECT * FROM issues");
 
     const tasksByIssue = groupBy(
@@ -674,6 +919,7 @@ export class IssueStore {
         position: number;
         text: string;
         done: number;
+        updated_at: string | null;
       }>(db, "SELECT * FROM issue_tasks ORDER BY issue_id, position"),
       (r) => r.issue_id,
     );
@@ -744,6 +990,9 @@ export class IssueStore {
         id: t.task_id,
         text: t.text,
         done: t.done !== 0,
+        // No eager default for a missing stamp — the sync wire boundary
+        // defaults it to the ticket's createdAt (02-merge-spec §5).
+        ...(t.updated_at ? { updatedAt: t.updated_at } : {}),
       }));
       const tags = coerceTags((tagsByIssue.get(row.id) ?? []).map((t) => t.tag));
       const attachments = coerceAttachments(
@@ -789,6 +1038,10 @@ export class IssueStore {
         record,
         links,
         pendingClose: pendingCloseByIssue.get(row.id) ?? null,
+        // NULLed by any older build's INSERT (its column list omits them) —
+        // re-derive/fall back exactly like normalize() does for objects.
+        guid: row.guid ?? deriveGuid(row.id, row.created_at),
+        updatedAt: row.updated_at ?? row.created_at,
       };
     });
   }
@@ -801,8 +1054,8 @@ export class IssueStore {
   private writeIssueRows(db: Database, issue: Issue): void {
     db.run(
       `INSERT OR REPLACE INTO issues
-         (id, number, title, description, verify_criteria, type, priority, status, created_at, resolved_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, number, title, description, verify_criteria, type, priority, status, created_at, resolved_at, guid, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         issue.id,
         issue.number,
@@ -814,6 +1067,8 @@ export class IssueStore {
         issue.status,
         issue.createdAt,
         issue.resolvedAt ?? null,
+        issue.guid ?? null,
+        issue.updatedAt ?? null,
       ],
     );
 
@@ -822,8 +1077,8 @@ export class IssueStore {
     db.run("DELETE FROM issue_tasks WHERE issue_id = ?", [issue.id]);
     issue.tasks.forEach((t, i) => {
       db.run(
-        "INSERT INTO issue_tasks (issue_id, task_id, position, text, done) VALUES (?, ?, ?, ?, ?)",
-        [issue.id, t.id, i, t.text, t.done ? 1 : 0],
+        "INSERT INTO issue_tasks (issue_id, task_id, position, text, done, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        [issue.id, t.id, i, t.text, t.done ? 1 : 0, t.updatedAt ?? null],
       );
     });
 
@@ -962,6 +1217,39 @@ export class IssueStore {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Per-task diff-stamping (docs/plans/ticket-sync/01 §5): a task id absent from
+ * `prior` is new (→ `now`); present with identical text+done carries the
+ * *prior* stamp forward (the webview strips the field, so reconciliation must
+ * happen here — and any smuggled incoming stamp is discarded); changed → `now`.
+ */
+function stampTasks(next: Task[], prior: Task[] | undefined, now: string): Task[] {
+  const priorById = new Map((prior ?? []).map((t) => [t.id, t]));
+  return next.map((t) => {
+    const p = priorById.get(t.id);
+    if (!p) return { ...t, updatedAt: now };
+    if (p.text === t.text && p.done === t.done) {
+      const { updatedAt: _incoming, ...rest } = t;
+      return p.updatedAt ? { ...rest, updatedAt: p.updatedAt } : rest;
+    }
+    return { ...t, updatedAt: now };
+  });
+}
+
+/**
+ * Import-path stamping (replaceAll / mergeAll): only-if-missing, so an
+ * export→import round trip preserves exported guids and timestamps.
+ */
+function ensureSyncFields(issue: Issue): Issue {
+  const guid =
+    typeof issue.guid === "string" && issue.guid
+      ? issue.guid
+      : deriveGuid(issue.id, issue.createdAt);
+  const updatedAt = isIsoString(issue.updatedAt) ? issue.updatedAt : issue.createdAt;
+  if (guid === issue.guid && updatedAt === issue.updatedAt) return issue;
+  return { ...issue, guid, updatedAt };
+}
 
 function selectAll<T extends Record<string, unknown>>(
   db: Database,

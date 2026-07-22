@@ -29,6 +29,12 @@ export interface Task {
   id: string;
   text: string;
   done: boolean;
+  /** ISO 8601 — when this task's `text`/`done` last changed. Server-stamped in
+   *  `IssueStore.upsert` by diffing against the prior ticket (webview/MCP input
+   *  is never honored). Optional so untouched payloads stay type-valid; when
+   *  missing, the sync wire boundary defaults it to the ticket's `createdAt`.
+   *  Additive — legacy tickets load without it. */
+  updatedAt?: string;
 }
 
 export interface StatusEvent {
@@ -180,6 +186,15 @@ export interface Issue {
    *  yet approved or denied it. Cleared on either verdict; approval also sets
    *  status to `Closed`. Additive — legacy tickets default to null. */
   pendingClose: PendingClose | null;
+  /** Canonical cross-writer identity for git-native sync. Server-derived:
+   *  minted `randomUUID()` at creation, backfilled deterministically via
+   *  `deriveGuid(id, createdAt)` for legacy data (`normalize()` /
+   *  `hydrateFromDb`). Webview/MCP input is never honored. Additive. */
+  guid: string;
+  /** ISO 8601 — last mutation. Server-stamped in `IssueStore.upsert`; sync
+   *  apply preserves remote values (`preserveTimestamps`). Legacy data
+   *  defaults to `createdAt`. Additive. */
+  updatedAt: string;
 }
 
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status.
@@ -222,7 +237,9 @@ export type WebviewToHost =
   | { type: "ready" }
   | {
       type: "createIssue";
-      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links" | "pendingClose"> & {
+      // `guid`/`updatedAt` are server-derived like `pendingClose` — the
+      // webview never supplies them (see `buildCreatedIssue` / `IssueStore.upsert`).
+      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links" | "pendingClose" | "guid" | "updatedAt"> & {
         tasks?: Task[];
         // Inline attachments staged in the new-issue modal. The host loops
         // these through the regular appendAttachment chokepoint after upserting

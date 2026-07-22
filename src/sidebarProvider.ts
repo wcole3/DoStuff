@@ -1,6 +1,7 @@
 // Sidebar provider — the WebviewView shown in the activity bar.
 
 import * as vscode from "vscode";
+import { randomUUID } from "node:crypto";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
 import {
@@ -103,10 +104,10 @@ function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
 
 /**
  * Build the `Issue` for a new ticket from the webview's `createIssue` partial.
- * New tickets always land in `Thinking` (only humans promote out of it). Tags
- * are coerced; inline forward links are coerced + validated against `knownIds`
- * (unknown targets and self-links are dropped and returned in `droppedLinks`
- * so the caller can log). Pure — no store access.
+ * New tickets always land in `Thinking` (humans or agents may promote them
+ * out later). Tags are coerced; inline forward links are coerced + validated
+ * against `knownIds` (unknown targets and self-links are dropped and returned
+ * in `droppedLinks` so the caller can log). Pure — no store access.
  */
 export function buildCreatedIssue(
   partial: CreateIssuePartial,
@@ -128,7 +129,10 @@ export function buildCreatedIssue(
     status,
     description: typeof partial.description === "string" ? partial.description : "",
     verifyCriteria: typeof partial.verifyCriteria === "string" ? partial.verifyCriteria : "",
-    tasks: Array.isArray(partial.tasks) ? partial.tasks : [],
+    tasks: (Array.isArray(partial.tasks) ? partial.tasks : []).map((t) => ({
+      ...t,
+      updatedAt: opts.now,
+    })),
     tags: coerceTags((partial as { tags?: unknown }).tags),
     attachments: [],
     links: kept,
@@ -137,6 +141,8 @@ export function buildCreatedIssue(
     pendingClose: null,
     statusHistory: [{ status, at: opts.now, by: "user" }],
     record: [],
+    guid: randomUUID(),
+    updatedAt: opts.now,
   };
   return { issue, droppedLinks: dropped };
 }

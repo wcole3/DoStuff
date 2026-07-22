@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
+import { deriveGuid } from "./syncMerge";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
 import { GraphPanel } from "./graphProvider";
@@ -60,9 +61,11 @@ export function inferMimeType(filename: string): string {
  * Pure merge of a webview-submitted partial update onto a persisted issue.
  *
  * Server-derived fields (`id`, `number`, `createdAt`, `record`, `statusHistory`,
- * `resolvedAt`) are NEVER copied from `incoming` — they are reconstructed from
- * `prior` plus this function's own bookkeeping. The webview can lie about any
- * of those and we'll ignore it.
+ * `resolvedAt`, `pendingClose`, `guid`, `updatedAt`) are NEVER copied from
+ * `incoming` — they are reconstructed from `prior` plus this function's own
+ * bookkeeping (`updatedAt` and per-task `tasks[].updatedAt` are then re-stamped
+ * by `IssueStore.upsert`, which discards any smuggled task stamps by diffing
+ * against `prior`). The webview can lie about any of those and we'll ignore it.
  *
  * Returns `{next}` on success or `{error}` if validation fails.
  *
@@ -239,6 +242,8 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       continue;
     }
     const status: Status = isStatus(e.status) ? e.status : "Thinking";
+    const isIso = (v: unknown): v is string =>
+      typeof v === "string" && v.length > 0 && !Number.isNaN(Date.parse(v));
     const issue: Issue = {
       id: e.id,
       number: Number.isFinite(e.number)
@@ -250,7 +255,15 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       status,
       description: typeof e.description === "string" ? e.description : "",
       verifyCriteria: typeof e.verifyCriteria === "string" ? e.verifyCriteria : "",
-      tasks: Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [],
+      // Keep well-formed per-task `updatedAt` (round-trips exported stamps);
+      // strip garbage values so nothing invalid enters the store.
+      tasks: (Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : []).map((t) => {
+        if (t && typeof t === "object" && "updatedAt" in t && !isIso(t.updatedAt)) {
+          const { updatedAt: _bad, ...rest } = t;
+          return rest;
+        }
+        return t;
+      }),
       tags: coerceTags(e.tags),
       attachments: coerceAttachments(e.attachments),
       // Cross-issue validation happens in the caller (after the full set is
@@ -263,6 +276,10 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
         : [{ status, at: e.createdAt, by: "user" }],
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
       pendingClose: coercePendingClose(e.pendingClose),
+      // Sync fields: keep well-formed provided values (export→import round
+      // trip), derive per the normalize() rules when missing.
+      guid: typeof e.guid === "string" && e.guid ? e.guid : deriveGuid(e.id, e.createdAt),
+      updatedAt: isIso(e.updatedAt) ? e.updatedAt : e.createdAt,
     };
     valid.push(issue);
   }
