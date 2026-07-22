@@ -101,6 +101,22 @@ export interface TicketLink {
   kind: LinkKind;
 }
 
+/**
+ * An agent's pending request to close a ticket, awaiting a human verdict. Set
+ * by the MCP `request_ticket_close` tool; cleared when a human approves (which
+ * also sets status to `Closed`) or denies via the host `resolveClose` handler.
+ * Additive field — legacy tickets load with `pendingClose: null`.
+ */
+export interface PendingClose {
+  /** Who requested the close. Agents set "agent"; kept as a union for a
+   *  possible future human-initiated request flow. */
+  by: "agent";
+  /** Optional rationale supplied by the requesting agent. */
+  note?: string;
+  /** ISO 8601 — when the close was requested. */
+  at: string;
+}
+
 const DS_ID_RE = /^DS-\d+$/;
 
 /**
@@ -160,10 +176,17 @@ export interface Issue {
    *  view is derived by scanning all issues and inverting the kind via
    *  `INVERSE_LINK_KIND`. There is no dual-write. */
   links: TicketLink[];
+  /** Non-null when an agent has requested closure via MCP and a human has not
+   *  yet approved or denied it. Cleared on either verdict; approval also sets
+   *  status to `Closed`. Additive — legacy tickets default to null. */
+  pendingClose: PendingClose | null;
 }
 
-/** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
-export const AGENT_WRITABLE_STATUSES: Status[] = ["Planned", "Working", "Verification"];
+/** Statuses an MCP-connected agent is allowed to set via update_ticket_status.
+ *  All non-terminal states: agents may promote a Thinking draft into an active
+ *  lane, shuffle the active lanes, or demote a ticket back to Thinking.
+ *  Complete and Closed remain human-only in both directions. */
+export const AGENT_WRITABLE_STATUSES: Status[] = ["Thinking", "Planned", "Working", "Verification"];
 
 /** Statuses an MCP-connected agent is allowed to read (get_ticket, resources)
  *  and annotate (update_ticket_progress). Excludes Complete and Closed. */
@@ -199,7 +222,7 @@ export type WebviewToHost =
   | { type: "ready" }
   | {
       type: "createIssue";
-      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links"> & {
+      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links" | "pendingClose"> & {
         tasks?: Task[];
         // Inline attachments staged in the new-issue modal. The host loops
         // these through the regular appendAttachment chokepoint after upserting
@@ -254,7 +277,12 @@ export type WebviewToHost =
   | { type: "revealTicket"; id: string }
   // Sidebar/board toolbar button — routes through the registered
   // `dostuff.openGraph` command on the host.
-  | { type: "openGraph" };
+  | { type: "openGraph" }
+  // Human verdict on an agent's pending close request (see `PendingClose`).
+  // Routed through the registered `dostuff.resolveClose` command → the host
+  // `resolveClose` handler, which applies `Closed` (approve) or clears the
+  // request (deny).
+  | { type: "resolveClose"; id: string; verdict: "approve" | "deny" };
 
 export interface Settings {
   storagePath: string;
@@ -343,6 +371,21 @@ export function coerceAttachments(input: unknown): Attachment[] {
     byId.set(id, { id, name, mimeType, sizeBytes, addedAt });
   }
   return Array.from(byId.values());
+}
+
+/**
+ * Validate a raw `pendingClose` value into a clean `PendingClose | null`.
+ * Mirrors the other coercers: forgiving (returns `null` on any bad or missing
+ * shape) and never throws, so a legacy ticket lacking the field loads as null.
+ */
+export function coercePendingClose(input: unknown): PendingClose | null {
+  if (!input || typeof input !== "object") return null;
+  const r = input as Record<string, unknown>;
+  if (r.by !== "agent") return null;
+  if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return null;
+  const out: PendingClose = { by: "agent", at: r.at };
+  if (typeof r.note === "string") out.note = r.note;
+  return out;
 }
 
 export function canMoveToActiveLane(

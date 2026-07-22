@@ -75,11 +75,11 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 ## Workflow rules
 
 - New tickets always start in **Thinking** for human triage.
-- Only humans can promote a ticket from Thinking to Planned. Agents cannot.
+- Agents may move tickets freely among the non-terminal states — promote out of Thinking, shuffle the active lanes, or demote back to Thinking — and edit the description of any non-terminal ticket.
 - Tickets move freely between Planned, Working, and Verification.
-- Only humans can move a ticket to **Complete** or **Closed** (via the UI).
+- Only humans can move a ticket to **Complete**. Agents can *request* a close via MCP, but a human approves it in the UI before the ticket becomes **Closed**.
 - Active lanes (Planned, Working, Verification) are each capped — a workflow throttle. Finish or de-scope before starting more work. Or raise `dostuff.activeLaneCap`; I'm not your supervisor.
-- **Closed** is a "won't do" state. It lives only in the sidebar (no board lane/drawer), is hidden under the **All** filter, and is reachable via its dedicated filter chip.
+- **Closed** is a "won't do" state. It lives only in the sidebar (no board lane/drawer), is hidden under the **All** filter, and is reachable via its dedicated filter chip. The sidebar also has an **Awaiting close** filter that surfaces tickets with a pending agent close request.
 
 ## Keyboard shortcuts
 
@@ -170,34 +170,40 @@ Workflow contract:
   2. Tickets have descriptions and verify criteria written by the human. Read before
      starting. Some tickets have subtasks to help you plan.
   3. Read `dostuff://tickets` to discover work. It lists Thinking + active-lane
-     tickets (Complete and Closed are hidden). Thinking tickets are drafts the
-     human hasn't triaged yet -- do not start work on them, and only a human can
-     promote one to Planned. You *may* read and annotate them via
-     `update_ticket_progress`: use this to record relationships ("blocks DS-042",
-     "follow-up of DS-019") on a ticket you just filed with `create_ticket`, or
-     to leave context for the human before they triage.
-  4. When you start a ticket, call `update_ticket_status` to move it to "Working".
-     When you believe it's ready for verification, move it to "Verification".
-  5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
-     decides. If your verification fails, move it back to "Working".
+     tickets (Complete and Closed are hidden). Thinking tickets are untriaged
+     drafts; you MAY promote one into an active lane with `update_ticket_status`
+     when you pick it up. You may also annotate any non-terminal ticket via
+     `update_ticket_progress` (e.g. record "blocks DS-042" on a ticket you just
+     filed) or reshape a Thinking draft with `update_ticket_draft`.
+  4. Call `update_ticket_status` to move a ticket among Thinking, Planned,
+     Working, and Verification -- promote a draft out of Thinking, shuffle the
+     active lanes, or demote a ticket back to Thinking to de-prioritize it. Move
+     it to "Working" when you start and "Verification" when it's ready to review.
+  5. You cannot mark a ticket "Complete" or "Closed". A human reviews
+     Verification tickets and decides. If your verification fails, move it back
+     to "Working".
   6. Active lanes (Planned, Working, Verification) are capped. Moves that would
-     exceed the cap are rejected.
+     exceed the cap are rejected (this includes promotions out of Thinking).
   7. As you make progress, call `update_ticket_progress` to tick tasks off and
      append a short note to the ticket's record. Be terse and factual.
-  8. If you discover follow-up work, call `create_ticket` to file it. New
+  8. Use `update_ticket_description` to correct or expand a ticket's description.
+     Allowed on any non-terminal ticket (Thinking/Planned/Working/Verification).
+  9. If you discover follow-up work, call `create_ticket` to file it. New
      tickets land in "Thinking" for the human to triage. Optionally supply
      `links: [{ targetId, kind }]` to record first-class relationships at
      creation time (kinds: blocks, child-of, relates-to).
-  9. While a ticket is still in "Thinking" (an untriaged draft), call
-     `update_ticket_draft` to reshape its tags, links, and/or task list --
-     useful for fleshing out a ticket you just filed before a human triages
-     it. Once it's triaged to an active lane, that scope locks -- you can then
-     only toggle task done-state via `update_ticket_progress`.
+ 10. While a ticket is in "Thinking", call `update_ticket_draft` to reshape its
+     tags, links, and/or task list -- in an active lane that scope locks and you
+     can only toggle task done-state via `update_ticket_progress` (demote the
+     ticket back to Thinking if its scope genuinely needs reshaping).
+ 11. If a ticket is done or no longer needed, call `request_ticket_close`. This
+     does not close it -- it asks the human to approve the close in DoStuff.
+     Poll `get_ticket` for the outcome (Closed on approval, request clears on
+     denial).
 
-You may NOT modify a ticket's title, description, priority, type, or verify
-criteria via the MCP server, and tags/links/tasks become read-only once a
-ticket leaves "Thinking". If something is wrong with those, file a new
-ticket instead.
+You may NOT modify a ticket's title, priority, type, or verify criteria via the
+MCP server, and tags/links/tasks become read-only once a ticket leaves
+"Thinking". If something is wrong with those, file a new ticket instead.
 ```
 
 Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `dostuff.mcp.instructions` in Settings. Leave the setting blank to use the built-in text above.
@@ -209,9 +215,11 @@ Override this per-user via **DoStuff: Edit MCP Workflow Instructions…** or `do
 | `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus the workflow prompt. Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped; outbound `links` and derived `inboundLinks` are included. |
 | `list_issues` | optional `type`, `priority`, `status` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Includes the workflow prompt and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. |
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
-| `update_ticket_status` | `id`, `status` (one of Planned / Working / Verification), optional `note` | Moves a ticket between active lanes. Honors the lane cap. Rejects moves out of Thinking, into Thinking, or to/from Complete and Closed. |
-| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, description, priority, type, verifyCriteria, or links. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
+| `update_ticket_status` | `id`, `status` (one of Thinking / Planned / Working / Verification), optional `note` | Moves a ticket among the non-terminal states — promote a draft out of Thinking, shuffle the active lanes, or demote back to Thinking (uncapped). Honors the active-lane cap. Rejects Complete/Closed as either target or source. |
+| `update_ticket_description` | `id`, `description`, optional `note` | Replaces the ticket's description (and appends one record entry). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Only the description changes — title, priority, type, and verifyCriteria stay locked. |
+| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 | `update_ticket_draft` | `id`, optional `tags[]`, `links[]`, `tasks[]` | Reshapes an untriaged draft's tags, links, and/or task list. **Thinking-only** — rejected once the ticket is triaged to an active lane (use the UI after that). Omit a field to leave it unchanged; pass `[]` to clear it. Unknown link targets are dropped. |
+| `request_ticket_close` | `id`, optional `note` | Flags a ticket for closure and awaits human approval — does **not** change status. A human approves (→ Closed) or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Poll `get_ticket` for the outcome. |
 
 ### Resources
 

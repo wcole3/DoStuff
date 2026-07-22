@@ -21,12 +21,14 @@ import initSqlJs, {
 import {
   coerceAttachments,
   coerceLinks,
+  coercePendingClose,
   coerceTags,
   isPriority,
   isStatus,
   isType,
   type Issue,
   type IssueType,
+  type PendingClose,
   type Priority,
   type RecordEntry,
   type Settings,
@@ -124,6 +126,13 @@ CREATE TABLE IF NOT EXISTS issue_links (
 );
 CREATE INDEX IF NOT EXISTS idx_links_target ON issue_links(target_id);
 
+CREATE TABLE IF NOT EXISTS issue_pending_close (
+  issue_id TEXT PRIMARY KEY REFERENCES issues(id) ON DELETE CASCADE,
+  by       TEXT NOT NULL,
+  note     TEXT,
+  at       TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -172,6 +181,7 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       attachments: coerceAttachments((issue as any).attachments),
       links: coerceLinks((issue as any).links, (issue as any).id),
       resolvedAt: issue.resolvedAt ?? null,
+      pendingClose: coercePendingClose((issue as any).pendingClose),
     },
     coerced,
   };
@@ -716,6 +726,18 @@ export class IssueStore {
       }>(db, "SELECT * FROM issue_links ORDER BY source_id, position"),
       (r) => r.source_id,
     );
+    // 0-or-1 relation, so a plain Map rather than groupBy. A main-era DB has no
+    // such table row for any issue → the map is empty → all pendingClose null.
+    const pendingCloseByIssue = new Map<string, PendingClose>();
+    for (const r of selectAll<{ issue_id: string; by: string; note: string | null; at: string }>(
+      db,
+      "SELECT * FROM issue_pending_close",
+    )) {
+      const pc = coercePendingClose(
+        r.note !== null ? { by: r.by, at: r.at, note: r.note } : { by: r.by, at: r.at },
+      );
+      if (pc) pendingCloseByIssue.set(r.issue_id, pc);
+    }
 
     return issueRows.map((row) => {
       const tasks: Task[] = (tasksByIssue.get(row.id) ?? []).map((t) => ({
@@ -766,6 +788,7 @@ export class IssueStore {
         statusHistory,
         record,
         links,
+        pendingClose: pendingCloseByIssue.get(row.id) ?? null,
       };
     });
   }
@@ -849,6 +872,14 @@ export class IssueStore {
         [issue.id, l.targetId, l.kind, i],
       );
     });
+
+    db.run("DELETE FROM issue_pending_close WHERE issue_id = ?", [issue.id]);
+    if (issue.pendingClose) {
+      db.run(
+        "INSERT INTO issue_pending_close (issue_id, by, note, at) VALUES (?, ?, ?, ?)",
+        [issue.id, issue.pendingClose.by, issue.pendingClose.note ?? null, issue.pendingClose.at],
+      );
+    }
   }
 
   private runInTransaction(fn: () => void): void {

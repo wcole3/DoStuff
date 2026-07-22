@@ -84,6 +84,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
     links: overrides.links ?? [],
+    pendingClose: overrides.pendingClose ?? null,
   };
 }
 
@@ -115,6 +116,27 @@ describe("normalize", () => {
     expect(issue.tasks).toEqual([]);
     expect(issue.tags).toEqual([]);
     expect(issue.resolvedAt).toBeNull();
+    expect(issue.pendingClose).toBeNull();
+  });
+
+  test("defaults a missing pendingClose to null and coerces a malformed one to null", () => {
+    const missing = {
+      id: "DS-050",
+      title: "legacy",
+      type: "Bug",
+      priority: "High",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+    } as unknown as Issue;
+    expect(normalize(missing).issue.pendingClose).toBeNull();
+
+    const malformed = {
+      ...missing,
+      pendingClose: { by: "user", at: "not-iso" },
+    } as unknown as Issue;
+    expect(normalize(malformed).issue.pendingClose).toBeNull();
   });
 
   test("tags are normalized: trimmed, deduplicated, non-string entries dropped", () => {
@@ -459,6 +481,40 @@ describe("IssueStore (SQLite-backed branch)", () => {
     expect(loaded?.tags).toEqual(["alpha", "beta"]);
     expect(loaded?.tasks).toEqual([{ id: "t1", text: "first", done: false }]);
     b.dispose();
+  });
+
+  test("pendingClose round-trips across store instances and clears on delete-then-insert", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(
+      makeIssue({
+        id: "DS-088",
+        number: 88,
+        status: "Working",
+        pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "wrap up" },
+      }),
+    );
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-088")?.pendingClose).toEqual({
+      by: "agent",
+      at: "2026-05-18T00:00:00.000Z",
+      note: "wrap up",
+    });
+    // Clear it — the child row should be deleted (delete-then-insert), not orphaned.
+    await b.upsert({ ...b.get("DS-088")!, pendingClose: null });
+    b.dispose();
+
+    const c = makeSqlStore(ctx);
+    await c.init();
+    expect(c.get("DS-088")?.pendingClose).toBeNull();
+    c.dispose();
   });
 
   test("migrates pre-existing JSON tickets into the DB and moves them to legacy-json-backup/", async () => {

@@ -182,6 +182,10 @@ export function postOpenGraph(): void {
   vscodeApi.postMessage({ type: "openGraph" });
 }
 
+export function postResolveClose(id: string, verdict: "approve" | "deny"): void {
+  vscodeApi.postMessage({ type: "resolveClose", id, verdict });
+}
+
 export function postStageAttachmentByUri(uri: string): void {
   vscodeApi.postMessage({ type: "stageAttachmentByUri", uri });
 }

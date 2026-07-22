@@ -134,6 +134,7 @@ export function buildCreatedIssue(
     links: kept,
     createdAt: opts.now,
     resolvedAt: null,
+    pendingClose: null,
     statusHistory: [{ status, at: opts.now, by: "user" }],
     record: [],
   };
@@ -509,6 +510,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
       case "openGraph":
         vscode.commands.executeCommand("dostuff.openGraph");
         break;
+      case "resolveClose": {
+        const m = msg as { id?: unknown; verdict?: unknown };
+        if (
+          typeof m.id !== "string" ||
+          !ID_RE.test(m.id) ||
+          (m.verdict !== "approve" && m.verdict !== "deny")
+        ) {
+          this.output.appendLine(`Rejected resolveClose: bad payload (${JSON.stringify(msg)})`);
+          break;
+        }
+        vscode.commands.executeCommand("dostuff.resolveClose", { id: m.id, verdict: m.verdict });
+        break;
+      }
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;

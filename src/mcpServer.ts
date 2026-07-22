@@ -10,28 +10,37 @@
 //     workflow                                Workflow guidance for the agent
 //
 //   Tools
-//     get_ticket             fetch by #NN, DS-id, or title substring
-//     list_issues            compact id/title index with optional type/priority/status filters
-//     create_ticket          file new ticket in "Thinking" for human triage
-//     update_ticket_status   move ticket between Planned <-> Working <-> Verification
-//                            with lane-cap enforcement (cap=6) and the
-//                            Thinking-one-way rule (current must already be active)
-//     update_ticket_progress toggle task[].done and append a record entry
-//     update_ticket_draft    reshape a Thinking draft's tags/links/tasks
+//     get_ticket                fetch by #NN, DS-id, or title substring
+//     list_issues               compact id/title index with optional type/priority/status filters
+//     create_ticket             file new ticket in "Thinking" for human triage
+//     update_ticket_status      move ticket among the non-terminal states
+//                               (Thinking <-> Planned <-> Working <-> Verification;
+//                               active-lane cap=6, Thinking uncapped). Never
+//                               targets Complete/Closed.
+//     update_ticket_description edit the description of any non-terminal ticket
+//     update_ticket_progress    toggle task[].done and append a record entry
+//     update_ticket_draft       reshape a Thinking draft's tags/links/tasks
+//     request_ticket_close      ask a human to close a ticket (sets pendingClose;
+//                               a human approves/denies in the DoStuff UI)
 //
 // Constraints enforced by the server (not just the schema):
 //   - Tickets in Complete or Closed are never returned by the read APIs.
 //     Thinking tickets ARE readable + annotatable (so agents can record
-//     relationships on tickets they just filed), but cannot be promoted.
+//     relationships on tickets they just filed) and may now be promoted into
+//     an active lane.
 //   - update_ticket_status rejects:
-//       * targets that aren't Planned/Working/Verification
-//       * current status that isn't Planned/Working/Verification
-//         (Thinking-one-way; only humans triage)
-//       * moves into a lane already at ACTIVE_LANE_CAP
+//       * targets that aren't Thinking/Planned/Working/Verification
+//       * a source status that isn't Thinking/Planned/Working/Verification
+//         (Complete/Closed are terminal for agents)
+//       * moves into an active lane already at ACTIVE_LANE_CAP (Thinking uncapped)
+//   - update_ticket_description edits only the description (+ one record entry),
+//     on Thinking/Planned/Working/Verification. Complete/Closed rejected.
 //   - update_ticket_progress can only touch tasks[].done and append to record.
 //   - update_ticket_draft can replace tags/links/tasks, but ONLY while the
-//     ticket is in Thinking (untriaged). Title/description/priority/type/
-//     verifyCriteria remain UI-only.
+//     ticket is in Thinking (untriaged). Title/priority/type/verifyCriteria
+//     remain UI-only (description is editable via update_ticket_description).
+//   - request_ticket_close never changes status itself; it flags pendingClose,
+//     and a human's approval in the UI is what moves the ticket to Closed.
 
 import * as http from "http";
 import type { AddressInfo } from "node:net";
@@ -149,6 +158,21 @@ const DRAFT_INPUT = {
     .optional(),
 };
 
+// Edit a ticket's description. Allowed on any non-terminal ticket (Thinking,
+// Planned, Working, Verification); Complete/Closed are rejected in-handler.
+const DESCRIPTION_INPUT = {
+  id: z.string().regex(/^DS-\d+$/),
+  description: z.string().max(20_000),
+  note: z.string().max(2_000).optional(),
+};
+
+// Request a human close a ticket. Sets pendingClose; the actual Close is a
+// human action in the DoStuff UI. Allowed on any non-terminal ticket.
+const CLOSE_REQUEST_INPUT = {
+  id: z.string().regex(/^DS-\d+$/),
+  note: z.string().max(2_000).optional(),
+};
+
 const GET_TICKET_INPUT = {
   query: z
     .string()
@@ -179,6 +203,8 @@ const NewTicketSchema   = z.object(NEW_TICKET_INPUT).strict();
 const StatusSchema      = z.object(STATUS_INPUT).strict();
 const ProgressSchema    = z.object(PROGRESS_INPUT).strict();
 const DraftSchema       = z.object(DRAFT_INPUT).strict();
+const DescriptionSchema = z.object(DESCRIPTION_INPUT).strict();
+const CloseRequestSchema = z.object(CLOSE_REQUEST_INPUT).strict();
 const GetTicketSchema   = z.object(GET_TICKET_INPUT).strict();
 const ListIssuesSchema  = z.object(LIST_ISSUES_INPUT).strict();
 
@@ -225,6 +251,10 @@ export function publicView(issue: Issue, allIssues: Issue[] = []) {
     links: issue.links.map((l) => ({ targetId: l.targetId, kind: l.kind })),
     inboundLinks,
     createdAt: issue.createdAt,
+    // Surfaced so a polling agent can see a close request it made is still
+    // pending (non-null) vs. denied (cleared back to null); an approved close
+    // makes the ticket Closed, which the read gate then hides.
+    pendingClose: issue.pendingClose,
   };
 }
 
@@ -298,6 +328,8 @@ export type UpdateDraftInput = {
   links?: Array<{ targetId: string; kind: LinkKind }>;
   tasks?: Array<{ text: string; done?: boolean }>;
 };
+export type UpdateDescriptionInput = { id: string; description: string; note?: string };
+export type RequestCloseInput = { id: string; note?: string };
 
 /**
  * Look up an active ticket by number (`#42` / `42`), id (`DS-042`), or
@@ -481,6 +513,7 @@ export async function runCreateTicket(
     links: validatedLinks,
     createdAt: now,
     resolvedAt: null,
+    pendingClose: null,
     statusHistory: [{ status: "Thinking", at: now, by: "agent" }],
     record: [
       {
@@ -507,15 +540,19 @@ export async function runCreateTicket(
 }
 
 /**
- * Move a ticket between the active lanes (Planned / Working / Verification).
+ * Move a ticket among the non-terminal states (Thinking / Planned / Working /
+ * Verification) — promote a draft into the pipeline, shuffle the active lanes,
+ * or demote a ticket back to Thinking.
  *
  * Returns `{ id, status, from }` on success.
  *
- * - Target must be Planned, Working, or Verification — never Thinking or Complete.
- * - Current status must already be Planned, Working, or Verification; agents
- *   cannot promote out of Thinking or re-open Complete tickets.
- * - The destination lane is capped at `ACTIVE_LANE_CAP` (6); a move that
- *   would exceed the cap is rejected with an error naming the lane.
+ * - Target may be Thinking, Planned, Working, or Verification — never Complete
+ *   or Closed (humans accept; agents ask via request_ticket_close).
+ * - Source likewise: Complete and Closed are terminal for agents and cannot be
+ *   re-opened.
+ * - Active-lane targets are capped at `ACTIVE_LANE_CAP` (6); a move that would
+ *   exceed the cap is rejected with an error naming the lane. Thinking is
+ *   uncapped.
  */
 export async function runUpdateTicketStatus(
   store: IssueStore,
@@ -527,7 +564,8 @@ export async function runUpdateTicketStatus(
   if (!AGENT_WRITABLE_STATUSES.includes(args.status)) {
     return ToolResultErr(
       `Agents cannot move a ticket to "${args.status}". ` +
-      `Thinking is the human triage queue — only humans may route work there. ` +
+      `Only a human can accept a ticket (Complete) or approve a close (Closed) — ` +
+      `use request_ticket_close to ask for one. ` +
       `Allowed target statuses for agents: ${AGENT_WRITABLE_STATUSES.join(", ")}.`,
     );
   }
@@ -539,15 +577,9 @@ export async function runUpdateTicketStatus(
   const issue = store.get(args.id);
   if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
 
-  // Thinking-one-way + Complete-is-terminal: current must already be active.
-  // Only humans can promote out of Thinking, and Complete tickets cannot be
-  // reopened by an agent.
-  if (!AGENT_WRITABLE_STATUSES.includes(issue.status)) {
-    if (issue.status === "Thinking") {
-      return ToolResultErr(
-        `Ticket ${issue.id} is in "Thinking" -- only a human can triage and promote it to Planned.`,
-      );
-    }
+  // Source may be Thinking (promotion into the pipeline) or any active lane.
+  // Complete and Closed are terminal for agents and cannot be re-opened.
+  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
     if (issue.status === "Complete") {
       return ToolResultErr(
         `Ticket ${issue.id} is Complete and cannot be re-opened by an agent.`,
@@ -559,7 +591,7 @@ export async function runUpdateTicketStatus(
       );
     }
     return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may only move tickets that are already Planned, Working, or Verification.`,
+      `Ticket ${issue.id} is in "${issue.status}". Agents may not move it.`,
     );
   }
 
@@ -607,9 +639,8 @@ export async function runUpdateTicketStatus(
  *   record relationships ("blocks DS-042") on a ticket it just filed.
  * - Every `taskUpdates[].id` must match an existing task on the ticket; an
  *   unknown id rejects the whole call.
- * - This is the only MCP tool that writes ticket content. Title, description,
- *   priority, type, and verifyCriteria are never modifiable here — only the
- *   UI can edit those.
+ * - Title, priority, type, and verifyCriteria are never modifiable here. The
+ *   description is editable via `update_ticket_description`; the rest are UI-only.
  */
 export async function runUpdateTicketProgress(
   store: IssueStore,
@@ -736,6 +767,117 @@ export async function runUpdateTicketDraft(
       null,
       2,
     ),
+  );
+}
+
+/**
+ * Edit a ticket's description — the one MCP path that changes prose scope.
+ *
+ * Returns `{ id }` on success.
+ *
+ * - Allowed on any non-terminal ticket (Thinking / Planned / Working /
+ *   Verification). Complete and Closed are rejected.
+ * - Mutates ONLY `description` and appends one `record` entry. Title, priority,
+ *   type, verifyCriteria, status, and tasks are untouched (preserved by spread).
+ */
+export async function runUpdateTicketDescription(
+  store: IssueStore,
+  args: UpdateDescriptionInput,
+): Promise<ToolResult> {
+  const parsed = DescriptionSchema.safeParse(args);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_description: ${parsed.error.message}`);
+  args = parsed.data;
+
+  const issue = store.get(args.id);
+  if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
+
+  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
+    return ToolResultErr(
+      `Ticket ${issue.id} is in "${issue.status}". Agents may not edit the description of Complete or Closed tickets.`,
+    );
+  }
+
+  const now = new Date().toISOString();
+  const next: Issue = {
+    ...issue,
+    description: args.description,
+    record: [
+      ...issue.record,
+      {
+        at: now,
+        author: "agent",
+        text: args.note ? `Description updated via MCP: ${args.note}` : "Description updated via MCP",
+      },
+    ],
+  };
+  await store.upsert(next);
+  return ToolResultOk(
+    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id }, null, 2),
+  );
+}
+
+/**
+ * Request that a human close a ticket. This does NOT change status — it flags
+ * `pendingClose` so the ticket surfaces for human approval in the DoStuff UI,
+ * where a human approves (→ Closed) or denies (clears the flag).
+ *
+ * Returns `{ id, pendingClose: true, message }` on success.
+ *
+ * - Allowed on any non-terminal ticket (Thinking / Planned / Working /
+ *   Verification). Complete and Closed are rejected (already terminal).
+ * - Idempotent: re-requesting a ticket that already has a pending close returns
+ *   the same "awaiting approval" result without appending a second record entry.
+ */
+export async function runRequestTicketClose(
+  store: IssueStore,
+  args: RequestCloseInput,
+): Promise<ToolResult> {
+  const parsed = CloseRequestSchema.safeParse(args);
+  if (!parsed.success) return ToolResultErr(`Invalid arguments for request_ticket_close: ${parsed.error.message}`);
+  args = parsed.data;
+
+  const issue = store.get(args.id);
+  if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
+
+  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
+    return ToolResultErr(
+      `Ticket ${issue.id} is in "${issue.status}" and is already terminal; there is nothing to close.`,
+    );
+  }
+
+  const message =
+    `Close requested for ${issue.id}. A human must approve it in DoStuff before it is closed. ` +
+    `Poll get_ticket: the ticket becomes Closed on approval, or the request clears on denial.`;
+
+  // Idempotent: an existing pending request is left as-is (no duplicate record).
+  if (issue.pendingClose) {
+    return ToolResultOk(
+      JSON.stringify(
+        { workspace: getWorkspaceContext(), id: issue.id, pendingClose: true, message: `Already pending. ${message}` },
+        null,
+        2,
+      ),
+    );
+  }
+
+  const now = new Date().toISOString();
+  const next: Issue = {
+    ...issue,
+    pendingClose: { by: "agent", at: now, ...(args.note ? { note: args.note } : {}) },
+    record: [
+      ...issue.record,
+      {
+        at: now,
+        author: "agent",
+        text: args.note
+          ? `Close requested via MCP (awaiting human approval): ${args.note}`
+          : "Close requested via MCP (awaiting human approval)",
+      },
+    ],
+  };
+  await store.upsert(next);
+  return ToolResultOk(
+    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id, pendingClose: true, message }, null, 2),
   );
 }
 
@@ -1244,10 +1386,10 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
     {
       title: "Update ticket status",
       description:
-        "Move a ticket between Planned, Working, and Verification. " +
-        "You cannot mark a ticket Complete -- only a human reviewer can do that. " +
-        "You also cannot move a ticket back to Thinking once it has left. " +
-        `Each active lane is capped at ${liveCap} tickets; a move that would exceed the cap is rejected.`,
+        "Move a ticket among Thinking, Planned, Working, and Verification — promote a draft " +
+        "out of Thinking, shuffle the active lanes, or demote a ticket back to Thinking. " +
+        "You cannot mark a ticket Complete or Closed (use request_ticket_close to ask for a close). " +
+        `Each active lane is capped at ${liveCap} tickets; a move that would exceed the cap is rejected. Thinking is uncapped.`,
       inputSchema: STATUS_INPUT,
     },
     async (args) => runUpdateTicketStatus(store, args as UpdateStatusInput),
@@ -1259,7 +1401,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       title: "Update ticket progress",
       description:
         "Tick tasks done/undone and append a note to the ticket's record. " +
-        "Title, description, priority, type, and verifyCriteria are not modifiable here. " +
+        "Title, priority, type, and verifyCriteria are not modifiable here (edit the description via update_ticket_description). " +
         "Allowed on Thinking, Planned, Working, and Verification tickets; Complete and Closed are rejected. " +
         "To reshape a draft's tags/links/task-list, use update_ticket_draft (Thinking only).",
       inputSchema: PROGRESS_INPUT,
@@ -1280,6 +1422,33 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       inputSchema: DRAFT_INPUT,
     },
     async (args) => runUpdateTicketDraft(store, args as UpdateDraftInput),
+  );
+
+  mcp.registerTool(
+    "update_ticket_description",
+    {
+      title: "Update ticket description",
+      description:
+        "Replace a ticket's description. Allowed on Thinking, Planned, Working, and " +
+        "Verification tickets; Complete and Closed are rejected. Only the description " +
+        "changes (plus a record entry) — title, priority, type, and verifyCriteria stay locked.",
+      inputSchema: DESCRIPTION_INPUT,
+    },
+    async (args) => runUpdateTicketDescription(store, args as UpdateDescriptionInput),
+  );
+
+  mcp.registerTool(
+    "request_ticket_close",
+    {
+      title: "Request ticket close",
+      description:
+        "Ask a human to close a ticket you believe is done or no longer needed. This does " +
+        "NOT close it — it flags the ticket for human approval in DoStuff, where a human " +
+        "approves (moving it to Closed) or denies. Allowed on any non-terminal ticket. " +
+        "Poll get_ticket to see the outcome.",
+      inputSchema: CLOSE_REQUEST_INPUT,
+    },
+    async (args) => runRequestTicketClose(store, args as RequestCloseInput),
   );
 }
 

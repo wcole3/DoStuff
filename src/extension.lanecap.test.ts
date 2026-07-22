@@ -55,6 +55,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
     links: overrides.links ?? [],
+    pendingClose: overrides.pendingClose ?? null,
   };
 }
 

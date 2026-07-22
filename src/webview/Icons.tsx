@@ -5,6 +5,7 @@ export type IconName =
   | "search"
   | "close"
   | "chevronRight"
+  | "chevronLeft"
   | "chevronDown"
   | "chevronUp"
   | "plus"
@@ -44,6 +45,7 @@ const ICON_PATHS: Record<IconName, ReactNode> = {
   ),
   close: <path d="M3 3l10 10M13 3L3 13" />,
   chevronRight: <path d="M6 3l4 5-4 5" />,
+  chevronLeft: <path d="M10 3l-4 5 4 5" />,
   chevronDown: <path d="M3 6l5 4 5-4" />,
   chevronUp: <path d="M3 10l5-4 5 4" />,
   plus: <path d="M8 3v10M3 8h10" />,

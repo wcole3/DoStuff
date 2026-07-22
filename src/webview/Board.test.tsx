@@ -9,7 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { Board, decideDrop } from "./Board";
+import { Board, decideDrop, stepStatus } from "./Board";
 import { ACTIVE_LANE_CAP, type Issue } from "../types";
 import {
   installVsCodeApi,
@@ -294,6 +294,124 @@ describe("Drawer search + filter", () => {
     // Reopen — filter should be gone.
     fireEvent.click(drawerBtn);
     expect(screen.queryByText("Gamma issue")).not.toBeNull();
+  });
+});
+
+describe("stepStatus", () => {
+  test("walks the board order in both directions", () => {
+    expect(stepStatus("Thinking", 1)).toBe("Planned");
+    expect(stepStatus("Planned", 1)).toBe("Working");
+    expect(stepStatus("Working", 1)).toBe("Verification");
+    expect(stepStatus("Verification", 1)).toBe("Complete");
+    expect(stepStatus("Planned", -1)).toBe("Thinking");
+    expect(stepStatus("Working", -1)).toBe("Planned");
+    expect(stepStatus("Verification", -1)).toBe("Working");
+    expect(stepStatus("Complete", -1)).toBe("Verification");
+  });
+
+  test("returns null at the board edges", () => {
+    expect(stepStatus("Thinking", -1)).toBeNull();
+    expect(stepStatus("Complete", 1)).toBeNull();
+  });
+
+  test("returns null for Closed (off-board) in both directions", () => {
+    expect(stepStatus("Closed", -1)).toBeNull();
+    expect(stepStatus("Closed", 1)).toBeNull();
+  });
+});
+
+describe("Board card step arrows", () => {
+  test("a lane card renders both arrows; clicking right moves one lane right without opening detail", () => {
+    const a = makeIssue({ id: "DS-201", number: 201, title: "Step me", status: "Working" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    const card = document.querySelector(".bd-card") as HTMLElement;
+    expect(card.querySelector(".bd-card-step-left")?.getAttribute("title")).toBe("Move to Planned");
+    expect(card.querySelector(".bd-card-step-right")?.getAttribute("title")).toBe("Move to Verification");
+    // Each zone immediately precedes its rail (the `~` hover chain depends on
+    // this order), and the content sits in an inner column between the rails.
+    expect(card.querySelector(".bd-card-zone-left + .bd-card-step-left")).not.toBeNull();
+    expect(card.querySelector(".bd-card-zone-right + .bd-card-step-right")).not.toBeNull();
+    expect(card.querySelector(".bd-card-inner")).not.toBeNull();
+
+    fireEvent.click(card.querySelector(".bd-card-step-right") as HTMLElement);
+
+    expect(document.querySelector(".bd-focus")).toBeNull();
+    const updates = api.posted.filter((m) => m.type === "updateIssue");
+    expect(updates).toHaveLength(1);
+    expect((updates[0] as unknown as { issue: Issue }).issue.status).toBe("Verification");
+  });
+
+  test("clicking left on a Planned card demotes it into the Thinking drawer", () => {
+    const a = makeIssue({ id: "DS-202", number: 202, title: "Back to drawer", status: "Planned" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    const card = document.querySelector(".bd-card") as HTMLElement;
+    fireEvent.click(card.querySelector(".bd-card-step-left") as HTMLElement);
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue");
+    expect(updates).toHaveLength(1);
+    expect((updates[0] as unknown as { issue: Issue }).issue.status).toBe("Thinking");
+  });
+
+  test("right arrow into a full lane is blocked with a toast and no update", () => {
+    const mover = makeIssue({ id: "DS-210", number: 210, title: "Blocked", status: "Working" });
+    const fillers: Issue[] = [];
+    for (let i = 0; i < ACTIVE_LANE_CAP; i++) {
+      fillers.push(makeIssue({ id: `DS-25${i}`, number: 250 + i, status: "Verification" }));
+    }
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([mover, ...fillers]);
+
+    const workingCard = Array.from(document.querySelectorAll(".bd-card")).find((c) =>
+      c.textContent?.includes("Blocked"),
+    ) as HTMLElement;
+    fireEvent.click(workingCard.querySelector(".bd-card-step-right") as HTMLElement);
+
+    expect(api.posted.filter((m) => m.type === "updateIssue")).toHaveLength(0);
+    expect(document.querySelector(".bd-toast")?.textContent ?? "").toContain("full");
+  });
+
+  test("Thinking drawer card: only a right arrow, promoting to Planned", () => {
+    const a = makeIssue({ id: "DS-203", number: 203, title: "Draft", status: "Thinking" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement);
+    const card = document.querySelector(".bd-drawer-card") as HTMLElement;
+    expect(card.querySelector(".bd-card-step-left")).toBeNull();
+    expect(card.querySelector(".bd-card-step-right")?.getAttribute("title")).toBe("Move to Planned");
+
+    fireEvent.click(card.querySelector(".bd-card-step-right") as HTMLElement);
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue");
+    expect(updates).toHaveLength(1);
+    expect((updates[0] as unknown as { issue: Issue }).issue.status).toBe("Planned");
+    expect(document.querySelector(".bd-focus")).toBeNull();
+  });
+
+  test("Complete drawer card: only a left arrow, moving back to Verification", () => {
+    const a = makeIssue({ id: "DS-204", number: 204, title: "Reopen", status: "Complete" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-right .bd-drawer-head") as HTMLElement);
+    const card = document.querySelector(".bd-drawer-card") as HTMLElement;
+    expect(card.querySelector(".bd-card-step-right")).toBeNull();
+    expect(card.querySelector(".bd-card-step-left")?.getAttribute("title")).toBe("Move to Verification");
+
+    fireEvent.click(card.querySelector(".bd-card-step-left") as HTMLElement);
+
+    const updates = api.posted.filter((m) => m.type === "updateIssue");
+    expect(updates).toHaveLength(1);
+    expect((updates[0] as unknown as { issue: Issue }).issue.status).toBe("Verification");
   });
 });
 

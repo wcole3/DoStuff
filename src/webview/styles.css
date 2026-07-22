@@ -201,6 +201,12 @@ button { font: inherit; color: inherit; }
 }
 .ds-row-id { font-variant-numeric: tabular-nums; opacity: .75; font-size: 10.5px; }
 .ds-row-dot { opacity: .4; }
+.ds-row-pending-close {
+  display: inline-flex; align-items: center; gap: 3px;
+  color: #e2c08d;
+  font-size: 10px;
+  text-transform: uppercase; letter-spacing: .04em; font-weight: 600;
+}
 .ds-row-date { font-variant-numeric: tabular-nums; }
 
 /* Feature-tag chips. `--tag-color` is set inline per chip from tagColor(). */
@@ -373,6 +379,50 @@ button { font: inherit; color: inherit; }
   border-radius: 3px;
   grid-column: 2;
 }
+
+/* Agent close-request banner (IssueDetail). Amber accent = needs a human
+   decision; approve is tinted with the Complete green. */
+.ds-d-close-req {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, #e2c08d 45%, transparent);
+  background: color-mix(in srgb, #e2c08d 12%, transparent);
+  border-radius: var(--radius);
+  margin: 2px 0 4px;
+}
+.ds-d-close-req-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 600;
+  color: var(--vsc-fg);
+}
+.ds-d-close-req-head svg { color: #e2c08d; }
+.ds-d-close-req-note {
+  font-size: 11.5px;
+  color: var(--vsc-fg-muted);
+  font-style: italic;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ds-d-close-req-actions { display: flex; gap: 6px; margin-top: 2px; }
+.ds-d-close-req-approve, .ds-d-close-req-deny {
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.ds-d-close-req-approve {
+  background: color-mix(in srgb, #89d185 22%, transparent);
+  border-color: color-mix(in srgb, #89d185 55%, transparent);
+  color: var(--vsc-fg);
+}
+.ds-d-close-req-approve:hover { background: color-mix(in srgb, #89d185 34%, transparent); }
+.ds-d-close-req-deny {
+  background: transparent;
+  border-color: var(--vsc-border-2);
+  color: var(--vsc-fg-muted);
+}
+.ds-d-close-req-deny:hover { background: var(--vsc-hover); color: var(--vsc-fg); }
 
 .ds-d-section-h {
   font-size: 10.5px; font-weight: 600;
@@ -851,18 +901,90 @@ button { font: inherit; color: inherit; }
 /* Cards */
 .bd-card {
   --card-accent: var(--accent);
+  position: relative; /* anchors the edge hover-zones */
   background: var(--vsc-card-2);
   border: 1px solid var(--vsc-border-2);
   border-radius: 5px;
   padding: 8px 10px;
   cursor: grab;
-  display: flex; flex-direction: column; gap: 6px;
+  /* Row layout: [left step-rail] [.bd-card-inner column] [right step-rail].
+     The rails are width-0 until their edge zone is hovered. */
+  display: flex; align-items: stretch;
   user-select: none;
   transition: transform .12s ease, box-shadow .12s ease, background .12s ease, border-color .12s ease;
 }
 .bd-card:hover { background: var(--vsc-hover); border-color: var(--vsc-fg-dim); }
 .bd-card:active { cursor: grabbing; }
 .bd-card.is-dragging { opacity: .35; transform: scale(.98); }
+
+/* Edge-hover step-arrows: move a ticket one board position left/right
+   (including into the Thinking / Complete drawers).
+
+   Each card edge carries an invisible hover "zone" over its outer tenth. The
+   zone has no background and no handlers — its pointer events bubble to the
+   card, so dragging or clicking from the edge behaves exactly like the
+   center. The arrow itself is a "rail": a real flex item in the card row
+   with width 0. Hovering a zone GROWS the rail out of the card edge and the
+   content column (.bd-card-inner, min-width:0) squeezes aside — nothing is
+   overlaid. DOM order (zone before its rail) powers the `~` hover chain, and
+   the rail sits above the zone (z-index) so it receives the click once
+   grown; its own :hover keeps it open while the pointer is on it. The rail
+   is tinted with the *target* lane's accent so the color hints where the
+   ticket would land. */
+.bd-card-zone {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 10%;
+  min-width: 14px;
+  z-index: 2;
+}
+.bd-card-zone-left { left: 0; }
+.bd-card-zone-right { right: 0; }
+
+.bd-card-inner {
+  flex: 1 1 auto;
+  min-width: 0; /* lets the column compress when a rail grows */
+  display: flex; flex-direction: column;
+}
+.bd-card .bd-card-inner { gap: 6px; }
+.bd-drawer-card .bd-card-inner { gap: 5px; }
+
+.bd-card-step {
+  position: relative; z-index: 3; /* above the zone so the click lands on the rail */
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 0;
+  margin: 0;
+  padding: 0; border: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  overflow: hidden; /* clips the chevron while collapsed */
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--step-accent, var(--accent)) 16%, transparent);
+  color: var(--step-accent, var(--vsc-fg-muted));
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    width .2s cubic-bezier(.34, 1.3, .64, 1),
+    margin .2s cubic-bezier(.34, 1.3, .64, 1),
+    opacity .15s ease,
+    background .15s ease,
+    box-shadow .15s ease;
+}
+.bd-card-zone-left:hover ~ .bd-card-step-left,
+.bd-card-step-left:hover,
+.bd-card-step-left:focus-visible {
+  width: 20px; opacity: 1; margin-right: 8px;
+}
+.bd-card-zone-right:hover ~ .bd-card-step-right,
+.bd-card-step-right:hover,
+.bd-card-step-right:focus-visible {
+  width: 20px; opacity: 1; margin-left: 8px;
+}
+.bd-card-step:hover {
+  background: color-mix(in srgb, var(--step-accent, var(--accent)) 30%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--step-accent, var(--accent)) 60%, transparent);
+}
+.bd-card.is-dragging .bd-card-zone { display: none; }
 
 /* Floating ghost rendered by the pointer-event drag system (see Board.tsx).
    pointer-events:none in the inline style so elementFromPoint hits the lane
@@ -890,6 +1012,7 @@ button { font: inherit; color: inherit; }
 .bd-card-spacer { flex: 1; }
 .bd-card-type { display: inline-flex; opacity: .7; }
 .bd-card-pri { display: inline-flex; }
+.bd-card-pending-close { display: inline-flex; align-items: center; color: #e2c08d; margin-right: 4px; }
 
 .bd-card-title {
   font-size: 13px; line-height: 1.35;
@@ -995,11 +1118,13 @@ button { font: inherit; color: inherit; }
   border: 2px solid transparent; background-clip: content-box;
 }
 .bd-drawer-card {
+  position: relative; /* anchors the edge hover-zones */
   background: var(--vsc-card-2);
   border: 1px solid var(--vsc-border-2);
   border-radius: 5px;
   padding: 7px 9px;
-  display: flex; flex-direction: column; gap: 5px;
+  /* Row layout, same as .bd-card: step-rails flank .bd-card-inner. */
+  display: flex; align-items: stretch;
   cursor: grab;
   margin: 0 0 6px;
   box-sizing: border-box;

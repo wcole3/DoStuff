@@ -24,6 +24,8 @@ import {
   runUpdateTicketStatus,
   runUpdateTicketProgress,
   runUpdateTicketDraft,
+  runUpdateTicketDescription,
+  runRequestTicketClose,
   registerMcpTools,
   getWorkspaceContext,
   DoStuffMcpServer,
@@ -93,6 +95,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
     links: overrides.links ?? [],
+    pendingClose: overrides.pendingClose ?? null,
   };
 }
 
@@ -794,11 +797,37 @@ describe("update_ticket_status", () => {
     expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
-  test("Thinking -> Planned: rejected (human-only promotion)", async () => {
+  test("Thinking -> Planned: allowed (agent may promote a draft into the pipeline)", async () => {
     const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking" })]);
     const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Planned" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Planned");
+    expect(store.get("DS-001")!.statusHistory.at(-1)).toMatchObject({ status: "Planned", by: "agent" });
+  });
+
+  test("Thinking -> Working: allowed (promotion may target any active lane)", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking" })]);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Working" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Working");
+  });
+
+  test("Thinking -> Verification: allowed", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking" })]);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Verification" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Verification");
+  });
+
+  test("Thinking -> Planned: rejected when the Planned lane is already full", async () => {
+    const seed = [makeIssue({ id: "DS-001", status: "Thinking" })];
+    for (let i = 2; i <= 7; i++) {
+      seed.push(makeIssue({ id: `DS-${String(i).padStart(3, "0")}`, status: "Planned" }));
+    }
+    const store = await makeStore(seed);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Planned" });
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("Thinking");
+    expect(res.content[0].text).toContain("full");
     expect(store.get("DS-001")!.status).toBe("Thinking");
   });
 
@@ -828,17 +857,38 @@ describe("update_ticket_status", () => {
     expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
-  test("Planned -> Thinking: rejected with actionable message explaining the human-triage rule", async () => {
-    const store = await makeStore([makeIssue({ id: "DS-001", status: "Planned" })]);
-    // bypass schema by casting; handler must still reject
-    const res = await runUpdateTicketStatus(store, {
-      id: "DS-001",
-      status: "Thinking" as Status,
+  for (const source of ["Planned", "Working", "Verification"] as const) {
+    test(`${source} -> Thinking: allowed (agent may demote back to the drawer)`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status: source })]);
+      const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Thinking" });
+      expect(res.isError).toBeFalsy();
+      const u = store.get("DS-001")!;
+      expect(u.status).toBe("Thinking");
+      expect(u.statusHistory.at(-1)).toMatchObject({ status: "Thinking", by: "agent" });
     });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("human triage queue");
-    expect(res.content[0].text).toContain("Planned, Working, Verification");
-    expect(store.get("DS-001")!.status).toBe("Planned");
+  }
+
+  test("Thinking is uncapped: demotion succeeds even with many Thinking tickets", async () => {
+    const seed = [makeIssue({ id: "DS-001", status: "Planned" })];
+    for (let i = 2; i <= 9; i++) {
+      seed.push(makeIssue({ id: `DS-${String(i).padStart(3, "0")}`, status: "Thinking" }));
+    }
+    const store = await makeStore(seed);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Thinking" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Thinking");
+  });
+
+  test("demoting to Thinking re-opens update_ticket_draft scope editing", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tags: [] })]);
+    // Locked while active…
+    const locked = await runUpdateTicketDraft(store, { id: "DS-001", tags: ["rescoped"] });
+    expect(locked.isError).toBe(true);
+    // …unlocked after an agent demotes it back to Thinking.
+    await runUpdateTicketStatus(store, { id: "DS-001", status: "Thinking" });
+    const unlocked = await runUpdateTicketDraft(store, { id: "DS-001", tags: ["rescoped"] });
+    expect(unlocked.isError).toBeFalsy();
+    expect(store.get("DS-001")!.tags).toEqual(["rescoped"]);
   });
 
   test("Planned -> Complete: rejected (only humans complete)", async () => {
@@ -1294,6 +1344,132 @@ describe("update_ticket_draft", () => {
     expect(u.priority).toBe("High");
     expect(u.type).toBe("Bug");
     expect(u.verifyCriteria).toBe("Original verify");
+  });
+});
+
+describe("update_ticket_description", () => {
+  for (const status of ["Thinking", "Planned", "Working", "Verification"] as const) {
+    test(`edits the description on a ${status} ticket and appends one agent record`, async () => {
+      const store = await makeStore([
+        makeIssue({ id: "DS-001", status, description: "old", record: [] }),
+      ]);
+      const res = await runUpdateTicketDescription(store, { id: "DS-001", description: "new prose" });
+      expect(res.isError).toBeFalsy();
+      const u = store.get("DS-001")!;
+      expect(u.description).toBe("new prose");
+      expect(u.status).toBe(status);
+      expect(u.record).toHaveLength(1);
+      expect(u.record[0]).toMatchObject({ author: "agent" });
+    });
+  }
+
+  test("leaves title/priority/type/verifyCriteria untouched", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        title: "Original",
+        priority: "High",
+        type: "Bug",
+        verifyCriteria: "Original verify",
+        description: "old",
+      }),
+    ]);
+    await runUpdateTicketDescription(store, { id: "DS-001", description: "changed" });
+    const u = store.get("DS-001")!;
+    expect(u.title).toBe("Original");
+    expect(u.priority).toBe("High");
+    expect(u.type).toBe("Bug");
+    expect(u.verifyCriteria).toBe("Original verify");
+    expect(u.description).toBe("changed");
+  });
+
+  for (const status of ["Complete", "Closed"] as const) {
+    test(`rejects a ${status} ticket`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status, description: "keep" })]);
+      const res = await runUpdateTicketDescription(store, { id: "DS-001", description: "nope" });
+      expect(res.isError).toBe(true);
+      expect(store.get("DS-001")!.description).toBe("keep");
+    });
+  }
+
+  test("rejects an unknown id", async () => {
+    const store = await makeStore([]);
+    const res = await runUpdateTicketDescription(store, { id: "DS-999", description: "x" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("not found");
+  });
+
+  test("rejects an over-length description", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working" })]);
+    const res = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "x".repeat(20_001),
+    });
+    expect(res.isError).toBe(true);
+  });
+
+  test("strict-rejects a smuggled extra field (e.g. title)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", title: "Original", description: "old" }),
+    ]);
+    const res = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "new",
+      title: "hacked",
+    } as unknown as { id: string; description: string });
+    expect(res.isError).toBe(true);
+    const u = store.get("DS-001")!;
+    expect(u.title).toBe("Original");
+    expect(u.description).toBe("old");
+  });
+});
+
+describe("request_ticket_close", () => {
+  for (const status of ["Thinking", "Planned", "Working", "Verification"] as const) {
+    test(`flags pendingClose on a ${status} ticket without changing status`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status, record: [] })]);
+      const res = await runRequestTicketClose(store, { id: "DS-001", note: "done here" });
+      expect(res.isError).toBeFalsy();
+      const u = store.get("DS-001")!;
+      expect(u.status).toBe(status);
+      expect(u.pendingClose).toMatchObject({ by: "agent", note: "done here" });
+      expect(u.record).toHaveLength(1);
+      expect(u.record[0]).toMatchObject({ author: "agent" });
+      expect(res.content[0].text).toContain("approve");
+      expect(res.content[0].text).toContain("get_ticket");
+    });
+  }
+
+  test("is idempotent: a second request adds no duplicate record and keeps the original", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", record: [] })]);
+    await runRequestTicketClose(store, { id: "DS-001" });
+    const afterFirst = store.get("DS-001")!;
+    expect(afterFirst.pendingClose).not.toBeNull();
+    expect(afterFirst.record).toHaveLength(1);
+
+    const res = await runRequestTicketClose(store, { id: "DS-001", note: "again" });
+    expect(res.isError).toBeFalsy();
+    const afterSecond = store.get("DS-001")!;
+    expect(afterSecond.record).toHaveLength(1);
+    expect(afterSecond.pendingClose).toMatchObject({ by: "agent" });
+    expect(afterSecond.pendingClose?.note).toBeUndefined();
+  });
+
+  for (const status of ["Complete", "Closed"] as const) {
+    test(`rejects a ${status} ticket`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status })]);
+      const res = await runRequestTicketClose(store, { id: "DS-001" });
+      expect(res.isError).toBe(true);
+      expect(store.get("DS-001")!.pendingClose).toBeNull();
+    });
+  }
+
+  test("rejects an unknown id", async () => {
+    const store = await makeStore([]);
+    const res = await runRequestTicketClose(store, { id: "DS-999" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("not found");
   });
 });
 
@@ -1872,6 +2048,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       "create_ticket",
       "get_ticket",
       "list_issues",
+      "request_ticket_close",
+      "update_ticket_description",
       "update_ticket_draft",
       "update_ticket_progress",
       "update_ticket_status",
@@ -1892,6 +2070,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
         "create_ticket",
         "get_ticket",
         "list_issues",
+        "request_ticket_close",
+        "update_ticket_description",
         "update_ticket_draft",
         "update_ticket_progress",
         "update_ticket_status",

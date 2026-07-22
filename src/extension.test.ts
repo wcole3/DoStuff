@@ -5,7 +5,13 @@
 // in or out of "Complete".
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { mergeIssueUpdate, validateLinks, type UpdateBy } from "./extension";
+import {
+  mergeIssueUpdate,
+  resolveCloseRequest,
+  validateImportList,
+  validateLinks,
+  type UpdateBy,
+} from "./extension";
 import type { Issue, IssueType, Priority, Status, StatusEvent, TicketLink } from "./types";
 
 let issueCounter = 0;
@@ -32,6 +38,7 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
     record: overrides.record ?? [],
     attachments: overrides.attachments ?? [],
     links: overrides.links ?? [],
+    pendingClose: overrides.pendingClose ?? null,
   };
 }
 
@@ -263,6 +270,88 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
     expect(next.createdAt).toBe(prior.createdAt);
     expect(next.record).toBe(prior.record);
     expect(next.title).toBe("renamed");
+  });
+
+  test("incoming.pendingClose is ignored; prior.pendingClose survives a normal edit", () => {
+    const prior = makeIssue({
+      status: "Working",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "keep" },
+    });
+    const incoming: Partial<Issue> = {
+      title: "edit",
+      // A stale/hostile webview payload forging a clear must be ignored:
+      // pendingClose is preserved via `...prior`, never taken from `incoming`.
+      pendingClose: null,
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+
+    expect(next.pendingClose).toBe(prior.pendingClose);
+    expect(next.pendingClose).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z", note: "keep" });
+    expect(next.title).toBe("edit");
+  });
+});
+
+describe("resolveCloseRequest", () => {
+  const NOW = () => "2026-06-01T00:00:00.000Z";
+
+  test("approve moves the ticket to Closed, clears the flag, appends user history + record", () => {
+    const prior = makeIssue({
+      status: "Working",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
+    });
+    const next = resolveCloseRequest(prior, "approve", NOW);
+    expect(next).not.toBeNull();
+    expect(next!.status).toBe("Closed");
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.statusHistory.at(-1)).toEqual({ status: "Closed", at: NOW(), by: "user" });
+    expect(next!.record.at(-1)).toMatchObject({ author: "user" });
+  });
+
+  test("deny clears the flag, leaves status + history unchanged, appends a user record", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
+    });
+    const next = resolveCloseRequest(prior, "deny", NOW);
+    expect(next).not.toBeNull();
+    expect(next!.status).toBe("Verification");
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.statusHistory).toBe(prior.statusHistory);
+    expect(next!.record.at(-1)).toMatchObject({ author: "user" });
+  });
+
+  test("returns null when there is nothing pending to resolve", () => {
+    const prior = makeIssue({ status: "Working", pendingClose: null });
+    expect(resolveCloseRequest(prior, "approve", NOW)).toBeNull();
+    expect(resolveCloseRequest(prior, "deny", NOW)).toBeNull();
+  });
+});
+
+describe("validateImportList — pendingClose", () => {
+  test("defaults a missing pendingClose to null and coerces a malformed one", () => {
+    const { valid } = validateImportList([
+      { id: "DS-001", title: "a", createdAt: "2025-01-01T00:00:00.000Z" },
+      {
+        id: "DS-002",
+        title: "b",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "n" },
+      },
+      {
+        id: "DS-003",
+        title: "c",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        pendingClose: { by: "user", at: "bad" },
+      },
+    ]);
+    const byId = new Map(valid.map((i) => [i.id, i]));
+    expect(byId.get("DS-001")?.pendingClose).toBeNull();
+    expect(byId.get("DS-002")?.pendingClose).toEqual({
+      by: "agent",
+      at: "2026-05-18T00:00:00.000Z",
+      note: "n",
+    });
+    expect(byId.get("DS-003")?.pendingClose).toBeNull();
   });
 });
 

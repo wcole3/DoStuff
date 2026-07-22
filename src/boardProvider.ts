@@ -270,6 +270,19 @@ export class BoardPanel {
       case "openGraph":
         vscode.commands.executeCommand("dostuff.openGraph");
         break;
+      case "resolveClose": {
+        const m = msg as { id?: unknown; verdict?: unknown };
+        if (
+          typeof m.id !== "string" ||
+          !ID_RE.test(m.id) ||
+          (m.verdict !== "approve" && m.verdict !== "deny")
+        ) {
+          this.output.appendLine(`Rejected resolveClose: bad payload (${JSON.stringify(msg)})`);
+          break;
+        }
+        vscode.commands.executeCommand("dostuff.resolveClose", { id: m.id, verdict: m.verdict });
+        break;
+      }
       // The board view ignores message types only the sidebar handles
       // (e.g. "createIssue", "openBoard", "openSettings"). Log + drop.
       default: {

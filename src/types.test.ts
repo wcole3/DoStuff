@@ -6,6 +6,7 @@ import {
   LINK_KINDS,
   coerceAttachments,
   coerceLinks,
+  coercePendingClose,
   isLinkKind,
   type Attachment,
 } from "./types";
@@ -210,5 +211,48 @@ describe("isLinkKind", () => {
     expect(isLinkKind(undefined)).toBe(false);
     expect(isLinkKind(null)).toBe(false);
     expect(isLinkKind(42)).toBe(false);
+  });
+});
+
+describe("coercePendingClose", () => {
+  const ISO = "2026-05-18T00:00:00.000Z";
+
+  test("accepts a well-formed request with a note", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, note: "ship it" })).toEqual({
+      by: "agent",
+      at: ISO,
+      note: "ship it",
+    });
+  });
+
+  test("accepts a request without a note (note omitted, not null)", () => {
+    const out = coercePendingClose({ by: "agent", at: ISO });
+    expect(out).toEqual({ by: "agent", at: ISO });
+    expect(out && "note" in out).toBe(false);
+  });
+
+  test("returns null for null / undefined / non-object input", () => {
+    expect(coercePendingClose(null)).toBeNull();
+    expect(coercePendingClose(undefined)).toBeNull();
+    expect(coercePendingClose("nope")).toBeNull();
+    expect(coercePendingClose(42)).toBeNull();
+  });
+
+  test('returns null when `by` is not "agent"', () => {
+    expect(coercePendingClose({ by: "user", at: ISO })).toBeNull();
+  });
+
+  test("returns null when `at` is missing or not ISO 8601", () => {
+    expect(coercePendingClose({ by: "agent" })).toBeNull();
+    expect(coercePendingClose({ by: "agent", at: "yesterday" })).toBeNull();
+    expect(coercePendingClose({ by: "agent", at: 123 })).toBeNull();
+  });
+
+  test("drops a non-string note but keeps the request", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, note: 5 })).toEqual({ by: "agent", at: ISO });
+  });
+
+  test("ignores extra keys", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, extra: "x" })).toEqual({ by: "agent", at: ISO });
   });
 });

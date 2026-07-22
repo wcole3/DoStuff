@@ -18,34 +18,41 @@ Workflow contract:
   2. Tickets have descriptions and verify criteria written by the human. Read before
      starting.  Some tickets have subtasks to help you plan.
   3. Read \`dostuff://tickets\` to discover work. It lists Thinking + active-lane
-     tickets (Complete and Closed are hidden). Thinking tickets are drafts the
-     human hasn't triaged yet -- do not start work on them, and only a human can
-     promote one to Planned. You *may* read and annotate them via
-     \`update_ticket_progress\`: use this to record relationships ("blocks DS-042",
-     "follow-up of DS-019") on a ticket you just filed with \`create_ticket\`, or
-     to leave context for the human before they triage.
-  4. When you start a ticket, call \`update_ticket_status\` to move it to "Working".
-     When you believe it's ready for verification, move it to "Verification".
-  5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
-     decides. If your verification fails, move it back to "Working".
+     tickets (Complete and Closed are hidden). Thinking tickets are untriaged
+     drafts; you MAY promote one into an active lane with \`update_ticket_status\`
+     when you pick it up. You may also annotate any non-terminal ticket via
+     \`update_ticket_progress\` (e.g. record "blocks DS-042" on a ticket you just
+     filed) or reshape a Thinking draft with \`update_ticket_draft\`.
+  4. Call \`update_ticket_status\` to move a ticket among Thinking, Planned,
+     Working, and Verification -- promote a draft out of Thinking, shuffle the
+     active lanes, or demote a ticket back to Thinking to de-prioritize it. Move
+     it to "Working" when you start and "Verification" when it's ready to review.
+  5. You cannot mark a ticket "Complete" or "Closed". A human reviews
+     Verification tickets and decides. If your verification fails, move it back
+     to "Working".
   6. Active lanes (Planned, Working, Verification) are capped at ${cap} tickets each.
-     Moves that would exceed the cap are rejected.
+     Moves that would exceed the cap are rejected (this includes promotions out
+     of Thinking).
   7. As you make progress, call \`update_ticket_progress\` to tick tasks off and
      append a short note to the ticket's record. Be terse and factual.
-  8. If you discover follow-up work, call \`create_ticket\` to file it. New
+  8. Use \`update_ticket_description\` to correct or expand a ticket's description.
+     Allowed on any non-terminal ticket (Thinking/Planned/Working/Verification).
+  9. If you discover follow-up work, call \`create_ticket\` to file it. New
      tickets land in "Thinking" for the human to triage. Optionally supply
      \`links: [{ targetId, kind }]\` to record first-class relationships at
      creation time (kinds: blocks, child-of, relates-to).
-  9. While a ticket is still in "Thinking" (an untriaged draft), call
-     \`update_ticket_draft\` to reshape its tags, links, and/or task list --
-     useful for fleshing out a ticket you just filed before a human triages
-     it. Once it's triaged to an active lane, that scope locks -- you can then
-     only toggle task done-state via \`update_ticket_progress\`.
+ 10. While a ticket is in "Thinking", call \`update_ticket_draft\` to reshape its
+     tags, links, and/or task list -- in an active lane that scope locks and you
+     can only toggle task done-state via \`update_ticket_progress\` (demote the
+     ticket back to Thinking if its scope genuinely needs reshaping).
+ 11. If a ticket is done or no longer needed, call \`request_ticket_close\`. This
+     does not close it -- it asks the human to approve the close in DoStuff.
+     Poll \`get_ticket\` for the outcome (Closed on approval, request clears on
+     denial).
 
-You may NOT modify a ticket's title, description, priority, type, or verify
-criteria via the MCP server, and tags/links/tasks become read-only once a
-ticket leaves "Thinking". If something is wrong with those, file a new
-ticket instead.`;
+You may NOT modify a ticket's title, priority, type, or verify criteria via the
+MCP server, and tags/links/tasks become read-only once a ticket leaves
+"Thinking". If something is wrong with those, file a new ticket instead.`;
 }
 
 // Convenience snapshot at the schema-default cap. Used by tests and by

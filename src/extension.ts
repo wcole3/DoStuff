@@ -15,6 +15,7 @@ import {
   canMoveToActiveLane,
   coerceAttachments,
   coerceLinks,
+  coercePendingClose,
   coerceTags,
   isPriority,
   isStatus,
@@ -180,6 +181,41 @@ export function mergeIssueUpdate(
   return { next };
 }
 
+/**
+ * Pure core of the host `resolveClose` handler (exported for tests). Given a
+ * ticket with a pending agent close request, returns the next Issue for the
+ * human's verdict — approve moves it to `Closed` and clears the flag; deny
+ * clears the flag and leaves status unchanged. Returns `null` when there is
+ * nothing pending to resolve.
+ *
+ * `record`/`statusHistory` are appended here (author "user"), which is exactly
+ * why this can't route through {@link mergeIssueUpdate} — those fields are
+ * server-derived and never taken from an incoming payload. `resolvedAt` is left
+ * untouched: it tracks acceptance (Complete), and Closed is "won't do".
+ */
+export function resolveCloseRequest(
+  prior: Issue,
+  verdict: "approve" | "deny",
+  now: () => string = () => new Date().toISOString(),
+): Issue | null {
+  if (!prior.pendingClose) return null;
+  const ts = now();
+  if (verdict === "approve") {
+    return {
+      ...prior,
+      status: "Closed",
+      pendingClose: null,
+      statusHistory: [...prior.statusHistory, { status: "Closed", at: ts, by: "user" }],
+      record: [...prior.record, { at: ts, author: "user", text: "Close request approved" }],
+    };
+  }
+  return {
+    ...prior,
+    pendingClose: null,
+    record: [...prior.record, { at: ts, author: "user", text: "Close request denied" }],
+  };
+}
+
 /** Required-field shape check on an imported issue. Coerces missing enum values to defaults. */
 export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: number } {
   const valid: Issue[] = [];
@@ -226,6 +262,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
         ? (e.statusHistory as Issue["statusHistory"])
         : [{ status, at: e.createdAt, by: "user" }],
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
+      pendingClose: coercePendingClose(e.pendingClose),
     };
     valid.push(issue);
   }
@@ -265,8 +302,9 @@ export function activate(context: vscode.ExtensionContext) {
    *
    *   1. Reconstructing the persisted issue from a small allow-list of mutable
    *      fields (see {@link mergeIssueUpdate}). Server-derived fields like
-   *      `statusHistory`, `resolvedAt`, `id`, `number`, `createdAt`, `record`
-   *      are never trusted from the webview payload.
+   *      `statusHistory`, `resolvedAt`, `id`, `number`, `createdAt`, `record`,
+   *      `pendingClose` are never trusted from the webview payload (an agent
+   *      close request is set via MCP and cleared only by {@link resolveClose}).
    *   2. Enforcing the active-lane cap (Planned/Working/Verification ≤ 6).
    *   3. Note: the UI is allowed to move a ticket out of "Complete" (humans can
    *      correct mis-clicks). The MCP layer enforces a stricter contract.
@@ -309,6 +347,26 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }
 
+    await store.upsert(next);
+  };
+
+  /**
+   * Apply a human's verdict on an agent's pending close request. Approve moves
+   * the ticket to `Closed` and clears the flag; deny clears the flag. Built
+   * directly (not via `applyIssueUpdate`) because it appends a `record` entry,
+   * which the merge chokepoint deliberately never accepts from a payload.
+   * On a no-op (nothing pending — e.g. already resolved in another window) we
+   * re-broadcast so any stale "awaiting close" banner in an open webview clears.
+   */
+  const resolveClose = async (id: string, verdict: "approve" | "deny"): Promise<void> => {
+    const prior = store.get(id);
+    const next = prior ? resolveCloseRequest(prior, verdict) : null;
+    if (!next) {
+      sidebar.broadcast();
+      BoardPanel.broadcast(store.list());
+      GraphPanel.broadcast(store.list());
+      return;
+    }
     await store.upsert(next);
   };
 
@@ -640,6 +698,16 @@ export function activate(context: vscode.ExtensionContext) {
       if (typeof id !== "string" || !/^DS-\d+$/.test(id)) return;
       sidebar.revealTicket(id);
       BoardPanel.revealTicket(id);
+    }),
+
+    // Human verdict on an agent's pending close request. Forwarded from the
+    // sidebar/board webview `resolveClose` message via executeCommand.
+    vscode.commands.registerCommand("dostuff.resolveClose", (arg: unknown) => {
+      if (!arg || typeof arg !== "object") return;
+      const { id, verdict } = arg as { id?: unknown; verdict?: unknown };
+      if (typeof id !== "string" || !/^DS-\d+$/.test(id)) return;
+      if (verdict !== "approve" && verdict !== "deny") return;
+      void resolveClose(id, verdict);
     }),
 
     vscode.commands.registerCommand("dostuff.newIssue", () => {

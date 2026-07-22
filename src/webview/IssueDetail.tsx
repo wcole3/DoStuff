@@ -24,6 +24,7 @@ import {
   postOpenAttachment,
   postOpenLink,
   postPickAttachment,
+  postResolveClose,
   postUpdateIssue,
   useIssues,
 } from "./messaging";
@@ -275,6 +276,32 @@ export function IssueDetail({ issue }: IssueDetailProps) {
           <Icon name="trash" size={12} />
         </button>
       </div>
+
+      {issue.pendingClose && (
+        <div className="ds-d-close-req" role="alert">
+          <div className="ds-d-close-req-head">
+            <Icon name="clock" size={12} />
+            <span>An agent requested to close this ticket.</span>
+          </div>
+          {issue.pendingClose.note && (
+            <div className="ds-d-close-req-note">“{issue.pendingClose.note}”</div>
+          )}
+          <div className="ds-d-close-req-actions">
+            <button
+              className="ds-d-close-req-approve"
+              onClick={() => postResolveClose(issue.id, "approve")}
+            >
+              Approve &amp; close
+            </button>
+            <button
+              className="ds-d-close-req-deny"
+              onClick={() => postResolveClose(issue.id, "deny")}
+            >
+              Deny
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="ds-d-grid">
         <label className="ds-d-label">Status</label>
