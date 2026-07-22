@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { deriveGuid } from "./syncMerge";
+import { GitSyncController } from "./gitSync";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
 import { GraphPanel } from "./graphProvider";
@@ -737,8 +738,15 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("dostuff.clearAll", async () => {
+      // With sync on, replaceAll([]) records tombstones for every ticket and
+      // the deletion propagates to every replica on next sync — say so.
+      const syncOn = vscode.workspace
+        .getConfiguration("dostuff")
+        .get<boolean>("sync.enabled", false);
       const answer = await vscode.window.showWarningMessage(
-        "Delete all issues? This cannot be undone.",
+        syncOn
+          ? "Delete all issues? This cannot be undone. This will also delete these tickets for everyone syncing this repo."
+          : "Delete all issues? This cannot be undone.",
         { modal: true },
         "Clear All",
       );
@@ -978,6 +986,103 @@ export function activate(context: vscode.ExtensionContext) {
   // Fire-and-forget so the extension is marked active before the MCP SDK
   // dynamic import + port bind + registry write resolve (~50–200 ms).
   void reconcileMcp();
+
+  // ─── Git ticket sync ──────────────────────────────────────────────────
+  // Mirrors the MCP block: a reconcile function reads config and starts or
+  // stops the controller; hooked to config + workspace-folder changes. No
+  // lazy import needed — gitSync has no heavy deps (04-controller-wiring §3).
+  let sync: GitSyncController | null = null;
+
+  const syncStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+  syncStatusItem.command = "dostuff.sync.now";
+  const refreshSyncStatus = (status?: import("./gitSync").SyncStatus) => {
+    const cfg = vscode.workspace.getConfiguration("dostuff");
+    if (!cfg.get<boolean>("sync.enabled", false)) {
+      syncStatusItem.hide();
+      return;
+    }
+    const s = status ?? sync?.status ?? { state: "disabled" as const };
+    const icon =
+      s.state === "syncing"
+        ? "$(sync~spin)"
+        : s.state === "pendingPush" || s.state === "error"
+          ? "$(warning)"
+          : "$(sync)";
+    syncStatusItem.text = `${icon} DoStuff Sync`;
+    syncStatusItem.tooltip = [
+      `DoStuff git sync: ${s.state}`,
+      s.detail ?? "",
+      s.lastSyncAt ? `Last sync: ${s.lastSyncAt}` : "",
+      "Click to sync now.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    syncStatusItem.show();
+  };
+
+  const reconcileSync = () => {
+    const cfg = vscode.workspace.getConfiguration("dostuff");
+    const enabled = cfg.get<boolean>("sync.enabled", false);
+    // Always rebuild on reconcile — settings are few and cheap, and a fresh
+    // controller picks up remote/ref/interval changes without diff logic.
+    if (sync) {
+      sync.dispose();
+      sync = null;
+    }
+    if (!enabled) {
+      refreshSyncStatus();
+      return;
+    }
+    const controller = new GitSyncController(
+      store,
+      () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+      {
+        remote: cfg.get<string>("sync.remote", "origin"),
+        ref: cfg.get<string>("sync.ref", "refs/dostuff/state"),
+        intervalMinutes: cfg.get<number>("sync.intervalMinutes", 5),
+        activeLaneCap: cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP),
+      },
+    );
+    sync = controller;
+    context.subscriptions.push(controller.onStatusChange((s) => refreshSyncStatus(s)));
+    controller.start();
+    refreshSyncStatus();
+  };
+
+  context.subscriptions.push(
+    syncStatusItem,
+    { dispose: () => sync?.dispose() },
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("dostuff.sync") || e.affectsConfiguration("dostuff.activeLaneCap")) {
+        reconcileSync();
+      }
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => reconcileSync()),
+    vscode.commands.registerCommand("dostuff.sync.now", async () => {
+      if (!sync) {
+        vscode.window.showWarningMessage(
+          "DoStuff git sync is disabled — enable `dostuff.sync.enabled` first.",
+        );
+        return;
+      }
+      const result = await sync.syncNow("manual");
+      const parts = [
+        `${result.applied} applied`,
+        result.pushed ? "pushed" : "nothing to push",
+        ...(result.renames.length ? [`${result.renames.length} renumbered`] : []),
+      ];
+      vscode.window.showInformationMessage(`DoStuff sync: ${parts.join(", ")}.`);
+    }),
+    vscode.commands.registerCommand("dostuff.sync.toggle", async () => {
+      const cfg = vscode.workspace.getConfiguration("dostuff");
+      const enabled = cfg.get<boolean>("sync.enabled", false);
+      await cfg.update("sync.enabled", !enabled, vscode.ConfigurationTarget.Workspace);
+      vscode.window.showInformationMessage(
+        `DoStuff git ticket sync ${!enabled ? "enabled" : "disabled"} for this workspace.`,
+      );
+    }),
+  );
+  reconcileSync();
 }
 
 export function deactivate() {}

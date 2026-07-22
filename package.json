@@ -142,6 +142,17 @@
         "title": "Clear All Issues…",
         "category": "DoStuff",
         "icon": "$(trash)"
+      },
+      {
+        "command": "dostuff.sync.now",
+        "title": "Sync Tickets Now",
+        "category": "DoStuff",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "dostuff.sync.toggle",
+        "title": "Toggle Git Ticket Sync",
+        "category": "DoStuff"
       }
     ],
     "menus": {
@@ -175,6 +186,12 @@
         },
         {
           "command": "dostuff.clearAll"
+        },
+        {
+          "command": "dostuff.sync.now"
+        },
+        {
+          "command": "dostuff.sync.toggle"
         }
       ],
       "view/title": [
@@ -272,7 +289,45 @@
           "default": "",
           "editPresentation": "multilineText",
           "scope": "application",
-          "markdownDescription": "System-level workflow prompt served alongside every ticket. Leave blank to use the built-in default. Only configurable at the user (application) level — not per-workspace."
+          "markdownDescription": "System-level workflow prompt served as the MCP server's initialize instructions (and at `dostuff://instructions/workflow`). Leave blank to use the built-in default. Only configurable at the user (application) level — not per-workspace."
+        },
+        "dostuff.sync.enabled": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "markdownDescription": "Sync the ticket board across clones through a hidden git ref (`refs/dostuff/state`). Off = exactly current single-writer behavior."
+        },
+        "dostuff.sync.remote": {
+          "type": "string",
+          "default": "origin",
+          "scope": "window",
+          "markdownDescription": "Git remote used to fetch/push the sync ref."
+        },
+        "dostuff.sync.ref": {
+          "type": "string",
+          "default": "refs/dostuff/state",
+          "scope": "window",
+          "markdownDescription": "Full ref name the ticket state is stored under. Must start with `refs/`."
+        },
+        "dostuff.sync.intervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 120,
+          "scope": "window",
+          "markdownDescription": "Minutes between automatic network syncs. `0` = manual network sync only (local ref commits still happen)."
+        },
+        "dostuff.sync.syncAttachments": {
+          "type": "boolean",
+          "default": true,
+          "scope": "window",
+          "markdownDescription": "Sync attachment bytes through the ref tree (metadata always syncs)."
+        },
+        "dostuff.sync.maxAttachmentSyncBytes": {
+          "type": "number",
+          "default": 5242880,
+          "scope": "window",
+          "markdownDescription": "Per-file cap for attachment byte sync. Larger files sync metadata only."
         }
       }
     }
