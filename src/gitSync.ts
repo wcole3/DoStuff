@@ -21,6 +21,7 @@ import {
   fromWire,
   mergeStates,
   renumber,
+  sanitizeExt,
   toWire,
   type ElementTombstone,
   type SyncState,
@@ -96,6 +97,19 @@ export interface GitSyncOptions {
 const TRACKING_REF = "refs/dostuff/remote";
 const CAS_RETRIES = 5;
 const PUSH_RETRIES = 3;
+
+/**
+ * Is `target` strictly inside `rootPath`? Belt-and-braces behind the
+ * safe-segment validation in `coerceWireTicket`: no filesystem operation
+ * driven by wire data may escape the attachments root, even if a hostile id
+ * somehow reached the cache (e.g. via a pre-hardening DB).
+ */
+function insideRoot(rootPath: string, target: string): boolean {
+  const rel = nodePath.relative(rootPath, target);
+  return (
+    rel !== "" && rel !== ".." && !rel.startsWith(`..${nodePath.sep}`) && !nodePath.isAbsolute(rel)
+  );
+}
 
 export class GitSyncController implements vscode.Disposable {
   private repo: GitRepo | null = null;
@@ -204,9 +218,21 @@ export class GitSyncController implements vscode.Disposable {
     this.statusEmitter.dispose();
   }
 
-  /** Single-flight op chain — the `reconcilePromise` pattern. */
+  /**
+   * Single-flight op chain — the `reconcilePromise` pattern. Ops fired from
+   * the debounce/poll paths are `void`-ed by their callers, so a rejection
+   * here would surface as an unhandled promise rejection and never reach the
+   * status bar — catch, log, and mark the error instead. (`syncNow` carries
+   * its own try/catch and never rejects.)
+   */
   private chain(op: () => Promise<void>): Promise<void> {
-    this.opChain = this.opChain.then(op, op);
+    const run = () =>
+      op().catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.store.appendLog(`Sync operation failed: ${msg}`);
+        this.setStatus("error", msg);
+      });
+    this.opChain = this.opChain.then(run, run);
     return this.opChain;
   }
 
@@ -451,7 +477,7 @@ export class GitSyncController implements vscode.Disposable {
       if (oldTip) {
         outbound = mergeStates(await this.readState(oldTip), local);
       }
-      const { state: settled, renames } = renumber(outbound);
+      const { state: settled } = renumber(outbound);
       const rootTree = await this.writeState(settled, await this.attachmentOidsAt(oldTip));
 
       if (oldTip) {
@@ -459,9 +485,9 @@ export class GitSyncController implements vscode.Disposable {
         const oldTree = await repo.revParse(`${oldTip}^{tree}`);
         if (oldTree === rootTree) {
           this.lastSeenTip = oldTip;
-          if (renames.length || this.stateDiffersFromCache(settled)) {
-            await this.applyState(settled, renames, oldTip);
-          }
+          // The tip may still carry state we haven't applied (applyState
+          // self-guards and no-ops when the store already matches).
+          await this.applyState(settled, oldTip);
           return;
         }
       }
@@ -478,9 +504,7 @@ export class GitSyncController implements vscode.Disposable {
       }
       this.lastSeenTip = commit;
       // The commit may have folded in tip-side state we hadn't applied.
-      if (renames.length || this.stateDiffersFromCache(settled)) {
-        await this.applyState(settled, renames, commit);
-      }
+      await this.applyState(settled, commit);
       this.schedulePushFollowUp();
       return;
     }
@@ -491,11 +515,11 @@ export class GitSyncController implements vscode.Disposable {
   private async applyTipOp(tip: string): Promise<void> {
     const repo = this.repo;
     if (!repo) return;
-    const merged = mergeStates(await this.readState(tip), this.buildLocalState());
-    const { state: settled, renames } = renumber(merged);
+    const result = await this.applyState(await this.readState(tip), tip);
+    // Only mark the tip seen after a successful apply — a throw above leaves
+    // it unset so the next poll retries instead of silently skipping it.
     this.lastSeenTip = tip;
-    if (renames.length || this.stateDiffersFromCache(settled)) {
-      await this.applyState(settled, renames, tip);
+    if (result.applied > 0) {
       // Our cache may have had state the tip lacked — fold it back in.
       await this.commitLocalOp();
     }
@@ -530,8 +554,7 @@ export class GitSyncController implements vscode.Disposable {
             // Fast-forward: adopt the remote tip, no new commit.
             await repo.updateRefCas(this.opts.ref, remoteTip, localTip);
             this.lastSeenTip = remoteTip;
-            const { state: settled, renames } = renumber(await this.readState(remoteTip));
-            const applied = await this.applyState(settled, renames, remoteTip);
+            const applied = await this.applyState(await this.readState(remoteTip), remoteTip);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
             result.laneOverflow = applied.laneOverflow;
@@ -540,7 +563,7 @@ export class GitSyncController implements vscode.Disposable {
             // True divergence (or unborn local): state-merge with both parents.
             const localState = localTip ? await this.readState(localTip) : this.buildLocalState();
             const merged = mergeStates(localState, await this.readState(remoteTip));
-            const { state: settled, renames } = renumber(merged);
+            const { state: settled } = renumber(merged);
             // Blob OIDs reusable from either parent tip.
             const prevOids = new Map([
               ...(await this.attachmentOidsAt(localTip)),
@@ -551,7 +574,7 @@ export class GitSyncController implements vscode.Disposable {
             const commit = await repo.commitTree(rootTree, parents, "dostuff: merge");
             await repo.updateRefCas(this.opts.ref, commit, localTip);
             this.lastSeenTip = commit;
-            const applied = await this.applyState(settled, renames, commit);
+            const applied = await this.applyState(settled, commit);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
             result.laneOverflow = applied.laneOverflow;
@@ -600,7 +623,7 @@ export class GitSyncController implements vscode.Disposable {
               await this.readState(localTip),
               await this.readState(remoteTip),
             );
-            const { state: settled, renames } = renumber(merged);
+            const { state: settled } = renumber(merged);
             const prevOids = new Map([
               ...(await this.attachmentOidsAt(localTip)),
               ...(await this.attachmentOidsAt(remoteTip)),
@@ -609,7 +632,7 @@ export class GitSyncController implements vscode.Disposable {
             const commit = await repo.commitTree(rootTree, [localTip, remoteTip], "dostuff: merge");
             await repo.updateRefCas(this.opts.ref, commit, localTip);
             this.lastSeenTip = commit;
-            await this.applyState(settled, renames, commit);
+            await this.applyState(settled, commit);
           }
           continue;
         }
@@ -631,18 +654,17 @@ export class GitSyncController implements vscode.Disposable {
 
   // ─── inbound application ────────────────────────────────────────────────
 
-  /** Cheap check: does the settled state differ from the store cache? */
-  private stateDiffersFromCache(state: SyncState): boolean {
-    const cache = this.store.list();
-    if (cache.length !== state.tickets.size) return true;
-    const idToGuid = new Map(cache.map((i) => [i.id, i.guid]));
-    for (const i of cache) {
-      const wire = state.tickets.get(i.guid);
-      if (!wire) return true;
-      const tombs = this.elementTombstonesFor(i.guid);
-      if (canonicalJson(toWire(i, idToGuid, tombs)) !== canonicalJson(wire)) return true;
-    }
-    return false;
+  /**
+   * Witness fields (`deletedTasks`/`deletedAttachments`) are sourced
+   * differently on the two sides of a cache-vs-wire comparison — the local
+   * `sync_tombstones` table never learns remote-origin tombstones (applySync
+   * records nothing) and its wall-clock prune diverges from the merge GC —
+   * so they can disagree forever on logically-identical tickets. Strip them
+   * before comparing; convergence of the witnesses themselves is guaranteed
+   * by the outbound `mergeStates` union, not by store writes.
+   */
+  private static stripWitnesses(w: WireTicket): WireTicket {
+    return { ...w, deletedTasks: [], deletedAttachments: [] };
   }
 
   private elementTombstonesFor(guid: string): {
@@ -662,17 +684,84 @@ export class GitSyncController implements vscode.Disposable {
   }
 
   /**
-   * Apply a settled (merged + renumbered) state to the store: attachment-dir
-   * renames first, then one `applySync`, then notifications
-   * (04-controller-wiring §2).
+   * Apply a merged state to the store: fold the live cache, renumber,
+   * attachment-dir renames first, then one `applySync`, then notifications
+   * (04-controller-wiring §2). Self-guarding: when the folded state already
+   * matches the store, no write and no notification happens.
    */
-  private async applyState(
-    state: SyncState,
-    renames: Array<{ guid: string; oldId: string; newId: string }>,
-    tip?: string | null,
-  ): Promise<SyncResult> {
+  private async applyState(rawState: SyncState, tip?: string | null): Promise<SyncResult> {
+    // Fold the LIVE cache in: store mutations may have landed after the
+    // snapshot `rawState` was computed from (the fetch window is seconds
+    // long). Merge idempotence makes this free when nothing changed, and it
+    // guarantees a cache ticket absent from the folded state was beaten by a
+    // tombstone — a sync cycle racing a local create/edit can no longer
+    // delete the new ticket or clobber the fresh edit.
+    const folded = mergeStates(rawState, this.buildLocalState());
+    const { state } = renumber(folded);
+
     const cache = this.store.list();
+    const idToGuid = new Map(cache.map((i) => [i.id, i.guid]));
+    const cacheByGuid = new Map(cache.map((i) => [i.guid, i]));
     const guidToId = new Map([...state.tickets.values()].map((t) => [t.guid, t.id]));
+
+    const upserts: Issue[] = [];
+    let applied = 0;
+    for (const wire of state.tickets.values()) {
+      const prior = cacheByGuid.get(wire.guid);
+      if (prior) {
+        const projected = toWire(prior, idToGuid, this.elementTombstonesFor(wire.guid));
+        if (
+          canonicalJson(GitSyncController.stripWitnesses(projected)) ===
+          canonicalJson(GitSyncController.stripWitnesses(wire))
+        ) {
+          continue; // unchanged — keep the cache copy untouched
+        }
+      }
+      const { issue, coerced } = normalize(fromWire(wire, guidToId));
+      if (coerced.length) {
+        this.store.appendLog(`Sync: coerced fields on ${issue.id}: ${coerced.join(", ")}`);
+      }
+      upserts.push(issue);
+      applied += 1;
+    }
+
+    // Removals and renames both come from the cache-vs-state diff, not from
+    // renumber()'s rename list — the caller may have pre-renumbered its
+    // state, in which case renumber() here sees no collision but the cache
+    // still holds rows under the old ids. A vanished guid necessarily lost
+    // to a ticket tombstone after the live-cache fold (one-sided presence is
+    // otherwise kept by the merge) — the `has` check is an invariant belt.
+    const renames: Array<{ guid: string; oldId: string; newId: string }> = [];
+    const removals: string[] = [];
+    const tombstoned: string[] = [];
+    for (const i of cache) {
+      const wire = state.tickets.get(i.guid);
+      if (!wire) {
+        if (state.tombstones.has(i.guid)) {
+          removals.push(i.id);
+          tombstoned.push(i.id);
+        }
+      } else if (wire.id !== i.id) {
+        renames.push({ guid: i.guid, oldId: i.id, newId: wire.id });
+        removals.push(i.id);
+      }
+    }
+
+    if (upserts.length === 0 && removals.length === 0) {
+      // Nothing to write; still fill any missing attachment bytes (a prior
+      // restore may have failed) and skip every notification.
+      const attRootIdle = this.store.attachmentsDir();
+      if (tip && attRootIdle && this.opts.syncAttachments !== false) {
+        try {
+          await this.restoreAttachments(state, tip, attRootIdle.fsPath);
+        } catch (e) {
+          this.store.appendLog(
+            `Sync: attachment restore failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      }
+      return { applied: 0, pushed: false, renames: [], laneOverflow: [] };
+    }
 
     // Attachment dir renames before any restore (and before removal of old
     // rows). Node fs, not vscode fs — attachment bytes always live on the
@@ -680,39 +769,21 @@ export class GitSyncController implements vscode.Disposable {
     const attRoot = this.store.attachmentsDir();
     if (attRoot) {
       for (const r of renames) {
+        const from = nodePath.join(attRoot.fsPath, r.oldId);
+        const to = nodePath.join(attRoot.fsPath, r.newId);
+        if (!insideRoot(attRoot.fsPath, from) || !insideRoot(attRoot.fsPath, to)) {
+          this.store.appendLog(`Sync: refused attachment dir rename for unsafe id ${r.oldId}`);
+          continue;
+        }
         try {
-          await fsp.rename(
-            nodePath.join(attRoot.fsPath, r.oldId),
-            nodePath.join(attRoot.fsPath, r.newId),
-          );
+          await fsp.rename(from, to);
         } catch {
           // Dir may simply not exist — the common case.
         }
       }
     }
 
-    const upserts: Issue[] = [];
-    for (const wire of state.tickets.values()) {
-      const { issue, coerced } = normalize(fromWire(wire, guidToId));
-      if (coerced.length) {
-        this.store.appendLog(`Sync: coerced fields on ${issue.id}: ${coerced.join(", ")}`);
-      }
-      upserts.push(issue);
-    }
-
-    // Removals: cached ids whose guid vanished (tombstoned) + old ids of renames.
-    const removals: string[] = [];
-    const tombstoned: string[] = [];
-    for (const i of cache) {
-      if (!state.tickets.has(i.guid)) {
-        removals.push(i.id);
-        tombstoned.push(i.id);
-      }
-    }
-    for (const r of renames) {
-      if (!removals.includes(r.oldId)) removals.push(r.oldId);
-    }
-
+    applied += removals.length;
     this.applyingRemote += 1;
     try {
       await this.store.applySync({ upserts, removals, tombstoned });
@@ -753,7 +824,7 @@ export class GitSyncController implements vscode.Disposable {
     }
 
     return {
-      applied: upserts.length + removals.length,
+      applied,
       pushed: false,
       renames: renames.map((r) => ({ oldId: r.oldId, newId: r.newId })),
       laneOverflow,
@@ -780,11 +851,16 @@ export class GitSyncController implements vscode.Disposable {
         const oid = oids.get(`attachments/${wire.guid}/${att.id}`);
         if (!oid) continue; // bytes were never synced (cap/skip) — leave missing
         if (await this.store.findAttachmentUri(wire.id, att.id)) continue; // already present
-        const dot = att.name.lastIndexOf(".");
-        const ext = dot >= 0 ? att.name.slice(dot) : "";
+        // `att.name` is remote-controlled — the extension must never smuggle
+        // a separator into the destination path.
         const dir = nodePath.join(attRootPath, wire.id);
+        const dest = nodePath.join(dir, `${att.id}${sanitizeExt(att.name)}`);
+        if (!insideRoot(attRootPath, dir) || !insideRoot(dir, dest)) {
+          this.store.appendLog(`Sync: refused attachment restore for unsafe path ${wire.id}/${att.id}`);
+          continue;
+        }
         await fsp.mkdir(dir, { recursive: true });
-        await repo.catBlobToFile(oid, nodePath.join(dir, `${att.id}${ext}`));
+        await repo.catBlobToFile(oid, dest);
       }
     }
   }

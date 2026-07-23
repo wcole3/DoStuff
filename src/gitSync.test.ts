@@ -532,4 +532,253 @@ describe("GitSyncController: failure modes & plumbing behavior", () => {
     await a.controller.syncNow("manual");
     expect(git(a.dir, "rev-parse", REF).trim()).toBe(tip1);
   });
+
+  test("interval 0: local ref commits happen, no network until manual sync (04 §8)", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare)); // intervalMinutes: 0 in the harness
+    a.controller.start();
+    await sleep(50); // let start() register the onChange listener
+    a.store.put(makeIssue({ guid: "g-1", number: 1 }));
+    await sleep(80); // debounce (5ms) plus slack — local commit lands
+    expect(git(a.dir, "rev-parse", "--verify", REF).trim()).toMatch(/^[0-9a-f]{40}$/);
+    // No network op has run: the bare remote never saw the ref.
+    expect(() => git(bare, "rev-parse", "--verify", REF)).toThrow();
+    const result = await a.controller.syncNow("manual");
+    expect(result.pushed).toBe(true);
+    expect(git(bare, "rev-parse", "--verify", REF).trim()).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  test("non-FF push retry: a commit racing in between fetch and push is merged, not lost (04 §8)", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare));
+    const b = track(mkClone("cloneB", bare));
+    a.store.put(makeIssue({ guid: "g-1", number: 1, createdAt: T(1), updatedAt: T(1) }));
+    a.controller.start();
+    b.controller.start();
+    await a.controller.syncNow("manual");
+    await b.controller.syncNow("manual");
+
+    b.store.put(makeIssue({ guid: "g-2", number: 2, id: "DS-002", createdAt: T(2), updatedAt: T(2) }));
+    await sleep(30); // let B's debounce commit locally
+
+    // Move the bare ref from A's side the moment B first tries to push.
+    const repo = (b.controller as unknown as { repo: { pushStateRef(r: string, f: string): Promise<void> } }).repo;
+    const origPush = repo.pushStateRef.bind(repo);
+    let injected = false;
+    repo.pushStateRef = async (remote: string, ref: string) => {
+      if (!injected) {
+        injected = true;
+        a.store.put(makeIssue({ guid: "g-3", number: 3, id: "DS-003", createdAt: T(3), updatedAt: T(3) }));
+        await sleep(30);
+        await a.controller.syncNow("manual"); // advances the bare ref under B
+      }
+      return origPush(remote, ref);
+    };
+
+    const result = await b.controller.syncNow("manual");
+    expect(result.pushed).toBe(true);
+    await a.controller.syncNow("manual");
+    expect(boardJson(a.store)).toBe(boardJson(b.store));
+    expect(b.store.cache.map((i) => i.guid).sort()).toEqual(["g-1", "g-2", "g-3"]);
+  });
+});
+
+// ----- hardening & race regressions ------------------------------------------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Hand-roll a ref state (bypassing the controller) to simulate foreign writers. */
+function writeRefState(
+  dir: string,
+  formatVersion: number,
+  tickets: Array<[guid: string, body: Record<string, unknown>]>,
+): string {
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@t",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@t",
+  };
+  const blob = (content: string) =>
+    execFileSync("git", ["hash-object", "-w", "--stdin"], { cwd: dir, input: content, encoding: "utf8" }).trim();
+  const mktree = (lines: string[]) =>
+    execFileSync("git", ["mktree"], { cwd: dir, input: lines.join("\n") + "\n", encoding: "utf8" }).trim();
+  const rootLines = [`100644 blob ${blob(JSON.stringify({ formatVersion }))}\tmeta.json`];
+  if (tickets.length) {
+    const entries = tickets.map(([guid, body]) => `100644 blob ${blob(JSON.stringify(body))}\t${guid}.json`);
+    rootLines.push(`040000 tree ${mktree(entries)}\ttickets`);
+  }
+  const commit = execFileSync("git", ["commit-tree", mktree(rootLines), "-m", "foreign"], {
+    cwd: dir,
+    env,
+    encoding: "utf8",
+  }).trim();
+  execFileSync("git", ["update-ref", REF, commit], { cwd: dir });
+  return commit;
+}
+
+describe("GitSyncController: hardening & race regressions", () => {
+  test("mid-cycle store mutations survive the apply (create + edit are never clobbered)", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare));
+    const b = track(mkClone("cloneB", bare));
+    a.store.put(makeIssue({ guid: "g-1", number: 1, createdAt: T(1), updatedAt: T(1), title: "original" }));
+    a.controller.start();
+    b.controller.start();
+    await a.controller.syncNow("manual");
+    await b.controller.syncNow("manual");
+    expect(b.store.get("DS-001")).toBeDefined();
+
+    // Simulate a user/agent mutating the store while a sync cycle is between
+    // its local-commit snapshot and the apply step: hook the first readState
+    // of the next cycle (runs post-snapshot) to create one ticket and edit
+    // another. Pre-fix, the apply deleted the new ticket (tombstoned it!) and
+    // overwrote the edit with the older remote copy.
+    a.store.put(makeIssue({ guid: "g-2", number: 5, id: "DS-005", createdAt: T(2), updatedAt: T(2) }));
+    await sleep(30);
+    await a.controller.syncNow("manual"); // remote now ahead of B → next B sync merges
+
+    const ctrl = b.controller as unknown as { readState(tip: string): Promise<unknown> };
+    const origRead = ctrl.readState.bind(b.controller);
+    let raced = false;
+    ctrl.readState = async (tip: string) => {
+      const state = await origRead(tip);
+      if (!raced) {
+        raced = true;
+        b.store.put(makeIssue({ guid: "g-race", number: 9, id: "DS-009", createdAt: T(4), updatedAt: T(4), title: "raced create" }));
+        b.store.put({ ...b.store.get("DS-001")!, title: "raced edit", updatedAt: T(9) });
+      }
+      return state;
+    };
+
+    await b.controller.syncNow("manual");
+    // The race ticket survived and the edit won LWW.
+    expect(b.store.get("DS-009")?.title).toBe("raced create");
+    expect(b.store.get("DS-001")?.title).toBe("raced edit");
+
+    // And both propagate: full convergence on the next cycles.
+    await sleep(30); // raced puts' debounce
+    await b.controller.syncNow("manual");
+    await a.controller.syncNow("manual");
+    expect(boardJson(a.store)).toBe(boardJson(b.store));
+    expect(a.store.get("DS-009")?.title).toBe("raced create");
+    expect(a.store.get("DS-001")?.title).toBe("raced edit");
+  });
+
+  test("remote element tombstones do not cause permanent re-apply churn", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare));
+    const b = track(mkClone("cloneB", bare));
+    a.store.put(
+      makeIssue({
+        guid: "g-1",
+        number: 1,
+        createdAt: T(1),
+        updatedAt: T(1),
+        tasks: [{ id: "tX", text: "doomed", done: false, updatedAt: T(1) }],
+      }),
+    );
+    a.controller.start();
+    b.controller.start();
+    await a.controller.syncNow("manual");
+    await b.controller.syncNow("manual");
+
+    a.store.dropTask("DS-001", "tX", T(3));
+    await a.controller.syncNow("manual");
+    await b.controller.syncNow("manual");
+    expect(b.store.get("DS-001")!.tasks).toHaveLength(0);
+
+    // B's local tombstone table never learns the remote-origin witness — the
+    // apply guard must strip witness fields, or every future cycle re-applies
+    // the full board.
+    const calls = b.store.applySyncCalls;
+    const idle1 = await b.controller.syncNow("manual");
+    const idle2 = await b.controller.syncNow("manual");
+    expect(idle1.applied).toBe(0);
+    expect(idle2.applied).toBe(0);
+    expect(b.store.applySyncCalls).toBe(calls);
+  });
+
+  test("a hostile ticket blob is skipped whole — nothing outside the attachments root is touched", async () => {
+    const dir = mkRepo("local");
+    const store = new FakeStore();
+    store.attachRoot = path.join(dir, ".attachments");
+    fs.mkdirSync(store.attachRoot, { recursive: true });
+    const canary = path.join(dir, "canary.txt");
+    fs.writeFileSync(canary, "untouched");
+
+    writeRefState(dir, 1, [
+      ["evil-guid", { guid: "evil-guid", id: "../../pwn", title: "evil", createdAt: T(1) }],
+      ["e-slash", { guid: "e/slash", id: "DS-002", title: "evil2", createdAt: T(1) }],
+      ["g-ok", { guid: "g-ok", id: "DS-003", title: "legit", createdAt: T(1) }],
+    ]);
+
+    const controller = new GitSyncController(store as unknown as SyncStoreLike, () => dir, {
+      remote: "origin",
+      ref: REF,
+      intervalMinutes: 0,
+      activeLaneCap: 6,
+      debounceMs: 5,
+      tipPollMs: 25,
+      pushFollowUpMs: 3_600_000,
+      startupSync: false,
+      notify: () => {},
+    });
+    track({ dir, store, controller, notifications: [] });
+    controller.start();
+    await sleep(150); // tip poll applies the foreign state
+
+    expect(store.cache.map((i) => i.id)).toEqual(["DS-003"]);
+    // Two hostile blobs, skipped on every read of that tip (apply + commit re-read).
+    expect(
+      store.logs.filter((l) => l.includes("skipped malformed ticket blob")).length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(fs.readFileSync(canary, "utf8")).toBe("untouched");
+    // Nothing appeared outside the expected roots.
+    const entries = fs.readdirSync(dir).sort();
+    expect(entries).toEqual([".attachments", ".git", "canary.txt"]);
+    expect(fs.readdirSync(path.dirname(dir)).some((n) => n === "pwn")).toBe(false);
+  });
+
+  test("a chain op failure (newer formatVersion tip) sets error status, never an unhandled rejection, and the tip is retried", async () => {
+    const rejections: unknown[] = [];
+    const onRejection = (e: unknown) => rejections.push(e);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const dir = mkRepo("local");
+      const store = new FakeStore();
+      const controller = new GitSyncController(store as unknown as SyncStoreLike, () => dir, {
+        remote: "origin",
+        ref: REF,
+        intervalMinutes: 0,
+        activeLaneCap: 6,
+        debounceMs: 5,
+        tipPollMs: 25,
+        pushFollowUpMs: 3_600_000,
+        startupSync: false,
+        notify: () => {},
+      });
+      track({ dir, store, controller, notifications: [] });
+      writeRefState(dir, 2, [["g-1", { guid: "g-1", id: "DS-001", title: "future", createdAt: T(1) }]]);
+      controller.start();
+      await sleep(150); // several poll ticks, all failing
+
+      expect(controller.status.state).toBe("error");
+      expect(controller.status.detail).toContain("formatVersion 2");
+      expect(store.cache).toHaveLength(0);
+      expect(rejections).toHaveLength(0);
+
+      // The failing tip was never marked seen — once it becomes readable the
+      // same poll loop applies it.
+      writeRefState(dir, 1, [["g-1", { guid: "g-1", id: "DS-001", title: "readable now", createdAt: T(1) }]]);
+      await sleep(200);
+      expect(store.get("DS-001")?.title).toBe("readable now");
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
 });

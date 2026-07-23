@@ -113,7 +113,7 @@ describe("object round trip", () => {
     expect(blobs.has("0".repeat(40))).toBe(false); // missing oid → absent, no throw
   });
 
-  test("catBlobToFile streams bytes to disk", async () => {
+  test("catBlobToFile streams bytes to disk (and leaves no .part behind)", async () => {
     const dir = mkRepo("blobfile");
     const repo = new GitRepo(dir);
     const payload = Buffer.from([7, 0, 8, 0, 9, 255]);
@@ -121,6 +121,27 @@ describe("object round trip", () => {
     const dest = path.join(dir, "restored.bin");
     await repo.catBlobToFile(oid, dest);
     expect(Buffer.compare(fs.readFileSync(dest), payload)).toBe(0);
+    expect(fs.existsSync(`${dest}.part`)).toBe(false);
+  });
+
+  test("catBlobToFile failure leaves neither the destination nor a .part file", async () => {
+    const dir = mkRepo("blobfail");
+    const repo = new GitRepo(dir);
+    const dest = path.join(dir, "never.bin");
+    // Unknown oid → git exits non-zero; a truncated/empty file must not
+    // survive to be mistaken for a present attachment.
+    await expect(repo.catBlobToFile("f".repeat(40), dest)).rejects.toMatchObject({
+      code: "GitFailed",
+    });
+    expect(fs.existsSync(dest)).toBe(false);
+    expect(fs.existsSync(`${dest}.part`)).toBe(false);
+
+    // Write-stream failure (unwritable destination dir) → same guarantee.
+    const badDest = path.join(dir, "no-such-dir", "x.bin");
+    const oid = await repo.hashObjectStdin(Buffer.from([1]));
+    await expect(repo.catBlobToFile(oid, badDest)).rejects.toMatchObject({ code: "GitFailed" });
+    expect(fs.existsSync(badDest)).toBe(false);
+    expect(fs.existsSync(`${badDest}.part`)).toBe(false);
   });
 });
 
@@ -141,6 +162,15 @@ describe("updateRefCas", () => {
     // Stale old value (c1) after the ref moved to c2 → CasFailed.
     await expect(repo.updateRefCas(STATE_REF, c1, c1)).rejects.toMatchObject({
       code: "CasFailed",
+    });
+  });
+
+  test("non-CAS failures classify as GitFailed so the retry loop doesn't spin", async () => {
+    const dir = mkRepo("cas-misc");
+    const repo = new GitRepo(dir);
+    // A garbage new oid is unwinnable — retrying the CAS would never help.
+    await expect(repo.updateRefCas(STATE_REF, "not-an-oid", null)).rejects.toMatchObject({
+      code: "GitFailed",
     });
   });
 });

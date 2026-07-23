@@ -19,7 +19,7 @@ import initSqlJs, {
   type Database,
   type SqlJsStatic,
 } from "sql.js";
-import { deriveGuid, TOMBSTONE_TTL_MS } from "./syncMerge";
+import { deriveGuid, isSafePathSegment, TOMBSTONE_TTL_MS } from "./syncMerge";
 import {
   coerceAttachments,
   coerceLinks,
@@ -628,12 +628,26 @@ export class IssueStore {
   }
 
   // ─── attachments ────────────────────────────────────────────────────────
-  // Attachment bytes live on disk; the DB only holds metadata. These helpers
-  // are unchanged from the JSON-era storage layer.
+  // Attachment bytes live on disk; the DB only holds metadata. Every helper
+  // refuses ids that are not a single safe path segment — ids reach these
+  // methods from several input surfaces (webview, import, sync, DB hydrate),
+  // and this chokepoint keeps a hostile id from ever becoming a traversal.
+
+  /** True when every provided path component is a single safe segment. */
+  private safeAttachmentPath(what: string, ...segments: string[]): boolean {
+    for (const s of segments) {
+      if (!isSafePathSegment(s)) {
+        this.appendLog(`Attachment ${what} refused: unsafe path segment ${JSON.stringify(s)}`);
+        return false;
+      }
+    }
+    return true;
+  }
 
   /**
    * Write attachment bytes to `<storagePath>/attachments/<issueId>/<attId><ext>`.
-   * Returns false if no workspace folder is open. Throws on I/O failure.
+   * Returns false if no workspace folder is open (or the ids/ext are not safe
+   * path segments). Throws on I/O failure.
    */
   async writeAttachment(
     issueId: string,
@@ -643,6 +657,7 @@ export class IssueStore {
   ): Promise<boolean> {
     const root = this.attachmentsDir();
     if (!root) return false;
+    if (!this.safeAttachmentPath("write", issueId, `${attachmentId}${ext}`)) return false;
     const dir = vscode.Uri.joinPath(root, issueId);
     try { await vscode.workspace.fs.createDirectory(dir); } catch {}
     const file = vscode.Uri.joinPath(dir, `${attachmentId}${ext}`);
@@ -658,6 +673,7 @@ export class IssueStore {
   async findAttachmentUri(issueId: string, attachmentId: string): Promise<vscode.Uri | null> {
     const root = this.attachmentsDir();
     if (!root) return null;
+    if (!this.safeAttachmentPath("lookup", issueId, attachmentId)) return null;
     const dir = vscode.Uri.joinPath(root, issueId);
     let entries: [string, vscode.FileType][];
     try {
@@ -694,6 +710,9 @@ export class IssueStore {
   private async deleteIssueAttachments(issueId: string): Promise<void> {
     const root = this.attachmentsDir();
     if (!root) return;
+    // Recursive delete — the one helper where an unsafe id would be truly
+    // destructive. The guard makes a hostile id a logged no-op instead.
+    if (!this.safeAttachmentPath("delete", issueId)) return;
     const dir = vscode.Uri.joinPath(root, issueId);
     try {
       await vscode.workspace.fs.delete(dir, { recursive: true, useTrash: false });

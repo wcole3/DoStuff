@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
-import { deriveGuid } from "./syncMerge";
+import { deriveGuid, isSafePathSegment, sanitizeExt } from "./syncMerge";
 import { GitSyncController } from "./gitSync";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
@@ -261,17 +261,30 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       status,
       description: typeof e.description === "string" ? e.description : "",
       verifyCriteria: typeof e.verifyCriteria === "string" ? e.verifyCriteria : "",
-      // Keep well-formed per-task `updatedAt` (round-trips exported stamps);
+      // Task ids become sync identities (and were historically written into
+      // wire trees), so entries without a safe-segment string id are dropped;
+      // keep well-formed per-task `updatedAt` (round-trips exported stamps),
       // strip garbage values so nothing invalid enters the store.
-      tasks: (Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : []).map((t) => {
-        if (t && typeof t === "object" && "updatedAt" in t && !isIso(t.updatedAt)) {
-          const { updatedAt: _bad, ...rest } = t;
-          return rest;
-        }
-        return t;
-      }),
+      tasks: (Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [])
+        .filter(
+          (t) =>
+            t &&
+            typeof t === "object" &&
+            typeof t.id === "string" &&
+            isSafePathSegment(t.id) &&
+            typeof t.text === "string",
+        )
+        .map((t) => {
+          if ("updatedAt" in t && !isIso(t.updatedAt)) {
+            const { updatedAt: _bad, ...rest } = t;
+            return rest;
+          }
+          return t;
+        }),
       tags: coerceTags(e.tags),
-      attachments: coerceAttachments(e.attachments),
+      // Attachment ids name files on disk and blobs in the sync tree — same
+      // safe-segment bar as the sync wire coercer.
+      attachments: coerceAttachments(e.attachments).filter((a) => isSafePathSegment(a.id)),
       // Cross-issue validation happens in the caller (after the full set is
       // assembled) so we can drop links whose targets aren't in the import.
       links: coerceLinks(e.links, e.id),
@@ -283,8 +296,13 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
       pendingClose: coercePendingClose(e.pendingClose),
       // Sync fields: keep well-formed provided values (export→import round
-      // trip), derive per the normalize() rules when missing.
-      guid: typeof e.guid === "string" && e.guid ? e.guid : deriveGuid(e.id, e.createdAt),
+      // trip), derive per the normalize() rules when missing. A guid that is
+      // not a safe path segment is re-derived — guids name attachment dirs in
+      // the sync ref tree, and outbound state is never re-coerced.
+      guid:
+        typeof e.guid === "string" && e.guid && isSafePathSegment(e.guid)
+          ? e.guid
+          : deriveGuid(e.id, e.createdAt),
       updatedAt: isIso(e.updatedAt) ? e.updatedAt : e.createdAt,
     };
     valid.push(issue);
@@ -298,6 +316,17 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
     issue.links = kept;
   }
   return { valid, skipped };
+}
+
+/**
+ * Clamp `dostuff.sync.intervalMinutes` to sane bounds: `<= 0` (or garbage)
+ * means manual-only network sync; anything positive lands in [1, 120].
+ * package.json's declared min/max only constrain the settings UI.
+ */
+export function clampSyncInterval(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 5;
+  if (n <= 0) return 0;
+  return Math.min(120, Math.max(1, n));
 }
 
 /** Lanes that exceed `cap` in the given set. Empty if all within cap. */
@@ -426,7 +455,9 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     const attachmentId = randomUUID().replace(/-/g, "");
-    const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+    // `name` arrives over the webview message channel — sanitize before it
+    // contributes to an on-disk filename.
+    const ext = sanitizeExt(name);
     try {
       const written = await store.writeAttachment(issueId, attachmentId, ext, bytes);
       if (!written) {
@@ -1044,7 +1075,10 @@ export function activate(context: vscode.ExtensionContext) {
       {
         remote: cfg.get<string>("sync.remote", "origin"),
         ref: cfg.get<string>("sync.ref", "refs/dostuff/state"),
-        intervalMinutes: cfg.get<number>("sync.intervalMinutes", 5),
+        // package.json's min/max are UI hints only — clamp here so a raw
+        // settings.json value can't schedule a network sync every few ms.
+        // <= 0 stays 0 (manual network sync only).
+        intervalMinutes: clampSyncInterval(cfg.get<number>("sync.intervalMinutes", 5)),
         activeLaneCap: cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP),
         syncAttachments: cfg.get<boolean>("sync.syncAttachments", true),
         maxAttachmentSyncBytes: cfg.get<number>("sync.maxAttachmentSyncBytes", 5242880),

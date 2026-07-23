@@ -91,6 +91,37 @@ function sortKeys(value: unknown): unknown {
  */
 export const TOMBSTONE_TTL_MS = 90 * 24 * 3600 * 1000;
 
+/**
+ * Ids that sync turns into filesystem path components (ticket ids, guids,
+ * attachment/task ids) must be a single safe path segment: no separators, no
+ * `.`/`..`, no whitespace or control characters. Everything this extension
+ * mints (DS-NNN, uuids, `t-<uuid>`) passes; anything that could traverse out
+ * of the attachments root — or smuggle a `\t`/`\n` into a mktree entry line —
+ * fails. Shared by the wire coercer, the import validator, and the storage
+ * attachment helpers so every input path is gated identically.
+ */
+export function isSafePathSegment(value: string): boolean {
+  return /^(?!\.\.?$)[A-Za-z0-9._-]+$/.test(value);
+}
+
+/** Wire ticket ids are exactly what the store mints: DS-<digits>. The digit
+ *  cap keeps the parsed number well inside safe-integer renumber range. */
+const WIRE_ID_RE = /^DS-\d{1,9}$/;
+
+/**
+ * Derive a safe on-disk extension from an attachment display name. The name
+ * is remote-controlled (wire metadata / webview message), so the result must
+ * never contain a path separator: keep only `[A-Za-z0-9.]`, cap the length,
+ * drop the rest. Empty string when the name has no usable extension.
+ */
+export function sanitizeExt(name: string): string {
+  const dot = name.lastIndexOf(".");
+  if (dot < 0) return "";
+  const ext = name.slice(dot).replace(/[^A-Za-z0-9.]/g, "");
+  if (ext.length < 2 || ext.length > 16 || !ext.startsWith(".")) return "";
+  return ext;
+}
+
 // ─── wire model ───────────────────────────────────────────────────────────
 
 export interface WireLink {
@@ -253,19 +284,27 @@ function isIso(v: unknown): v is string {
 export function coerceWireTicket(raw: unknown): WireTicket | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  if (typeof r.guid !== "string" || !r.guid) return null;
-  if (typeof r.id !== "string" || !r.id) return null;
+  // Identity fields become filesystem path components (attachment dirs, tree
+  // entry names) on every replica — reject anything that is not exactly the
+  // shape this extension mints. No legitimate build ever wrote other shapes,
+  // so this loses no data; it only refuses hostile blobs.
+  if (typeof r.guid !== "string" || !isSafePathSegment(r.guid)) return null;
+  if (typeof r.id !== "string" || !WIRE_ID_RE.test(r.id)) return null;
   if (typeof r.title !== "string") return null;
   if (!isIso(r.createdAt)) return null;
   const createdAt = r.createdAt;
 
-  const tasks: WireTask[] = [];
+  // Last-wins dedupe by id — duplicate ids in a crafted blob would otherwise
+  // emit duplicate elements from the per-element merge.
+  const tasksById = new Map<string, WireTask>();
   if (Array.isArray(r.tasks)) {
     for (const t of r.tasks) {
       if (!t || typeof t !== "object") continue;
       const tt = t as Record<string, unknown>;
-      if (typeof tt.id !== "string" || !tt.id || typeof tt.text !== "string") continue;
-      tasks.push({
+      if (typeof tt.id !== "string" || !isSafePathSegment(tt.id) || typeof tt.text !== "string") {
+        continue;
+      }
+      tasksById.set(tt.id, {
         id: tt.id,
         text: tt.text,
         done: tt.done === true,
@@ -273,6 +312,7 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
       });
     }
   }
+  const tasks = [...tasksById.values()];
 
   const links: WireLink[] = [];
   if (Array.isArray(r.links)) {
@@ -280,7 +320,9 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     for (const l of r.links) {
       if (!l || typeof l !== "object") continue;
       const ll = l as Record<string, unknown>;
-      if (typeof ll.targetGuid !== "string" || !ll.targetGuid || !isLinkKind(ll.kind)) continue;
+      if (typeof ll.targetGuid !== "string" || !isSafePathSegment(ll.targetGuid) || !isLinkKind(ll.kind)) {
+        continue;
+      }
       const key = `${ll.targetGuid}|${ll.kind}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -317,12 +359,19 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     }
   }
 
+  // The id regex caps digits at 9, so the id-derived number is always a safe
+  // renumber input; an explicit `number` must be equally sane or it could
+  // blow up `bumpReserved`/renumber on every replica.
+  const numberFromId = Number.parseInt(r.id.slice(3), 10);
+  const number =
+    typeof r.number === "number" && Number.isSafeInteger(r.number) && r.number > 0 && r.number <= 999_999_999
+      ? r.number
+      : numberFromId;
+
   return {
     guid: r.guid,
     id: r.id,
-    number: Number.isFinite(r.number)
-      ? (r.number as number)
-      : Number.parseInt(r.id.replace(/^DS-/, ""), 10) || 0,
+    number,
     title: r.title,
     description: typeof r.description === "string" ? r.description : "",
     verifyCriteria: typeof r.verifyCriteria === "string" ? r.verifyCriteria : "",
@@ -334,7 +383,9 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     resolvedAt: isIso(r.resolvedAt) ? r.resolvedAt : null,
     tags: coerceTags(r.tags),
     tasks,
-    attachments: coerceAttachments(r.attachments),
+    // Attachment ids name blobs in the ref tree and files on disk — same
+    // safe-segment bar as the ticket identity fields.
+    attachments: coerceAttachments(r.attachments).filter((a) => isSafePathSegment(a.id)),
     links,
     statusHistory,
     record,
@@ -351,7 +402,7 @@ function coerceElementTombstones(input: unknown): ElementTombstone[] {
   for (const e of input) {
     if (!e || typeof e !== "object") continue;
     const ee = e as Record<string, unknown>;
-    if (typeof ee.id !== "string" || !ee.id || !isIso(ee.deletedAt)) continue;
+    if (typeof ee.id !== "string" || !isSafePathSegment(ee.id) || !isIso(ee.deletedAt)) continue;
     if (seen.has(ee.id)) continue;
     seen.add(ee.id);
     out.push({ id: ee.id, deletedAt: ee.deletedAt });
@@ -371,6 +422,12 @@ function contentHash(value: unknown): string {
  * sort chronologically under string compare; the content hash breaks
  * exact-timestamp ties identically on both machines. Returns a's-tuple minus
  * b's-tuple in sign.
+ *
+ * Nuance: on an exact-timestamp tie the hash compares *merged* content
+ * against an input, so re-merging can flip the winner once (a merged ticket
+ * hashes differently from either input). The state space is finite and the
+ * pick deterministic, so replicas still converge — absorption is only
+ * approximate under exact-ms ties, never divergent.
  */
 function compareTuple(aTs: string, aHash: string, bTs: string, bHash: string): number {
   if (aTs !== bTs) return aTs < bTs ? -1 : 1;

@@ -8,6 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
+import * as fsp from "node:fs/promises";
 import { once } from "node:events";
 
 // ─── error taxonomy ───────────────────────────────────────────────────────
@@ -293,14 +294,19 @@ export class GitRepo {
   /**
    * Compare-and-swap ref update. `oldOid: null` means "the ref must not exist
    * yet" (40 zeros). A mismatch (another writer advanced the ref) throws
-   * `CasFailed` — the caller re-reads, re-merges, retries.
+   * `CasFailed` — the caller re-reads, re-merges, retries. Failures that are
+   * NOT a lost race (bad oid, fs permissions) throw `GitFailed` so the
+   * caller's CAS retry loop doesn't spin on an unwinnable error.
    */
   async updateRefCas(ref: string, newOid: string, oldOid: string | null): Promise<void> {
     const args = ["update-ref", ref, newOid, oldOid ?? "0".repeat(40)];
     const r = await this.local(args);
     if (r.code !== 0) {
+      const isCas = /cannot lock ref|but expected|ref .* is at|reference already exists/i.test(
+        r.stderr,
+      );
       throw new GitError(
-        "CasFailed",
+        isCas ? "CasFailed" : "GitFailed",
         `git update-ref CAS on ${ref} failed: ${r.stderr.trim()}`,
         r.stderr,
       );
@@ -355,30 +361,46 @@ export class GitRepo {
   }
 
   /**
-   * Stream one blob's bytes straight to `destPath` (avoids `maxBuffer`
-   * concerns on large attachments).
+   * Stream one blob's bytes to `destPath` (avoids `maxBuffer` concerns on
+   * large attachments). Writes to `<destPath>.part` and renames into place on
+   * success, so a timeout or failure mid-stream never leaves a truncated file
+   * that would read as a present-but-corrupt attachment forever.
    */
   async catBlobToFile(oid: string, destPath: string): Promise<void> {
+    const partPath = `${destPath}.part`;
     await new Promise<void>((resolve, reject) => {
       const child = spawn("git", ["cat-file", "blob", oid], {
         cwd: this.root,
         env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
         stdio: ["ignore", "pipe", "pipe"],
       });
-      const timer = setTimeout(() => child.kill("SIGKILL"), this.localMs);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, this.localMs);
       const stderr: Buffer[] = [];
       child.stderr.on("data", (c: Buffer) => stderr.push(c));
 
-      const out = createWriteStream(destPath);
+      const out = createWriteStream(partPath);
       child.stdout.pipe(out);
+
+      const discardPart = async () => {
+        try {
+          await fsp.unlink(partPath);
+        } catch {
+          // best effort — nothing to discard when the stream never opened
+        }
+      };
 
       let failed: Error | null = null;
       out.on("error", (e) => {
         failed = e;
         child.kill("SIGKILL");
       });
-      child.on("error", (e: NodeJS.ErrnoException) => {
+      child.on("error", async (e: NodeJS.ErrnoException) => {
         clearTimeout(timer);
+        await discardPart();
         reject(
           e.code === "ENOENT"
             ? new GitError("GitNotFound", "git executable not found")
@@ -395,13 +417,31 @@ export class GitRepo {
         } catch {
           // fall through to the failure checks below
         }
-        if (failed) return reject(new GitError("GitFailed", `write failed: ${failed.message}`));
+        if (failed) {
+          await discardPart();
+          return reject(new GitError("GitFailed", `write failed: ${failed.message}`));
+        }
+        if (timedOut) {
+          await discardPart();
+          return reject(
+            new GitError("Timeout", `git cat-file blob ${oid} timed out after ${this.localMs}ms`),
+          );
+        }
         if (code !== 0) {
+          await discardPart();
           return reject(
             new GitError(
               "GitFailed",
               `git cat-file blob ${oid} exited ${code}: ${Buffer.concat(stderr).toString("utf8").trim()}`,
             ),
+          );
+        }
+        try {
+          await fsp.rename(partPath, destPath);
+        } catch (e) {
+          await discardPart();
+          return reject(
+            new GitError("GitFailed", `finalizing ${destPath} failed: ${(e as Error).message}`),
           );
         }
         resolve();

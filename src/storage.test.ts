@@ -1050,6 +1050,32 @@ describe("IssueStore attachments", () => {
     store.dispose();
   });
 
+  test("path traversal ids are refused by every attachment helper (logged no-op)", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs();
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+    await store.writeAttachment("DS-001", "legit", ".png", new Uint8Array([1]));
+    const sizeBefore = vfs.size;
+
+    // write: hostile issue id, attachment id, and extension each refuse.
+    expect(await store.writeAttachment("../../escape", "a", ".png", new Uint8Array([9]))).toBe(false);
+    expect(await store.writeAttachment("DS-001", "../up", ".png", new Uint8Array([9]))).toBe(false);
+    expect(await store.writeAttachment("DS-001", "a", "/../evil", new Uint8Array([9]))).toBe(false);
+    expect(vfs.size).toBe(sizeBefore); // nothing new anywhere in the FS
+
+    // lookup/read: hostile ids resolve to null / missing rather than probing.
+    expect(await store.findAttachmentUri("..", "legit")).toBeNull();
+    expect(await store.findAttachmentUri("DS-001", "../legit")).toBeNull();
+    await expect(store.readAttachment("../..", "x")).rejects.toThrow();
+
+    // delete: hostile ids are no-ops; the legit file survives untouched.
+    await store.deleteAttachmentFile("..", "legit");
+    await store.remove("../../etc"); // routes into deleteIssueAttachments
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/legit.png")).toBeDefined();
+    store.dispose();
+  });
+
   test("deleteAttachmentFile removes a single file without touching siblings", async () => {
     const { fs: vfs, handles: h } = installVirtualFs();
     handles = h;

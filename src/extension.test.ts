@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  clampSyncInterval,
   mergeIssueUpdate,
   resolveCloseRequest,
   validateImportList,
@@ -432,6 +433,44 @@ describe("validateImportList — sync fields (guid / updatedAt / tasks[].updated
     expect(byId.get("DS-002")?.guid).toBe(deriveGuid("DS-002", "2025-02-01T00:00:00.000Z"));
     expect(byId.get("DS-002")?.updatedAt).toBe("2025-02-01T00:00:00.000Z");
     expect(byId.get("DS-002")?.tasks[0]).toEqual({ id: "t2", text: "bare", done: true });
+  });
+
+  test("path-hardening: hostile guid is re-derived; unsafe attachment/task ids are dropped", () => {
+    const { valid } = validateImportList([
+      {
+        id: "DS-001",
+        title: "hostile import",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        // Guids name attachment dirs in the sync ref tree; a path-shaped one
+        // must not survive an import.
+        guid: "../../escape",
+        attachments: [
+          { id: "att-ok", name: "a.png", mimeType: "image/png", sizeBytes: 1, addedAt: "2025-01-01T00:00:00.000Z" },
+          { id: "../evil", name: "b.png", mimeType: "image/png", sizeBytes: 1, addedAt: "2025-01-01T00:00:00.000Z" },
+        ],
+        tasks: [
+          { id: "t-ok", text: "kept", done: false },
+          { id: "../../up", text: "dropped", done: false },
+          { id: 42, text: "not-a-string-id", done: false },
+        ],
+      },
+    ]);
+    expect(valid).toHaveLength(1);
+    expect(valid[0]!.guid).toBe(deriveGuid("DS-001", "2025-01-01T00:00:00.000Z"));
+    expect(valid[0]!.attachments.map((a) => a.id)).toEqual(["att-ok"]);
+    expect(valid[0]!.tasks.map((t) => t.id)).toEqual(["t-ok"]);
+  });
+});
+
+describe("clampSyncInterval", () => {
+  test("declared min/max are enforced in code, not just the settings UI", () => {
+    expect(clampSyncInterval(5)).toBe(5);
+    expect(clampSyncInterval(0)).toBe(0); // manual-only stays manual-only
+    expect(clampSyncInterval(-3)).toBe(0);
+    expect(clampSyncInterval(0.001)).toBe(1); // no 60ms network sync storms
+    expect(clampSyncInterval(9999)).toBe(120);
+    expect(clampSyncInterval(Number.NaN)).toBe(5);
+    expect(clampSyncInterval("7" as unknown)).toBe(5);
   });
 });
 

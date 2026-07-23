@@ -8,8 +8,10 @@ import {
   coerceWireTicket,
   deriveGuid,
   fromWire,
+  isSafePathSegment,
   mergeStates,
   renumber,
+  sanitizeExt,
   toWire,
   TOMBSTONE_TTL_MS,
   type SyncState,
@@ -633,6 +635,98 @@ describe("coerceWireTicket", () => {
       status: "Complete",
     });
     expect(out!.status).toBe("Complete");
+  });
+
+  // Wire identity fields become filesystem path components on every replica
+  // (attachment dirs, ref-tree entry names) — hostile blobs must never get a
+  // path-shaped id past the coercer.
+  test("path-hardening: traversal ids and guids → null", () => {
+    const base = { title: "t", createdAt: T(1) };
+    for (const id of ["../x", "DS-1/../..", "/etc/passwd", "DS-001\n100644", "x", "DS-", "DS-9999999999"]) {
+      expect(coerceWireTicket({ ...base, guid: "g1", id })).toBeNull();
+    }
+    for (const guid of ["../g", "a/b", "..", ".", "g\tid", "g id", ""]) {
+      expect(coerceWireTicket({ ...base, guid, id: "DS-001" })).toBeNull();
+    }
+    // Everything this extension actually mints still passes.
+    expect(coerceWireTicket({ ...base, guid: deriveGuid("DS-007", T(1)), id: "DS-007" })).not.toBeNull();
+    expect(coerceWireTicket({ ...base, guid: "kept-guid", id: "DS-007" })).not.toBeNull();
+  });
+
+  test("path-hardening: unsafe task/attachment/tombstone/link ids are dropped", () => {
+    const out = coerceWireTicket({
+      guid: "g1",
+      id: "DS-001",
+      title: "t",
+      createdAt: T(1),
+      tasks: [
+        { id: "t-ok", text: "kept" },
+        { id: "../../escape", text: "dropped" },
+      ],
+      attachments: [
+        { id: "att1", name: "a.png", mimeType: "image/png", sizeBytes: 1, addedAt: T(1) },
+        { id: "../evil", name: "b.png", mimeType: "image/png", sizeBytes: 1, addedAt: T(1) },
+      ],
+      links: [
+        { targetGuid: "g2", kind: "blocks" },
+        { targetGuid: "g/2", kind: "blocks" },
+      ],
+      deletedTasks: [
+        { id: "t-old", deletedAt: T(2) },
+        { id: "..", deletedAt: T(2) },
+      ],
+    });
+    expect(out!.tasks.map((t) => t.id)).toEqual(["t-ok"]);
+    expect(out!.attachments.map((a) => a.id)).toEqual(["att1"]);
+    expect(out!.links).toEqual([{ targetGuid: "g2", kind: "blocks" }]);
+    expect(out!.deletedTasks).toEqual([{ id: "t-old", deletedAt: T(2) }]);
+  });
+
+  test("number sanity: hostile/absent numbers derive from the id", () => {
+    const base = { guid: "g1", id: "DS-042", title: "t", createdAt: T(1) };
+    expect(coerceWireTicket({ ...base })!.number).toBe(42);
+    expect(coerceWireTicket({ ...base, number: 9e15 })!.number).toBe(42);
+    expect(coerceWireTicket({ ...base, number: -5 })!.number).toBe(42);
+    expect(coerceWireTicket({ ...base, number: 1.5 })!.number).toBe(42);
+    expect(coerceWireTicket({ ...base, number: 7 })!.number).toBe(7);
+  });
+
+  test("duplicate task ids dedupe last-wins — the merge must never emit duplicates", () => {
+    const out = coerceWireTicket({
+      guid: "g1",
+      id: "DS-001",
+      title: "t",
+      createdAt: T(1),
+      tasks: [
+        { id: "t-1", text: "first", updatedAt: T(2) },
+        { id: "t-1", text: "second", updatedAt: T(3) },
+      ],
+    });
+    expect(out!.tasks).toEqual([{ id: "t-1", text: "second", done: false, updatedAt: T(3) }]);
+  });
+});
+
+describe("isSafePathSegment / sanitizeExt", () => {
+  test("segments: minted shapes pass, traversal/separator/control shapes fail", () => {
+    for (const ok of ["DS-001", "t-abc123", deriveGuid("DS-001", T(1)), "a..b", "x_y-z.9"]) {
+      expect(isSafePathSegment(ok)).toBe(true);
+    }
+    for (const bad of ["", ".", "..", "a/b", "a\\b", "a\tb", "a\nb", "a b", "../a", "a/.."]) {
+      expect(isSafePathSegment(bad)).toBe(false);
+    }
+  });
+
+  test("sanitizeExt never emits a separator and caps length", () => {
+    expect(sanitizeExt("photo.png")).toBe(".png");
+    expect(sanitizeExt("archive.tar.gz")).toBe(".gz");
+    expect(sanitizeExt("noext")).toBe("");
+    expect(sanitizeExt("x./../../evil.sh")).toBe(".sh");
+    expect(sanitizeExt("a.b/c")).toBe(".bc"); // separator stripped, never joined
+    expect(sanitizeExt(`x.${"y".repeat(40)}`)).toBe("");
+    for (const name of ["a.b/c", "evil.\\sh", "x.p\0ng", "y..sh"]) {
+      expect(sanitizeExt(name)).not.toContain("/");
+      expect(sanitizeExt(name)).not.toContain("\\");
+    }
   });
 });
 
