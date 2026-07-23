@@ -22,6 +22,7 @@ import {
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, relTime } from "./IssueDetail";
 import { TagStrip } from "./Tags";
+import { pendingCloseTitle } from "./copy";
 import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
 import {
   clearExternalDragLocal,
@@ -288,11 +289,7 @@ const BoardCard = memo(function BoardCard({
           {issue.pendingClose && (
             <span
               className="bd-card-pending-close"
-              title={
-                issue.pendingClose.target === "Complete"
-                  ? "An agent reports this ticket's work as finished (awaiting acceptance)"
-                  : "An agent requested to close this ticket (no longer needed)"
-              }
+              title={pendingCloseTitle(issue.pendingClose)}
             >
               <Icon name="clock" size={11} />
             </span>

@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   canonicalJson,
+  coerceTombstone,
   coerceWireTicket,
   deriveGuid,
   fromWire,
@@ -703,6 +704,24 @@ describe("coerceWireTicket", () => {
       ],
     });
     expect(out!.tasks).toEqual([{ id: "t-1", text: "second", done: false, updatedAt: T(3) }]);
+  });
+});
+
+describe("coerceTombstone", () => {
+  test("valid tombstone passes; garbage and unsafe guids are rejected like tickets", () => {
+    expect(coerceTombstone({ guid: "g-1", deletedAt: T(2), lastId: "DS-001" })).toEqual({
+      guid: "g-1",
+      deletedAt: T(2),
+      lastId: "DS-001",
+    });
+    expect(coerceTombstone({ guid: "g-1", deletedAt: T(2) })).toMatchObject({ lastId: "" });
+    for (const junk of [null, 42, {}, { guid: "g-1" }, { guid: "g-1", deletedAt: "bad" }]) {
+      expect(coerceTombstone(junk)).toBeNull();
+    }
+    // The guid becomes a tombstones/<guid>.json mktree entry — same
+    // safe-segment bar as ticket guids (drift caught by review).
+    expect(coerceTombstone({ guid: "../evil", deletedAt: T(2) })).toBeNull();
+    expect(coerceTombstone({ guid: "g\t1", deletedAt: T(2) })).toBeNull();
   });
 });
 

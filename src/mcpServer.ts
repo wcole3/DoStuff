@@ -70,11 +70,13 @@ import {
   canMoveToActiveLane,
   coerceLinks,
   coerceTags,
+  effectiveCloseTarget,
   type Issue,
   type LinkKind,
   type RecordEntry,
   type Status,
 } from "./types";
+import { formatIssueId } from "./syncMerge";
 import { validateLinks } from "./extension";
 
 // The default workflow prompt lives in its own small module so the extension
@@ -96,6 +98,21 @@ const ToolResultErr = (text: string): ToolResult => ({
   isError: true,
   content: [{ type: "text", text }],
 });
+
+/**
+ * The single terminal-status gate for agent write tools — the CLAUDE.md rule
+ * that Complete and Closed are untouchable over MCP in either direction.
+ * Returns the rejection result, or null when the ticket is agent-mutable.
+ * `action` finishes the sentence "agents may not …"; genuinely tool-specific
+ * checks (e.g. request_ticket_complete's Verification-only rule) stay with
+ * their tools.
+ */
+function assertAgentMutable(issue: Issue, action: string): ToolResult | null {
+  if (AGENT_VISIBLE_STATUSES.includes(issue.status)) return null;
+  return ToolResultErr(
+    `Ticket ${issue.id} is in "${issue.status}" — terminal. Agents may not ${action}.`,
+  );
+}
 
 // ----- Input schemas (raw zod shapes per SDK v1.x) ---------------------------
 
@@ -483,7 +500,7 @@ export async function runCreateTicket(
   const validated = parsed.data;
   const now = new Date().toISOString();
   const number = store.nextNumber();
-  const id = `DS-${String(number).padStart(3, "0")}`;
+  const id = formatIssueId(number);
   // Normalize the agent-supplied links: coerce shape first, then drop entries
   // whose targetId doesn't exist (logged) and self-links (which `coerceLinks`
   // already filters when given the current id).
@@ -587,21 +604,8 @@ export async function runUpdateTicketStatus(
 
   // Source may be Thinking (promotion into the pipeline) or any active lane.
   // Complete and Closed are terminal for agents and cannot be re-opened.
-  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
-    if (issue.status === "Complete") {
-      return ToolResultErr(
-        `Ticket ${issue.id} is Complete and cannot be re-opened by an agent.`,
-      );
-    }
-    if (issue.status === "Closed") {
-      return ToolResultErr(
-        `Ticket ${issue.id} is Closed and cannot be re-opened by an agent.`,
-      );
-    }
-    return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may not move it.`,
-    );
-  }
+  const statusGate = assertAgentMutable(issue, "move it (terminal tickets cannot be re-opened)");
+  if (statusGate) return statusGate;
 
   if (args.status === issue.status) {
     return ToolResultOk(`Ticket ${issue.id} is already in ${issue.status}; no change.`);
@@ -661,11 +665,8 @@ export async function runUpdateTicketProgress(
   const issue = store.get(args.id);
   if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
 
-  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
-    return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may not update Complete or Closed tickets.`,
-    );
-  }
+  const progressGate = assertAgentMutable(issue, "update its tasks or record");
+  if (progressGate) return progressGate;
 
   const taskUpdates = args.taskUpdates ?? [];
   const knownTaskIds = new Set(issue.tasks.map((t) => t.id));
@@ -799,11 +800,8 @@ export async function runUpdateTicketDescription(
   const issue = store.get(args.id);
   if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
 
-  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
-    return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}". Agents may not edit the description of Complete or Closed tickets.`,
-    );
-  }
+  const descriptionGate = assertAgentMutable(issue, "edit its description");
+  if (descriptionGate) return descriptionGate;
 
   const now = new Date().toISOString();
   const next: Issue = {
@@ -849,7 +847,7 @@ async function runRequestTerminal(
     `${label} requested for ${issue.id}. A human must approve it in DoStuff. ` +
     `Poll get_ticket: the ticket becomes ${target} on approval, or the request clears on denial.`;
 
-  const existingTarget = issue.pendingClose ? (issue.pendingClose.target ?? "Closed") : null;
+  const existingTarget = issue.pendingClose ? effectiveCloseTarget(issue.pendingClose) : null;
   if (existingTarget === target) {
     return ToolResultOk(
       JSON.stringify(
@@ -898,11 +896,8 @@ export async function runRequestTicketClose(
   const issue = store.get(args.id);
   if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
 
-  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
-    return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}" and is already terminal; there is nothing to close.`,
-    );
-  }
+  const closeGate = assertAgentMutable(issue, "request a close; there is nothing left to close");
+  if (closeGate) return closeGate;
   return runRequestTerminal(store, issue, "Closed", args.note);
 }
 
@@ -926,11 +921,8 @@ export async function runRequestTicketComplete(
   const issue = store.get(args.id);
   if (!issue) return ToolResultErr(`Ticket ${args.id} not found.`);
 
-  if (!AGENT_VISIBLE_STATUSES.includes(issue.status)) {
-    return ToolResultErr(
-      `Ticket ${issue.id} is in "${issue.status}" and is already terminal; there is nothing to complete.`,
-    );
-  }
+  const completeGate = assertAgentMutable(issue, "request completion; there is nothing left to complete");
+  if (completeGate) return completeGate;
   if (issue.status !== "Verification") {
     return ToolResultErr(
       `Ticket ${issue.id} is in "${issue.status}". Completion requests are only allowed from ` +

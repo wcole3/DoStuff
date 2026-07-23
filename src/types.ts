@@ -135,7 +135,8 @@ export interface PendingClose {
   target?: PendingCloseTarget;
 }
 
-const DS_ID_RE = /^DS-\d+$/;
+/** Canonical DS-NNN ticket-id shape. Exported so validators don't re-inline it. */
+export const DS_ID_RE = /^DS-\d+$/;
 
 /**
  * Validate + dedupe a raw `links` value into a clean `TicketLink[]`. Mirrors
@@ -420,6 +421,15 @@ export function coercePendingClose(input: unknown): PendingClose | null {
     out.target = r.target as PendingCloseTarget;
   }
   return out;
+}
+
+/**
+ * The lane a pending close/complete request resolves to. An absent `target`
+ * is the legacy wire shape and means `Closed` (OBE) — this is the one place
+ * that rule lives; readers must not re-apply the default themselves.
+ */
+export function effectiveCloseTarget(pc: PendingClose): PendingCloseTarget {
+  return pc.target ?? "Closed";
 }
 
 export function canMoveToActiveLane(

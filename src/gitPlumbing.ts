@@ -50,9 +50,8 @@ const NON_FF_PATTERNS = [/non-fast-forward/i, /\[rejected\]/i, /fetch first/i, /
 function classify(args: string[], stderr: string): GitErrorCode {
   if (AUTH_PATTERNS.some((re) => re.test(stderr))) return "AuthFailed";
   if (args[0] === "push" && NON_FF_PATTERNS.some((re) => re.test(stderr))) return "NonFastForward";
-  if (args[0] === "update-ref" && /cannot lock ref|but expected|ref .* is at/i.test(stderr)) {
-    return "CasFailed";
-  }
+  // update-ref never routes through here — `updateRefCas` owns CAS
+  // classification with its own stderr patterns.
   return "GitFailed";
 }
 
@@ -84,20 +83,30 @@ interface RunResult {
  * Never rejects for a non-zero exit — callers inspect `code` (spawn errors
  * and timeouts DO reject with typed GitError).
  */
+/**
+ * The one place the git process environment is defined (03 §2): prompts
+ * disabled, optional locks off, sync identity injected so commits work in
+ * repos with no user.name. Both spawn paths (`runGit` and the streaming
+ * `catBlobToFile`) use this — a policy change must not miss one of them.
+ */
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GCM_INTERACTIVE: "never",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_AUTHOR_NAME: "DoStuff Sync",
+    GIT_AUTHOR_EMAIL: "dostuff@localhost",
+    GIT_COMMITTER_NAME: "DoStuff Sync",
+    GIT_COMMITTER_EMAIL: "dostuff@localhost",
+  };
+}
+
 function runGit(args: string[], opts: RunOpts): Promise<RunResult> {
   return new Promise<RunResult>((resolve, reject) => {
     const child = spawn("git", args, {
       cwd: opts.cwd,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        GCM_INTERACTIVE: "never",
-        GIT_OPTIONAL_LOCKS: "0",
-        GIT_AUTHOR_NAME: "DoStuff Sync",
-        GIT_AUTHOR_EMAIL: "dostuff@localhost",
-        GIT_COMMITTER_NAME: "DoStuff Sync",
-        GIT_COMMITTER_EMAIL: "dostuff@localhost",
-      },
+      env: gitEnv(),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -371,7 +380,7 @@ export class GitRepo {
     await new Promise<void>((resolve, reject) => {
       const child = spawn("git", ["cat-file", "blob", oid], {
         cwd: this.root,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
+        env: gitEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       });
       let timedOut = false;

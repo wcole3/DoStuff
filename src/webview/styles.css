@@ -201,6 +201,17 @@ button { font: inherit; color: inherit; }
 }
 .ds-row-id { font-variant-numeric: tabular-nums; opacity: .75; font-size: 10.5px; }
 .ds-row-dot { opacity: .4; }
+/* "Awaiting decision" filter toggle in the sidebar header. */
+.ds-pending-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--vsc-fg-muted);
+  margin-left: 8px;
+  cursor: pointer;
+}
+
 .ds-row-pending-close {
   display: inline-flex; align-items: center; gap: 3px;
   color: #e2c08d;

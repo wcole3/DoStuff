@@ -12,6 +12,7 @@ import {
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, absTime, relTime } from "./IssueDetail";
 import { TagStrip } from "./Tags";
+import { pendingCloseTitle } from "./copy";
 import { postExternalDragStart, useIssues } from "./messaging";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
 import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
@@ -152,11 +153,7 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
                 <span className="ds-row-dot">·</span>
                 <span
                   className="ds-row-pending-close"
-                  title={
-                    issue.pendingClose.target === "Complete"
-                      ? "An agent reports this ticket's work as finished (awaiting acceptance)"
-                      : "An agent requested to close this ticket (no longer needed)"
-                  }
+                  title={pendingCloseTitle(issue.pendingClose)}
                 >
                   <Icon name="clock" size={10} />
                   {issue.pendingClose.target === "Complete" ? "awaiting acceptance" : "awaiting close"}
@@ -340,15 +337,7 @@ export function Sidebar() {
         </label>
         {(pendingCloseCount > 0 || pendingCloseOnly) && (
           <label
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 4,
-              fontSize: 10.5,
-              color: "var(--vsc-fg-muted)",
-              marginLeft: 8,
-              cursor: "pointer",
-            }}
+            className="ds-pending-filter"
             title="Show only tickets with a pending agent request (close or completion)"
           >
             <input

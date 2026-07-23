@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
-import { deriveGuid, isSafePathSegment, sanitizeExt } from "./syncMerge";
+import { backfillSyncFields, isIsoTimestamp, isSafePathSegment, sanitizeExt } from "./syncMerge";
 import { GitSyncController } from "./gitSync";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
@@ -13,12 +13,14 @@ import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
 import {
   ACTIVE_LANE_CAP,
+  DS_ID_RE,
   MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
   coerceAttachments,
   coerceLinks,
   coercePendingClose,
   coerceTags,
+  effectiveCloseTarget,
   isPriority,
   isStatus,
   isType,
@@ -206,7 +208,7 @@ export function resolveCloseRequest(
 ): Issue | null {
   if (!prior.pendingClose) return null;
   const ts = now();
-  const target: Status = prior.pendingClose.target ?? "Closed";
+  const target: Status = effectiveCloseTarget(prior.pendingClose);
   const label = target === "Complete" ? "Completion" : "Close";
   if (verdict === "approve") {
     return {
@@ -235,7 +237,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       continue;
     }
     const e = entry as Record<string, unknown>;
-    if (typeof e.id !== "string" || !/^DS-\d+$/.test(e.id)) {
+    if (typeof e.id !== "string" || !DS_ID_RE.test(e.id)) {
       skipped += 1;
       continue;
     }
@@ -248,8 +250,6 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       continue;
     }
     const status: Status = isStatus(e.status) ? e.status : "Thinking";
-    const isIso = (v: unknown): v is string =>
-      typeof v === "string" && v.length > 0 && !Number.isNaN(Date.parse(v));
     const issue: Issue = {
       id: e.id,
       number: Number.isFinite(e.number)
@@ -275,7 +275,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
             typeof t.text === "string",
         )
         .map((t) => {
-          if ("updatedAt" in t && !isIso(t.updatedAt)) {
+          if ("updatedAt" in t && !isIsoTimestamp(t.updatedAt)) {
             const { updatedAt: _bad, ...rest } = t;
             return rest;
           }
@@ -296,14 +296,10 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
       pendingClose: coercePendingClose(e.pendingClose),
       // Sync fields: keep well-formed provided values (export→import round
-      // trip), derive per the normalize() rules when missing. A guid that is
-      // not a safe path segment is re-derived — guids name attachment dirs in
-      // the sync ref tree, and outbound state is never re-coerced.
-      guid:
-        typeof e.guid === "string" && e.guid && isSafePathSegment(e.guid)
-          ? e.guid
-          : deriveGuid(e.id, e.createdAt),
-      updatedAt: isIso(e.updatedAt) ? e.updatedAt : e.createdAt,
+      // trip), derive per the normalize() rules when missing. requireSafeGuid:
+      // guids name attachment dirs in the sync ref tree, and outbound state
+      // is never re-coerced.
+      ...backfillSyncFields(e.id, e.createdAt, e.guid, e.updatedAt, { requireSafeGuid: true }),
     };
     valid.push(issue);
   }
@@ -364,12 +360,21 @@ export function activate(context: vscode.ExtensionContext) {
    * On rejection we re-broadcast the current truth so the optimistic webview
    * state reverts.
    */
+  /**
+   * Re-broadcast current state to every open webview — used after a rejected
+   * update so stale optimistic UI (drag previews, banners) snaps back.
+   */
+  const broadcastAll = (): void => {
+    sidebar.broadcast();
+    BoardPanel.broadcast(store.list());
+    GraphPanel.broadcast(store.list());
+  };
+
   const applyIssueUpdate = async (incoming: Issue): Promise<void> => {
     const prior = store.get(incoming.id);
     if (!prior) {
       vscode.window.showWarningMessage(`DoStuff: No ticket with id ${incoming.id}.`);
-      sidebar.broadcast();
-      BoardPanel.broadcast(store.list());
+      broadcastAll();
       return;
     }
 
@@ -380,9 +385,7 @@ export function activate(context: vscode.ExtensionContext) {
     const merged = mergeIssueUpdate(prior, incoming, "user", undefined, knownIds);
     if ("error" in merged) {
       vscode.window.showWarningMessage(`DoStuff: ${merged.error}`);
-      sidebar.broadcast();
-      BoardPanel.broadcast(store.list());
-      GraphPanel.broadcast(store.list());
+      broadcastAll();
       return;
     }
     const next = merged.next;
@@ -392,9 +395,7 @@ export function activate(context: vscode.ExtensionContext) {
       const check = canMoveToActiveLane(store.list(), next.status, next.id, cap);
       if (check !== true) {
         vscode.window.showWarningMessage(`DoStuff: ${check}`);
-        sidebar.broadcast();
-        BoardPanel.broadcast(store.list());
-        GraphPanel.broadcast(store.list());
+        broadcastAll();
         return;
       }
     }
@@ -414,9 +415,7 @@ export function activate(context: vscode.ExtensionContext) {
     const prior = store.get(id);
     const next = prior ? resolveCloseRequest(prior, verdict) : null;
     if (!next) {
-      sidebar.broadcast();
-      BoardPanel.broadcast(store.list());
-      GraphPanel.broadcast(store.list());
+      broadcastAll();
       return;
     }
     await store.upsert(next);
@@ -749,7 +748,7 @@ export function activate(context: vscode.ExtensionContext) {
     // link-chip click (sidebar/board IssueDetail) or a graph node click; fans
     // the request out to every open webview so whichever is focused responds.
     vscode.commands.registerCommand("dostuff.revealTicket", (id: unknown) => {
-      if (typeof id !== "string" || !/^DS-\d+$/.test(id)) return;
+      if (typeof id !== "string" || !DS_ID_RE.test(id)) return;
       sidebar.revealTicket(id);
       BoardPanel.revealTicket(id);
     }),
@@ -759,7 +758,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("dostuff.resolveClose", (arg: unknown) => {
       if (!arg || typeof arg !== "object") return;
       const { id, verdict } = arg as { id?: unknown; verdict?: unknown };
-      if (typeof id !== "string" || !/^DS-\d+$/.test(id)) return;
+      if (typeof id !== "string" || !DS_ID_RE.test(id)) return;
       if (verdict !== "approve" && verdict !== "deny") return;
       void resolveClose(id, verdict);
     }),

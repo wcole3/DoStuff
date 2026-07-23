@@ -19,7 +19,14 @@ import initSqlJs, {
   type Database,
   type SqlJsStatic,
 } from "sql.js";
-import { deriveGuid, isSafePathSegment, TOMBSTONE_TTL_MS } from "./syncMerge";
+import {
+  backfillSyncFields,
+  deriveGuid,
+  formatIssueId,
+  isIsoTimestamp,
+  isSafePathSegment,
+  TOMBSTONE_TTL_MS,
+} from "./syncMerge";
 import {
   coerceAttachments,
   coerceLinks,
@@ -38,6 +45,23 @@ import {
   type StatusEvent,
   type Task,
 } from "./types";
+
+/** Persisted deletion witnesses, as read back by `getSyncTombstones`. */
+export interface TicketTombstoneRow {
+  guid: string;
+  deletedAt: string;
+  lastId: string;
+}
+export interface ElementTombstoneRow {
+  ticketGuid: string;
+  scope: "task" | "attachment";
+  elementId: string;
+  deletedAt: string;
+}
+export interface SyncTombstones {
+  tickets: TicketTombstoneRow[];
+  elements: ElementTombstoneRow[];
+}
 
 const STATE_KEY_FALLBACK = "dostuff.issues.v1";
 const DB_FILENAME = "dostuff.db";
@@ -159,10 +183,6 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 `;
 
-/** ISO-8601-parsable string guard. Shared by `normalize` and the import path. */
-function isIsoString(v: unknown): v is string {
-  return typeof v === "string" && v.length > 0 && !Number.isNaN(Date.parse(v));
-}
 
 /**
  * Forward-compat: stamp missing fields on issues loaded from older versions.
@@ -204,7 +224,7 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       // Keep task `updatedAt` only when ISO-valid; strip bad values rather
       // than throwing (legacy/garbage input must always load).
       tasks: (Array.isArray(issue.tasks) ? issue.tasks : []).map((t) => {
-        if (t && typeof t === "object" && "updatedAt" in t && !isIsoString((t as Task).updatedAt)) {
+        if (t && typeof t === "object" && "updatedAt" in t && !isIsoTimestamp((t as Task).updatedAt)) {
           const { updatedAt: _bad, ...rest } = t as Task;
           return rest as Task;
         }
@@ -217,11 +237,12 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       pendingClose: coercePendingClose((issue as any).pendingClose),
       // Sync identity/ordering fields — server-derived, deterministic backfill
       // for legacy data (docs/plans/ticket-sync/01 §2-3).
-      guid:
-        typeof (issue as any).guid === "string" && (issue as any).guid
-          ? (issue as any).guid
-          : deriveGuid(String(issue.id ?? ""), String(issue.createdAt ?? "")),
-      updatedAt: isIsoString((issue as any).updatedAt) ? (issue as any).updatedAt : issue.createdAt,
+      ...backfillSyncFields(
+        String(issue.id ?? ""),
+        String(issue.createdAt ?? ""),
+        (issue as any).guid,
+        (issue as any).updatedAt,
+      ),
     },
     coerced,
   };
@@ -493,15 +514,7 @@ export class IssueStore {
    * these into the outbound wire state. Empty (and never written) in the
    * `globalState` fallback — no workspace ⇒ sync inert.
    */
-  getSyncTombstones(): {
-    tickets: Array<{ guid: string; deletedAt: string; lastId: string }>;
-    elements: Array<{
-      ticketGuid: string;
-      scope: "task" | "attachment";
-      elementId: string;
-      deletedAt: string;
-    }>;
-  } {
+  getSyncTombstones(): SyncTombstones {
     if (!this.db) return { tickets: [], elements: [] };
     const rows = selectAll<{
       scope: string;
@@ -510,13 +523,8 @@ export class IssueStore {
       deleted_at: string;
       last_id: string;
     }>(this.db, "SELECT * FROM sync_tombstones");
-    const tickets: Array<{ guid: string; deletedAt: string; lastId: string }> = [];
-    const elements: Array<{
-      ticketGuid: string;
-      scope: "task" | "attachment";
-      elementId: string;
-      deletedAt: string;
-    }> = [];
+    const tickets: TicketTombstoneRow[] = [];
+    const elements: ElementTombstoneRow[] = [];
     for (const r of rows) {
       if (r.scope === "ticket") {
         tickets.push({ guid: r.ticket_guid, deletedAt: r.deleted_at, lastId: r.last_id });
@@ -546,29 +554,23 @@ export class IssueStore {
    */
   private recordElementTombstones(db: Database, prior: Issue, next: Issue, deletedAt: string): void {
     const guid = next.guid || prior.guid;
-    const nextTaskIds = new Set(next.tasks.map((t) => t.id));
-    for (const t of prior.tasks) {
-      if (!nextTaskIds.has(t.id)) {
+    const recordDropped = (scope: "task" | "attachment", priorEls: Array<{ id: string }>, nextEls: Array<{ id: string }>) => {
+      const kept = new Set(nextEls.map((e) => e.id));
+      for (const el of priorEls) {
+        if (kept.has(el.id)) continue;
         db.run(
-          "INSERT OR REPLACE INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('task', ?, ?, ?, '')",
-          [guid, t.id, deletedAt],
+          "INSERT OR REPLACE INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES (?, ?, ?, ?, '')",
+          [scope, guid, el.id, deletedAt],
         );
       }
-    }
-    const nextAttIds = new Set(next.attachments.map((a) => a.id));
-    for (const a of prior.attachments) {
-      if (!nextAttIds.has(a.id)) {
-        db.run(
-          "INSERT OR REPLACE INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('attachment', ?, ?, ?, '')",
-          [guid, a.id, deletedAt],
-        );
-      }
-    }
+    };
+    recordDropped("task", prior.tasks, next.tasks);
+    recordDropped("attachment", prior.attachments, next.attachments);
   }
 
   /** Generate next monotonic ID (DS-001, DS-002, ...). */
   nextId(): string {
-    return `DS-${String(this.nextNumber()).padStart(3, "0")}`;
+    return formatIssueId(this.nextNumber());
   }
 
   /**
@@ -1277,11 +1279,7 @@ function stampTasks(next: Task[], prior: Task[] | undefined, now: string): Task[
  * export→import round trip preserves exported guids and timestamps.
  */
 function ensureSyncFields(issue: Issue): Issue {
-  const guid =
-    typeof issue.guid === "string" && issue.guid
-      ? issue.guid
-      : deriveGuid(issue.id, issue.createdAt);
-  const updatedAt = isIsoString(issue.updatedAt) ? issue.updatedAt : issue.createdAt;
+  const { guid, updatedAt } = backfillSyncFields(issue.id, issue.createdAt, issue.guid, issue.updatedAt);
   if (guid === issue.guid && updatedAt === issue.updatedAt) return issue;
   return { ...issue, guid, updatedAt };
 }

@@ -17,6 +17,7 @@ import type { IssueStore } from "./storage";
 import { findRepoRoot, GitError, GitRepo, type GitRepoOptions, type TreeEntry } from "./gitPlumbing";
 import {
   canonicalJson,
+  coerceTombstone,
   coerceWireTicket,
   fromWire,
   mergeStates,
@@ -28,6 +29,7 @@ import {
   type Tombstone,
   type WireTicket,
 } from "./syncMerge";
+import type { ElementTombstoneRow, SyncTombstones } from "./storage";
 import { ACTIVE_LANES, type Issue, type Status } from "./types";
 
 export const FORMAT_VERSION = 1;
@@ -51,7 +53,12 @@ export interface SyncResult {
   applied: number;
   pushed: boolean;
   renames: Array<{ oldId: string; newId: string }>;
-  laneOverflow: string[]; // lanes left over cap by the merge, for the warn-once toast
+}
+
+/** What one apply pass changed — the slice of SyncResult applyState can know. */
+interface ApplyResult {
+  applied: number;
+  renames: Array<{ oldId: string; newId: string }>;
 }
 
 /**
@@ -247,22 +254,31 @@ export class GitSyncController implements vscode.Disposable {
 
   // ─── state building / reading ───────────────────────────────────────────
 
-  private buildLocalState(): SyncState {
-    const issues = this.store.list();
-    const idToGuid = new Map(issues.map((i) => [i.id, i.guid]));
-    const tombs = this.store.getSyncTombstones();
-    const elementsByGuid = new Map<string, { tasks: ElementTombstone[]; attachments: ElementTombstone[] }>();
-    for (const e of tombs.elements) {
-      let bucket = elementsByGuid.get(e.ticketGuid);
+  /** Group element-tombstone rows by owning ticket guid. */
+  private static bucketElementTombstones(
+    rows: ElementTombstoneRow[],
+  ): Map<string, { tasks: ElementTombstone[]; attachments: ElementTombstone[] }> {
+    const byGuid = new Map<string, { tasks: ElementTombstone[]; attachments: ElementTombstone[] }>();
+    for (const e of rows) {
+      let bucket = byGuid.get(e.ticketGuid);
       if (!bucket) {
         bucket = { tasks: [], attachments: [] };
-        elementsByGuid.set(e.ticketGuid, bucket);
+        byGuid.set(e.ticketGuid, bucket);
       }
       bucket[e.scope === "task" ? "tasks" : "attachments"].push({
         id: e.elementId,
         deletedAt: e.deletedAt,
       });
     }
+    return byGuid;
+  }
+
+  /** `tombs` is accepted so callers that already fetched the witnesses (one
+   *  SELECT) can share them instead of re-querying per use. */
+  private buildLocalState(tombs: SyncTombstones = this.store.getSyncTombstones()): SyncState {
+    const issues = this.store.list();
+    const idToGuid = new Map(issues.map((i) => [i.id, i.guid]));
+    const elementsByGuid = GitSyncController.bucketElementTombstones(tombs.elements);
     const tickets = new Map<string, WireTicket>();
     for (const i of issues) {
       tickets.set(i.guid, toWire(i, idToGuid, elementsByGuid.get(i.guid)));
@@ -274,9 +290,29 @@ export class GitSyncController implements vscode.Disposable {
     return { tickets, tombstones };
   }
 
+  /**
+   * Tree listing of an immutable tip, memoized — `readState` and
+   * `attachmentOidsAt` are routinely called on the same tip within one cycle,
+   * and each listing is a full `git ls-tree -r` spawn. Git objects never
+   * change under an oid, so entries can be cached indefinitely; the small cap
+   * just bounds memory.
+   */
+  private readonly treeCache = new Map<string, TreeEntry[]>();
+  private async entriesAt(tip: string): Promise<TreeEntry[]> {
+    const hit = this.treeCache.get(tip);
+    if (hit) return hit;
+    const entries = await this.repo!.readTree(tip);
+    this.treeCache.set(tip, entries);
+    if (this.treeCache.size > 4) {
+      const oldest = this.treeCache.keys().next().value;
+      if (oldest !== undefined) this.treeCache.delete(oldest);
+    }
+    return entries;
+  }
+
   private async readState(tip: string): Promise<SyncState> {
     const repo = this.repo!;
-    const entries = await repo.readTree(tip);
+    const entries = await this.entriesAt(tip);
     const meta = entries.find((e) => e.path === "meta.json");
     const wanted = entries.filter(
       (e) =>
@@ -320,19 +356,9 @@ export class GitSyncController implements vscode.Disposable {
         }
       } else if (e.path.startsWith("tombstones/")) {
         try {
-          const raw = JSON.parse(body.toString("utf8")) as Record<string, unknown>;
-          if (
-            typeof raw.guid === "string" &&
-            raw.guid &&
-            typeof raw.deletedAt === "string" &&
-            !Number.isNaN(Date.parse(raw.deletedAt))
-          ) {
-            tombstones.set(raw.guid, {
-              guid: raw.guid,
-              deletedAt: raw.deletedAt,
-              lastId: typeof raw.lastId === "string" ? raw.lastId : "",
-            });
-          }
+          const tomb = coerceTombstone(JSON.parse(body.toString("utf8")));
+          if (tomb) tombstones.set(tomb.guid, tomb);
+          else this.store.appendLog(`Sync: skipped malformed tombstone blob at ${e.path}`);
         } catch {
           this.store.appendLog(`Sync: skipped unparsable tombstone blob at ${e.path}`);
         }
@@ -345,7 +371,7 @@ export class GitSyncController implements vscode.Disposable {
   private async attachmentOidsAt(tip: string | null): Promise<Map<string, string>> {
     const out = new Map<string, string>();
     if (!tip || !this.repo) return out;
-    for (const e of await this.repo.readTree(tip)) {
+    for (const e of await this.entriesAt(tip)) {
       if (e.type === "blob" && e.path.startsWith("attachments/")) out.set(e.path, e.oid);
     }
     return out;
@@ -359,14 +385,14 @@ export class GitSyncController implements vscode.Disposable {
    * a missing local file never fails the commit.
    */
   private async buildAttachmentEntries(
-    state: SyncState,
+    sortedTickets: Array<[string, WireTicket]>,
     prevOids: Map<string, string>,
   ): Promise<TreeEntry[]> {
     if (this.opts.syncAttachments === false) return [];
     const repo = this.repo!;
     const cap = this.opts.maxAttachmentSyncBytes ?? 5 * 1024 * 1024;
     const perGuid: TreeEntry[] = [];
-    for (const [guid, t] of [...state.tickets.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    for (const [guid, t] of sortedTickets) {
       const files: TreeEntry[] = [];
       for (const att of t.attachments) {
         if (att.sizeBytes > cap) {
@@ -404,51 +430,41 @@ export class GitSyncController implements vscode.Disposable {
 
   private async writeState(state: SyncState, prevAttachmentOids?: Map<string, string>): Promise<string> {
     const repo = this.repo!;
-    const ticketEntries: TreeEntry[] = [];
-    for (const [guid, t] of [...state.tickets.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
-      ticketEntries.push({
-        mode: "100644",
-        type: "blob",
-        oid: await repo.hashObjectStdin(Buffer.from(canonicalJson(t), "utf8")),
-        path: `${guid}.json`,
-      });
-    }
-    const tombEntries: TreeEntry[] = [];
-    for (const [guid, t] of [...state.tombstones.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
-      tombEntries.push({
-        mode: "100644",
-        type: "blob",
-        oid: await repo.hashObjectStdin(Buffer.from(canonicalJson(t), "utf8")),
-        path: `${guid}.json`,
-      });
-    }
+    const byKey = ([a]: [string, unknown], [b]: [string, unknown]) => (a < b ? -1 : 1);
+    const sortedTickets = [...state.tickets.entries()].sort(byKey);
+    const sortedTombs = [...state.tombstones.entries()].sort(byKey);
+
+    // Every blob hash is independent — run them (and the attachment-subtree
+    // build) concurrently instead of one spawn-await per object. Loose-object
+    // writes are atomic, so concurrent `hash-object -w` is safe.
+    const blobEntry = (guid: string, oid: string): TreeEntry => ({
+      mode: "100644",
+      type: "blob",
+      oid,
+      path: `${guid}.json`,
+    });
+    const [metaOid, ticketOids, tombOids, attEntries] = await Promise.all([
+      repo.hashObjectStdin(Buffer.from(canonicalJson({ formatVersion: FORMAT_VERSION }), "utf8")),
+      Promise.all(
+        sortedTickets.map(([, t]) => repo.hashObjectStdin(Buffer.from(canonicalJson(t), "utf8"))),
+      ),
+      Promise.all(
+        sortedTombs.map(([, t]) => repo.hashObjectStdin(Buffer.from(canonicalJson(t), "utf8"))),
+      ),
+      this.buildAttachmentEntries(sortedTickets, prevAttachmentOids ?? new Map()),
+    ]);
+
     const rootEntries: TreeEntry[] = [
-      {
-        mode: "100644",
-        type: "blob",
-        oid: await repo.hashObjectStdin(
-          Buffer.from(canonicalJson({ formatVersion: FORMAT_VERSION }), "utf8"),
-        ),
-        path: "meta.json",
-      },
+      { mode: "100644", type: "blob", oid: metaOid, path: "meta.json" },
     ];
-    if (ticketEntries.length) {
-      rootEntries.push({
-        mode: "040000",
-        type: "tree",
-        oid: await repo.mkTree(ticketEntries),
-        path: "tickets",
-      });
+    if (sortedTickets.length) {
+      const tree = await repo.mkTree(sortedTickets.map(([guid], i) => blobEntry(guid, ticketOids[i]!)));
+      rootEntries.push({ mode: "040000", type: "tree", oid: tree, path: "tickets" });
     }
-    if (tombEntries.length) {
-      rootEntries.push({
-        mode: "040000",
-        type: "tree",
-        oid: await repo.mkTree(tombEntries),
-        path: "tombstones",
-      });
+    if (sortedTombs.length) {
+      const tree = await repo.mkTree(sortedTombs.map(([guid], i) => blobEntry(guid, tombOids[i]!)));
+      rootEntries.push({ mode: "040000", type: "tree", oid: tree, path: "tombstones" });
     }
-    const attEntries = await this.buildAttachmentEntries(state, prevAttachmentOids ?? new Map());
     if (attEntries.length) {
       rootEntries.push({
         mode: "040000",
@@ -511,6 +527,38 @@ export class GitSyncController implements vscode.Disposable {
     this.setStatus("error", "Local ref CAS kept failing — will retry on next change/sync");
   }
 
+  /**
+   * The shared two-tip merge-commit protocol (used by the syncNow divergence
+   * branch and the non-fast-forward push retry): read both states,
+   * state-merge, renumber, write the tree reusing attachment OIDs from both
+   * parents, commit with both tips as parents, CAS the local ref, apply.
+   * `localTip: null` = unborn local ref (first sync against an existing
+   * remote) — the remote tip becomes the sole parent.
+   */
+  private async mergeTips(
+    localTip: string | null,
+    remoteTip: string,
+  ): Promise<{ commit: string; applied: ApplyResult }> {
+    const repo = this.repo!;
+    const localState = localTip ? await this.readState(localTip) : this.buildLocalState();
+    const merged = mergeStates(localState, await this.readState(remoteTip));
+    const { state: settled } = renumber(merged);
+    const prevOids = new Map([
+      ...(await this.attachmentOidsAt(localTip)),
+      ...(await this.attachmentOidsAt(remoteTip)),
+    ]);
+    const rootTree = await this.writeState(settled, prevOids);
+    const commit = await repo.commitTree(
+      rootTree,
+      localTip ? [localTip, remoteTip] : [remoteTip],
+      "dostuff: merge",
+    );
+    await repo.updateRefCas(this.opts.ref, commit, localTip);
+    this.lastSeenTip = commit;
+    const applied = await this.applyState(settled, commit);
+    return { commit, applied };
+  }
+
   /** Another window moved the local ref — apply its tip. */
   private async applyTipOp(tip: string): Promise<void> {
     const repo = this.repo;
@@ -527,7 +575,7 @@ export class GitSyncController implements vscode.Disposable {
 
   /** Full network cycle: commit local → fetch → merge → apply → push. */
   async syncNow(reason: "manual" | "interval" | "startup" | "push-follow-up"): Promise<SyncResult> {
-    const result: SyncResult = { applied: 0, pushed: false, renames: [], laneOverflow: [] };
+    const result: SyncResult = { applied: 0, pushed: false, renames: [] };
     await this.chain(async () => {
       const repo = this.repo;
       if (!repo) return;
@@ -557,27 +605,12 @@ export class GitSyncController implements vscode.Disposable {
             const applied = await this.applyState(await this.readState(remoteTip), remoteTip);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
-            result.laneOverflow = applied.laneOverflow;
             localTip = remoteTip;
           } else {
-            // True divergence (or unborn local): state-merge with both parents.
-            const localState = localTip ? await this.readState(localTip) : this.buildLocalState();
-            const merged = mergeStates(localState, await this.readState(remoteTip));
-            const { state: settled } = renumber(merged);
-            // Blob OIDs reusable from either parent tip.
-            const prevOids = new Map([
-              ...(await this.attachmentOidsAt(localTip)),
-              ...(await this.attachmentOidsAt(remoteTip)),
-            ]);
-            const rootTree = await this.writeState(settled, prevOids);
-            const parents = localTip ? [localTip, remoteTip] : [remoteTip];
-            const commit = await repo.commitTree(rootTree, parents, "dostuff: merge");
-            await repo.updateRefCas(this.opts.ref, commit, localTip);
-            this.lastSeenTip = commit;
-            const applied = await this.applyState(settled, commit);
+            // True divergence (or unborn local): merge-commit with both parents.
+            const { commit, applied } = await this.mergeTips(localTip, remoteTip);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
-            result.laneOverflow = applied.laneOverflow;
             localTip = commit;
           }
         }
@@ -619,20 +652,7 @@ export class GitSyncController implements vscode.Disposable {
           const remoteTip = await repo.revParse(TRACKING_REF);
           const localTip = await repo.revParse(this.opts.ref);
           if (remoteTip && localTip && !(await repo.isAncestor(remoteTip, localTip))) {
-            const merged = mergeStates(
-              await this.readState(localTip),
-              await this.readState(remoteTip),
-            );
-            const { state: settled } = renumber(merged);
-            const prevOids = new Map([
-              ...(await this.attachmentOidsAt(localTip)),
-              ...(await this.attachmentOidsAt(remoteTip)),
-            ]);
-            const rootTree = await this.writeState(settled, prevOids);
-            const commit = await repo.commitTree(rootTree, [localTip, remoteTip], "dostuff: merge");
-            await repo.updateRefCas(this.opts.ref, commit, localTip);
-            this.lastSeenTip = commit;
-            await this.applyState(settled, commit);
+            await this.mergeTips(localTip, remoteTip);
           }
           continue;
         }
@@ -667,20 +687,17 @@ export class GitSyncController implements vscode.Disposable {
     return { ...w, deletedTasks: [], deletedAttachments: [] };
   }
 
-  private elementTombstonesFor(guid: string): {
-    tasks: ElementTombstone[];
-    attachments: ElementTombstone[];
-  } {
-    const tombs = this.store.getSyncTombstones();
-    const out = { tasks: [] as ElementTombstone[], attachments: [] as ElementTombstone[] };
-    for (const e of tombs.elements) {
-      if (e.ticketGuid !== guid) continue;
-      out[e.scope === "task" ? "tasks" : "attachments"].push({
-        id: e.elementId,
-        deletedAt: e.deletedAt,
-      });
+  /** One guarded restore pass; shared by the changed and no-change apply paths. */
+  private async tryRestoreAttachments(state: SyncState, tip: string | null | undefined): Promise<void> {
+    const attRoot = this.store.attachmentsDir();
+    if (!tip || !attRoot || this.opts.syncAttachments === false) return;
+    try {
+      await this.restoreAttachments(state, tip, attRoot.fsPath);
+    } catch (e) {
+      this.store.appendLog(
+        `Sync: attachment restore failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
-    return out;
   }
 
   /**
@@ -689,27 +706,29 @@ export class GitSyncController implements vscode.Disposable {
    * (04-controller-wiring §2). Self-guarding: when the folded state already
    * matches the store, no write and no notification happens.
    */
-  private async applyState(rawState: SyncState, tip?: string | null): Promise<SyncResult> {
+  private async applyState(rawState: SyncState, tip?: string | null): Promise<ApplyResult> {
     // Fold the LIVE cache in: store mutations may have landed after the
     // snapshot `rawState` was computed from (the fetch window is seconds
     // long). Merge idempotence makes this free when nothing changed, and it
     // guarantees a cache ticket absent from the folded state was beaten by a
     // tombstone — a sync cycle racing a local create/edit can no longer
     // delete the new ticket or clobber the fresh edit.
-    const folded = mergeStates(rawState, this.buildLocalState());
+    const tombs = this.store.getSyncTombstones();
+    const folded = mergeStates(rawState, this.buildLocalState(tombs));
     const { state } = renumber(folded);
 
     const cache = this.store.list();
     const idToGuid = new Map(cache.map((i) => [i.id, i.guid]));
     const cacheByGuid = new Map(cache.map((i) => [i.guid, i]));
     const guidToId = new Map([...state.tickets.values()].map((t) => [t.guid, t.id]));
+    const tombsByGuid = GitSyncController.bucketElementTombstones(tombs.elements);
 
     const upserts: Issue[] = [];
     let applied = 0;
     for (const wire of state.tickets.values()) {
       const prior = cacheByGuid.get(wire.guid);
       if (prior) {
-        const projected = toWire(prior, idToGuid, this.elementTombstonesFor(wire.guid));
+        const projected = toWire(prior, idToGuid, tombsByGuid.get(wire.guid));
         if (
           canonicalJson(GitSyncController.stripWitnesses(projected)) ===
           canonicalJson(GitSyncController.stripWitnesses(wire))
@@ -750,17 +769,8 @@ export class GitSyncController implements vscode.Disposable {
     if (upserts.length === 0 && removals.length === 0) {
       // Nothing to write; still fill any missing attachment bytes (a prior
       // restore may have failed) and skip every notification.
-      const attRootIdle = this.store.attachmentsDir();
-      if (tip && attRootIdle && this.opts.syncAttachments !== false) {
-        try {
-          await this.restoreAttachments(state, tip, attRootIdle.fsPath);
-        } catch (e) {
-          this.store.appendLog(
-            `Sync: attachment restore failed: ${e instanceof Error ? e.message : String(e)}`,
-          );
-        }
-      }
-      return { applied: 0, pushed: false, renames: [], laneOverflow: [] };
+      await this.tryRestoreAttachments(state, tip);
+      return { applied: 0, renames: [] };
     }
 
     // Attachment dir renames before any restore (and before removal of old
@@ -793,15 +803,7 @@ export class GitSyncController implements vscode.Disposable {
 
     // Restore genuinely-missing attachment bytes from the ref tree — after
     // the renumber dir-renames, before notifications (05-attachments §3).
-    if (tip && attRoot && this.opts.syncAttachments !== false) {
-      try {
-        await this.restoreAttachments(state, tip, attRoot.fsPath);
-      } catch (e) {
-        this.store.appendLog(
-          `Sync: attachment restore failed: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    }
+    await this.tryRestoreAttachments(state, tip);
 
     // Notifications.
     if (renames.length) {
@@ -825,9 +827,7 @@ export class GitSyncController implements vscode.Disposable {
 
     return {
       applied,
-      pushed: false,
       renames: renames.map((r) => ({ oldId: r.oldId, newId: r.newId })),
-      laneOverflow,
     };
   }
 

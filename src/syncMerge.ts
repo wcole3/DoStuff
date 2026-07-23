@@ -109,6 +109,46 @@ export function isSafePathSegment(value: string): boolean {
 const WIRE_ID_RE = /^DS-\d{1,9}$/;
 
 /**
+ * Loose ISO-8601 guard (`Date.parse`-based) — the single definition shared by
+ * the wire coercers, `storage.normalize`, and the import validator. The
+ * strict-shape `ISO_RE` in types.ts is intentionally different (exact wire
+ * format for `addedAt`/`pendingClose.at`); everything else uses this.
+ */
+export function isIsoTimestamp(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0 && !Number.isNaN(Date.parse(v));
+}
+
+/**
+ * DS-NNN formatting. `IssueStore.nextId` minting and the renumber pass must
+ * produce byte-identical ids on every replica, so both call this.
+ */
+export function formatIssueId(n: number): string {
+  return `DS-${String(n).padStart(3, "0")}`;
+}
+
+/**
+ * The sync-field backfill rule (docs/plans/ticket-sync/01 §2-3): keep a
+ * provided guid/updatedAt, else derive deterministically. One definition for
+ * `normalize`, `ensureSyncFields`, and `validateImportList` (which also
+ * requires the guid to be path-safe — guids name attachment dirs in the ref
+ * tree and outbound state is never re-coerced).
+ */
+export function backfillSyncFields(
+  id: string,
+  createdAt: string,
+  guid: unknown,
+  updatedAt: unknown,
+  opts?: { requireSafeGuid?: boolean },
+): { guid: string; updatedAt: string } {
+  const keepGuid =
+    typeof guid === "string" && guid !== "" && (!opts?.requireSafeGuid || isSafePathSegment(guid));
+  return {
+    guid: keepGuid ? (guid as string) : deriveGuid(id, createdAt),
+    updatedAt: isIsoTimestamp(updatedAt) ? updatedAt : createdAt,
+  };
+}
+
+/**
  * Derive a safe on-disk extension from an attachment display name. The name
  * is remote-controlled (wire metadata / webview message), so the result must
  * never contain a path separator: keep only `[A-Za-z0-9.]`, cap the length,
@@ -230,19 +270,15 @@ export function toWire(
 /**
  * Project a wire ticket back into a local Issue. `guidToId` resolves link
  * targets after renumbering settles; links to tombstoned/unknown guids are
- * dropped (mirrors `remove()`'s inbound-link scrub). The merged result must
- * still pass `normalize()` before touching the store.
+ * dropped (mirrors `remove()`'s inbound-link scrub). The result must still
+ * pass `normalize()` before touching the store — its `coerceLinks` owns link
+ * dedup and self-link removal, so this only does the guid→id resolution.
  */
 export function fromWire(wire: WireTicket, guidToId: Map<string, string>): Issue {
   const links: TicketLink[] = [];
-  const seen = new Set<string>();
   for (const l of wire.links) {
     const targetId = guidToId.get(l.targetGuid);
-    if (!targetId || targetId === wire.id) continue;
-    const key = `${targetId}|${l.kind}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    links.push({ targetId, kind: l.kind });
+    if (targetId) links.push({ targetId, kind: l.kind });
   }
   return {
     id: wire.id,
@@ -269,10 +305,6 @@ export function fromWire(wire: WireTicket, guidToId: Map<string, string>): Issue
 
 // ─── inbound hardening ────────────────────────────────────────────────────
 
-function isIso(v: unknown): v is string {
-  return typeof v === "string" && v.length > 0 && !Number.isNaN(Date.parse(v));
-}
-
 /**
  * Harden a ticket read from a fetched tree. Applying remote state is NOT an
  * agent write — MCP status gating does not apply (a remote human may
@@ -291,7 +323,7 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
   if (typeof r.guid !== "string" || !isSafePathSegment(r.guid)) return null;
   if (typeof r.id !== "string" || !WIRE_ID_RE.test(r.id)) return null;
   if (typeof r.title !== "string") return null;
-  if (!isIso(r.createdAt)) return null;
+  if (!isIsoTimestamp(r.createdAt)) return null;
   const createdAt = r.createdAt;
 
   // Last-wins dedupe by id — duplicate ids in a crafted blob would otherwise
@@ -308,7 +340,7 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
         id: tt.id,
         text: tt.text,
         done: tt.done === true,
-        updatedAt: isIso(tt.updatedAt) ? tt.updatedAt : createdAt,
+        updatedAt: isIsoTimestamp(tt.updatedAt) ? tt.updatedAt : createdAt,
       });
     }
   }
@@ -335,7 +367,7 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     for (const h of r.statusHistory) {
       if (!h || typeof h !== "object") continue;
       const hh = h as Record<string, unknown>;
-      if (!isStatus(hh.status) || !isIso(hh.at)) continue;
+      if (!isStatus(hh.status) || !isIsoTimestamp(hh.at)) continue;
       statusHistory.push({
         status: hh.status,
         at: hh.at,
@@ -349,7 +381,7 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     for (const e of r.record) {
       if (!e || typeof e !== "object") continue;
       const ee = e as Record<string, unknown>;
-      if (!isIso(ee.at) || typeof ee.text !== "string") continue;
+      if (!isIsoTimestamp(ee.at) || typeof ee.text !== "string") continue;
       record.push({
         at: ee.at,
         author: ee.author === "agent" ? "agent" : "user",
@@ -379,8 +411,8 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     priority: isPriority(r.priority) ? r.priority : "Regular",
     status: isStatus(r.status) ? r.status : "Thinking",
     createdAt,
-    updatedAt: isIso(r.updatedAt) ? r.updatedAt : createdAt,
-    resolvedAt: isIso(r.resolvedAt) ? r.resolvedAt : null,
+    updatedAt: isIsoTimestamp(r.updatedAt) ? r.updatedAt : createdAt,
+    resolvedAt: isIsoTimestamp(r.resolvedAt) ? r.resolvedAt : null,
     tags: coerceTags(r.tags),
     tasks,
     // Attachment ids name blobs in the ref tree and files on disk — same
@@ -395,6 +427,24 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
   };
 }
 
+/**
+ * Harden a ticket tombstone read from a fetched tree — the sibling of
+ * `coerceWireTicket`, kept beside it so the wire-hardening rules live under
+ * one roof (the controller only does I/O). Same guid bar as tickets: the guid
+ * becomes a `tombstones/<guid>.json` mktree entry on the next commit.
+ */
+export function coerceTombstone(raw: unknown): Tombstone | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.guid !== "string" || !isSafePathSegment(r.guid)) return null;
+  if (!isIsoTimestamp(r.deletedAt)) return null;
+  return {
+    guid: r.guid,
+    deletedAt: r.deletedAt,
+    lastId: typeof r.lastId === "string" ? r.lastId : "",
+  };
+}
+
 function coerceElementTombstones(input: unknown): ElementTombstone[] {
   if (!Array.isArray(input)) return [];
   const out: ElementTombstone[] = [];
@@ -402,7 +452,7 @@ function coerceElementTombstones(input: unknown): ElementTombstone[] {
   for (const e of input) {
     if (!e || typeof e !== "object") continue;
     const ee = e as Record<string, unknown>;
-    if (typeof ee.id !== "string" || !isSafePathSegment(ee.id) || !isIso(ee.deletedAt)) continue;
+    if (typeof ee.id !== "string" || !isSafePathSegment(ee.id) || !isIsoTimestamp(ee.deletedAt)) continue;
     if (seen.has(ee.id)) continue;
     seen.add(ee.id);
     out.push({ id: ee.id, deletedAt: ee.deletedAt });
@@ -418,10 +468,11 @@ function contentHash(value: unknown): string {
 }
 
 /**
- * LWW comparison tuple `(updatedAt, sha1(canonicalJson(x)))`. ISO timestamps
- * sort chronologically under string compare; the content hash breaks
- * exact-timestamp ties identically on both machines. Returns a's-tuple minus
- * b's-tuple in sign.
+ * LWW comparison on the tuple `(ts, sha1(canonicalJson(value)))`. ISO
+ * timestamps sort chronologically under string compare; the content hash
+ * breaks exact-timestamp ties identically on both machines — and is only
+ * computed on a tie, since serializing+hashing every ticket on the dominant
+ * differing-timestamp path is pure waste.
  *
  * Nuance: on an exact-timestamp tie the hash compares *merged* content
  * against an input, so re-merging can flip the winner once (a merged ticket
@@ -429,8 +480,10 @@ function contentHash(value: unknown): string {
  * pick deterministic, so replicas still converge — absorption is only
  * approximate under exact-ms ties, never divergent.
  */
-function compareTuple(aTs: string, aHash: string, bTs: string, bHash: string): number {
+function lwwCompare(a: unknown, b: unknown, aTs: string, bTs: string): number {
   if (aTs !== bTs) return aTs < bTs ? -1 : 1;
+  const aHash = contentHash(a);
+  const bHash = contentHash(b);
   if (aHash !== bHash) return aHash < bHash ? -1 : 1;
   return 0;
 }
@@ -492,7 +545,7 @@ export function mergeStates(a: SyncState, b: SyncState): SyncState {
 
 /** Ticket-vs-ticket field merge (02-merge-spec §5). */
 function mergeTickets(x: WireTicket, y: WireTicket): WireTicket {
-  const cmp = compareTuple(x.updatedAt, contentHash(x), y.updatedAt, contentHash(y));
+  const cmp = lwwCompare(x, y, x.updatedAt, y.updatedAt);
   const w = cmp >= 0 ? x : y; // winner
   const l = cmp >= 0 ? y : x; // loser
 
@@ -556,10 +609,7 @@ function mergeElements<T extends { id: string }>(
   const loserById = new Map(loserEls.map((e) => [e.id, e]));
   const winnerIds = new Set(winnerEls.map((e) => e.id));
 
-  const pickBoth = (we: T, le: T): T => {
-    const c = compareTuple(tsOf(we), contentHash(we), tsOf(le), contentHash(le));
-    return c >= 0 ? we : le;
-  };
+  const pickBoth = (we: T, le: T): T => (lwwCompare(we, le, tsOf(we), tsOf(le)) >= 0 ? we : le);
 
   const elements: T[] = [];
   const beatenTombs = new Set<string>();
@@ -705,7 +755,7 @@ export function renumber(state: SyncState): {
   let next = maxNumber;
   for (const t of losers) {
     next += 1;
-    const newId = `DS-${String(next).padStart(3, "0")}`;
+    const newId = formatIssueId(next);
     renames.push({ guid: t.guid, oldId: t.id, newId });
     tickets.set(t.guid, { ...t, number: next, id: newId });
   }

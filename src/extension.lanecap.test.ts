@@ -30,39 +30,12 @@ import {
   type Priority,
   type Status,
 } from "./types";
+import { makeIssueFactory } from "./testSupport";
 
-let issueCounter = 0;
-function makeIssue(overrides: Partial<Issue> = {}): Issue {
-  issueCounter += 1;
-  const number = overrides.number ?? issueCounter;
-  const id = overrides.id ?? `DS-${String(number).padStart(3, "0")}`;
-  const at = overrides.createdAt ?? new Date(2025, 0, 1, 0, 0, number).toISOString();
-  return {
-    id,
-    number,
-    title: overrides.title ?? `Issue ${number}`,
-    type: overrides.type ?? ("Feature" as IssueType),
-    priority: overrides.priority ?? ("Regular" as Priority),
-    status: overrides.status ?? ("Planned" as Status),
-    description: overrides.description ?? "",
-    tasks: overrides.tasks ?? [],
-    tags: overrides.tags ?? [],
-    verifyCriteria: overrides.verifyCriteria ?? "",
-    createdAt: at,
-    resolvedAt: overrides.resolvedAt ?? null,
-    statusHistory:
-      overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
-    record: overrides.record ?? [],
-    attachments: overrides.attachments ?? [],
-    links: overrides.links ?? [],
-    pendingClose: overrides.pendingClose ?? null,
-    guid: overrides.guid ?? `guid-${id}`,
-    updatedAt: overrides.updatedAt ?? at,
-  };
-}
+const makeIssue = makeIssueFactory();
 
 beforeEach(() => {
-  issueCounter = 0;
+  makeIssue.reset();
 });
 
 describe("lane-cap chokepoint composition (mergeIssueUpdate + canMoveToActiveLane)", () => {

@@ -3,6 +3,7 @@
 import * as vscode from "vscode";
 import { randomUUID } from "node:crypto";
 import { IssueStore } from "./storage";
+import { formatIssueId } from "./syncMerge";
 import { getWebviewHtml } from "./webviewHtml";
 import {
   coerceLinks,
@@ -113,7 +114,7 @@ export function buildCreatedIssue(
   partial: CreateIssuePartial,
   opts: { number: number; now: string; knownIds: ReadonlySet<string> },
 ): { issue: Issue; droppedLinks: TicketLink[] } {
-  const id = `DS-${String(opts.number).padStart(3, "0")}`;
+  const id = formatIssueId(opts.number);
   const status: Issue["status"] = "Thinking";
   const { kept, dropped } = validateLinks(
     coerceLinks((partial as { links?: unknown }).links, id),
