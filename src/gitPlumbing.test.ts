@@ -190,6 +190,52 @@ describe("isAncestor", () => {
   });
 });
 
+describe("commitSubject / diffTreeNameOnly", () => {
+  test("real commit → subject + file list; root commit lists files; child lists only the diff", async () => {
+    const dir = mkRepo("commitinfo");
+    const repo = new GitRepo(dir);
+    // mkTree takes single-level entries, so nested paths go through a subtree.
+    const subOid = await repo.mkTree([
+      { mode: "100644", type: "blob", oid: await repo.hashObjectStdin(Buffer.from("two", "utf8")), path: "b.txt" },
+    ]);
+    const rootTree = async (aBody: string) =>
+      repo.mkTree([
+        { mode: "100644", type: "blob", oid: await repo.hashObjectStdin(Buffer.from(aBody, "utf8")), path: "a.txt" },
+        { mode: "040000", type: "tree", oid: subOid, path: "sub" },
+      ]);
+    const c1 = await repo.commitTree(await rootTree("one"), [], "dostuff: 2 files");
+    const c2 = await repo.commitTree(await rootTree("changed"), [c1], "dostuff: 2 files");
+    await repo.updateRefCas(STATE_REF, c2, null);
+
+    expect(await repo.commitSubject(c1)).toBe("dostuff: 2 files");
+    // --root: the parentless commit still lists its files, recursively (-r).
+    expect((await repo.diffTreeNameOnly(c1))?.sort()).toEqual(["a.txt", "sub/b.txt"]);
+    // Child commit lists only what changed.
+    expect(await repo.diffTreeNameOnly(c2)).toEqual(["a.txt"]);
+    // Abbreviated sha resolves too.
+    expect(await repo.commitSubject(c1.slice(0, 7))).toBe("dostuff: 2 files");
+  });
+
+  test("unknown, non-hex, and option-shaped inputs → null (no throw, no spawn for non-hex)", async () => {
+    const dir = mkRepo("commitinfo-bad");
+    const repo = new GitRepo(dir);
+    expect(await repo.commitSubject("f".repeat(40))).toBeNull();
+    expect(await repo.diffTreeNameOnly("f".repeat(40))).toBeNull();
+    for (const bad of ["HEAD", "--format", "main..dev", "a1b2", ""]) {
+      expect(await repo.commitSubject(bad)).toBeNull();
+      expect(await repo.diffTreeNameOnly(bad)).toBeNull();
+    }
+  });
+
+  test("blob oid → null (^{commit} peel refuses non-commits)", async () => {
+    const dir = mkRepo("commitinfo-blob");
+    const repo = new GitRepo(dir);
+    const blobOid = await repo.hashObjectStdin(Buffer.from("just a blob", "utf8"));
+    expect(await repo.commitSubject(blobOid)).toBeNull();
+    expect(await repo.diffTreeNameOnly(blobOid)).toBeNull();
+  });
+});
+
 describe("remote operations against a bare origin", () => {
   test("lsRemote missing ref → null; fetch/push round trip; NonFastForward classified", async () => {
     const bare = mkRepo("origin.git", true);

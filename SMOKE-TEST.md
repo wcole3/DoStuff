@@ -41,6 +41,8 @@ Setup: enable the server (**DoStuff: Toggle MCP Server**), pin or read the port,
 - [ ] `request_ticket_complete` from a non-Verification lane is rejected, pointing at `update_ticket_status`; a completion request replaces a pending close request (record entry notes the switch).
 - [ ] Lane cap: with a full lane, agent promotion into it is rejected with the cap message.
 - [ ] `update_ticket_status` to Complete/Closed is rejected, pointing at `request_ticket_close`.
+- [ ] Commit anchors: `update_ticket_progress` with `commit: $(git rev-parse HEAD)` → response `commitCount: 1`; same sha again → still 1; `get_ticket` lists it under `commits`. A **Commits** section appears in the ticket detail without a reload: short sha + subject; expanding lists the touched files; clicking a file opens it in the editor (verify once from a workspace at the repo root and once from a workspace that is a subfolder of the repo). A ticket with no commits shows no section.
+- [ ] Commit anchor degradation: report a sha then `git commit --amend` (or fabricate one) → row shows "not found in this repo", detail otherwise usable, no error toast. Also holds with `dostuff.sync.enabled` off and in a non-git workspace.
 
 ## 5. Workflow prompt surfaces
 
@@ -69,6 +71,7 @@ git clone "$DIR/origin.git" "$DIR/cloneB"
 - [ ] MCP with sync on: agent `create_ticket` (Thinking) → promote → demote → `update_ticket_description` → `request_ticket_close`; all of it propagates to the other clone incl. the awaiting-close badge; approving in clone B turns it Closed in both. Lane caps and the human-only Complete/Closed boundary hold.
 - [ ] Element delete-vs-edit: shared ticket with tasks, synced. Delete task X in A (UI); toggle X done via MCP in B before syncing. Sync A→B→A → both converge (later stamp wins); repeat reversed. Then `update_ticket_draft` wholesale reshape in A concurrent with a done-toggle in B → converges, no resurrected duplicates.
 - [ ] pendingClose race: request in A concurrent with an edit in B that wins LWW → flag dropped on both (documented); agent re-request succeeds.
+- [ ] Commit anchors union: report different shas on the same ticket in A and B (MCP `update_ticket_progress`), sync both ways → both replicas show the union of commits in identical order; shas from the other clone's unpushed work render "not found in this repo" there.
 - [ ] Backward compat: open a workspace with a pre-sync `dostuff.db` → loads clean, derived guids, board unchanged; disabling sync restores exactly the old behavior.
 - [ ] Offline: kill the network, edit tickets → local commits succeed, status `pendingPush`; reconnect + sync → pushed.
 - [ ] `dostuff.clearAll` with sync on warns that deletion propagates to every replica.

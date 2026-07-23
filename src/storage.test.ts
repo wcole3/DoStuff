@@ -1625,3 +1625,103 @@ describe("sync schema groundwork", () => {
     store.dispose();
   });
 });
+
+// ─── Commit anchors (`commits` + `issue_commits`) — tenet proofs ─────────────
+
+describe("commit anchors schema", () => {
+  let handles: FsHandles | null = null;
+
+  afterEach(() => {
+    if (handles) {
+      restoreFs(handles);
+      handles = null;
+    }
+  });
+
+  test("normalize() on a legacy issue without `commits` returns []", () => {
+    const legacy = makeIssue({ id: "DS-001" }) as unknown as Record<string, unknown>;
+    delete legacy.commits;
+    const { issue } = normalize(legacy as unknown as Issue);
+    expect(issue.commits).toEqual([]);
+  });
+
+  test("normalize() drops garbage commits, keeps valid ones", () => {
+    const raw = makeIssue({ id: "DS-002" }) as unknown as Record<string, unknown>;
+    raw.commits = [
+      { sha: "A1B2C3D", at: "2026-07-01T00:00:00.000Z" }, // lowercased on load
+      { sha: "nothex!", at: "2026-07-01T00:00:00.000Z" },
+      { sha: "abcdef012345", at: "garbage" },
+      "junk",
+    ];
+    const { issue } = normalize(raw as unknown as Issue);
+    expect(issue.commits).toEqual([{ sha: "a1b2c3d", at: "2026-07-01T00:00:00.000Z" }]);
+  });
+
+  test("hydrates a DB created without issue_commits: loads [], then round-trips", async () => {
+    const bytes = await buildRawDb((db) => {
+      db.run(PRE_SYNC_DDL); // no issue_commits table at all
+      db.run(
+        "INSERT INTO issues (id, number, title, type, priority, status, created_at, resolved_at) VALUES ('DS-001', 1, 'old', 'Bug', 'High', 'Working', '2025-02-01T00:00:00.000Z', NULL)",
+      );
+      db.run("INSERT INTO schema_meta (key, value) VALUES ('version', '1')");
+    });
+    const { handles: h } = installVirtualFs({ "/ws/.vscode/dostuff/dostuff.db": bytes });
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    expect(a.get("DS-001")?.commits).toEqual([]);
+
+    // SCHEMA_DDL created the table on open — commits persist through a reopen.
+    await a.upsert({
+      ...a.get("DS-001")!,
+      commits: [{ sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: "2026-07-01T00:00:00.000Z" }],
+    });
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-001")?.commits).toEqual([
+      { sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: "2026-07-01T00:00:00.000Z" },
+    ]);
+    b.dispose();
+  });
+
+  test("commit order (at, sha) round-trips the DB even when PK lexical order differs", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    // (at, sha) order is zzzzzzz first — PK/lexical order would flip it.
+    const commits = [
+      { sha: "zzzzzzz".replace(/z/g, "f"), at: "2026-07-01T00:00:00.000Z" },
+      { sha: "aaaaaaa", at: "2026-07-02T00:00:00.000Z" },
+    ];
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(makeIssue({ id: "DS-300", commits }));
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-300")?.commits).toEqual(commits);
+    b.dispose();
+  });
+
+  test("globalState fallback round-trips commits through normalize()", async () => {
+    // No virtual FS installed → no workspace folder → memento branch. The same
+    // context object (thus the same memento) backs both store instances.
+    const ctx = makeContext();
+    const store = new IssueStore(ctx);
+    await store.init();
+    const commits = [{ sha: "0123abc", at: "2026-07-01T00:00:00.000Z" }];
+    await store.upsert(makeIssue({ id: "DS-001", commits }));
+    store.dispose();
+
+    const reopened = new IssueStore(ctx);
+    await reopened.init();
+    expect(reopened.get("DS-001")?.commits).toEqual(commits);
+    reopened.dispose();
+  });
+});

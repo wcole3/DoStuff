@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { backfillSyncFields, isIsoTimestamp, isSafePathSegment, sanitizeExt } from "./syncMerge";
 import { GitSyncController } from "./gitSync";
+import { createCommitDetailsFetcher } from "./commitDetails";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
 import { GraphPanel } from "./graphProvider";
@@ -17,6 +18,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
   coerceAttachments,
+  coerceCommits,
   coerceLinks,
   coercePendingClose,
   coerceTags,
@@ -64,8 +66,8 @@ export function inferMimeType(filename: string): string {
  * Pure merge of a webview-submitted partial update onto a persisted issue.
  *
  * Server-derived fields (`id`, `number`, `createdAt`, `record`, `statusHistory`,
- * `resolvedAt`, `pendingClose`, `guid`, `updatedAt`) are NEVER copied from
- * `incoming` — they are reconstructed from `prior` plus this function's own
+ * `resolvedAt`, `pendingClose`, `guid`, `updatedAt`, `commits`) are NEVER copied
+ * from `incoming` — they are reconstructed from `prior` plus this function's own
  * bookkeeping (`updatedAt` and per-task `tasks[].updatedAt` are then re-stamped
  * by `IssueStore.upsert`, which discards any smuggled task stamps by diffing
  * against `prior`). The webview can lie about any of those and we'll ignore it.
@@ -295,6 +297,8 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
         : [{ status, at: e.createdAt, by: "user" }],
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
       pendingClose: coercePendingClose(e.pendingClose),
+      // Round-trips exported commit anchors; garbage entries are dropped.
+      commits: coerceCommits(e.commits),
       // Sync fields: keep well-formed provided values (export→import round
       // trip), derive per the normalize() rules when missing. requireSafeGuid:
       // guids name attachment dirs in the sync ref tree, and outbound state
@@ -676,7 +680,7 @@ export function activate(context: vscode.ExtensionContext) {
       // Open the board if the user starts a drag with no board panel
       // visible — without it there'd be nowhere for the lanes to light up.
       if (!BoardPanel.isOpen()) {
-        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
+        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers, fetchCommitDetails);
       }
       BoardPanel.signalExternalDrag(issueId);
     },
@@ -728,7 +732,22 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.showWarningMessage(`DoStuff: link scheme "${scheme}" is not supported.`);
   };
 
-  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink, attachmentHandlers);
+  // Lazy commit-detail derivation for ticket commit anchors. Shas come from
+  // the store — never the webview — then resolve against the workspace repo
+  // on demand. Independent of dostuff.sync.enabled (reads the user's real
+  // repo, not the hidden state ref); degrades to "not found" without git.
+  const commitDetailsFetcher = createCommitDetailsFetcher(
+    () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+  );
+  const fetchCommitDetails = async (issueId: string) => {
+    const issue = store.get(issueId);
+    if (!issue || issue.commits.length === 0) {
+      return { pathPrefix: ".", details: [] };
+    }
+    return commitDetailsFetcher(issue.commits.map((c) => c.sha));
+  };
+
+  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink, attachmentHandlers, fetchCommitDetails);
 
   context.subscriptions.push(
     sidebar,
@@ -737,7 +756,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("dostuff.openBoard", () => {
-      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
+      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers, fetchCommitDetails);
     }),
 
     vscode.commands.registerCommand("dostuff.openGraph", () => {

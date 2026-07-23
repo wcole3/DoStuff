@@ -5,8 +5,10 @@ import {
   INVERSE_LINK_KIND,
   LINK_KINDS,
   coerceAttachments,
+  coerceCommits,
   coerceLinks,
   coercePendingClose,
+  compareCommits,
   isLinkKind,
   type Attachment,
 } from "./types";
@@ -273,5 +275,76 @@ describe("coercePendingClose", () => {
 
   test("ignores extra keys", () => {
     expect(coercePendingClose({ by: "agent", at: ISO, extra: "x" })).toEqual({ by: "agent", at: ISO });
+  });
+});
+
+describe("coerceCommits", () => {
+  const AT = "2026-07-01T00:00:00.000Z";
+  const AT2 = "2026-07-02T00:00:00.000Z";
+  const SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0";
+
+  test("accepts well-formed entries", () => {
+    expect(coerceCommits([{ sha: SHA, at: AT }])).toEqual([{ sha: SHA, at: AT }]);
+    expect(coerceCommits([{ sha: "a1b2c3d", at: AT }])).toEqual([{ sha: "a1b2c3d", at: AT }]);
+  });
+
+  test("returns [] for non-array input", () => {
+    expect(coerceCommits(undefined)).toEqual([]);
+    expect(coerceCommits(null)).toEqual([]);
+    expect(coerceCommits("deadbeef")).toEqual([]);
+    expect(coerceCommits({ sha: SHA, at: AT })).toEqual([]);
+  });
+
+  test("drops malformed shas: too short, too long, non-hex, option-shaped", () => {
+    expect(
+      coerceCommits([
+        { sha: "abc123", at: AT }, // 6 chars
+        { sha: SHA + "0", at: AT }, // 41 chars
+        { sha: "zzzzzzz", at: AT }, // non-hex
+        { sha: "--format", at: AT }, // option injection shape
+        { sha: 42, at: AT },
+        null,
+        "deadbeef",
+      ]),
+    ).toEqual([]);
+  });
+
+  test("drops entries with missing or non-ISO at", () => {
+    expect(
+      coerceCommits([
+        { sha: SHA },
+        { sha: SHA, at: "yesterday" },
+        { sha: SHA, at: 12345 },
+      ]),
+    ).toEqual([]);
+  });
+
+  test("lowercases uppercase shas", () => {
+    expect(coerceCommits([{ sha: SHA.toUpperCase(), at: AT }])).toEqual([{ sha: SHA, at: AT }]);
+  });
+
+  test("dedupes by sha keeping the earliest at, regardless of input order", () => {
+    const expected = [{ sha: SHA, at: AT }];
+    expect(coerceCommits([{ sha: SHA, at: AT }, { sha: SHA, at: AT2 }])).toEqual(expected);
+    expect(coerceCommits([{ sha: SHA, at: AT2 }, { sha: SHA, at: AT }])).toEqual(expected);
+    // Mixed-case duplicates collapse too.
+    expect(coerceCommits([{ sha: SHA.toUpperCase(), at: AT2 }, { sha: SHA, at: AT }])).toEqual(expected);
+  });
+
+  test("sorts output by (at, sha)", () => {
+    const a = { sha: "bbbbbbb", at: AT };
+    const b = { sha: "aaaaaaa", at: AT2 };
+    const c = { sha: "aaaaaab", at: AT };
+    expect(coerceCommits([b, a, c])).toEqual([c, a, b]);
+  });
+
+  test("compareCommits is a total order on (at, sha)", () => {
+    const x = { sha: "aaaaaaa", at: AT };
+    const y = { sha: "bbbbbbb", at: AT };
+    const z = { sha: "aaaaaaa", at: AT2 };
+    expect(compareCommits(x, y)).toBeLessThan(0);
+    expect(compareCommits(y, x)).toBeGreaterThan(0);
+    expect(compareCommits(x, z)).toBeLessThan(0);
+    expect(compareCommits(x, { ...x })).toBe(0);
   });
 });

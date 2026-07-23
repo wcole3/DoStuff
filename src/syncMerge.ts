@@ -12,8 +12,10 @@
 import { createHash } from "node:crypto";
 import {
   coerceAttachments,
+  coerceCommits,
   coercePendingClose,
   coerceTags,
+  compareCommits,
   isLinkKind,
   isPriority,
   isStatus,
@@ -28,6 +30,7 @@ import {
   type Status,
   type StatusEvent,
   type Task,
+  type TicketCommit,
   type TicketLink,
 } from "./types";
 
@@ -201,6 +204,8 @@ export interface WireTicket {
   links: WireLink[];
   statusHistory: StatusEvent[];
   record: RecordEntry[];
+  /** Append-only commit anchors — union-merged like `record`, never LWW. */
+  commits: TicketCommit[];
   pendingClose: PendingClose | null;
   /** Element deletion witnesses (docs/plans/ticket-sync/01 §6). */
   deletedTasks: ElementTombstone[];
@@ -261,6 +266,7 @@ export function toWire(
     links,
     statusHistory: issue.statusHistory.map((h) => ({ ...h })),
     record: issue.record.map((r) => ({ ...r })),
+    commits: issue.commits.map((c) => ({ ...c })),
     pendingClose: issue.pendingClose ? { ...issue.pendingClose } : null,
     deletedTasks: (elementTombstones?.tasks ?? []).map((t) => ({ ...t })),
     deletedAttachments: (elementTombstones?.attachments ?? []).map((t) => ({ ...t })),
@@ -298,6 +304,7 @@ export function fromWire(wire: WireTicket, guidToId: Map<string, string>): Issue
     links,
     statusHistory: wire.statusHistory.map((h) => ({ ...h })),
     record: wire.record.map((r) => ({ ...r })),
+    commits: wire.commits.map((c) => ({ ...c })),
     pendingClose: wire.pendingClose ? { ...wire.pendingClose } : null,
     guid: wire.guid,
   };
@@ -421,6 +428,7 @@ export function coerceWireTicket(raw: unknown): WireTicket | null {
     links,
     statusHistory,
     record,
+    commits: coerceCommits(r.commits),
     pendingClose: coercePendingClose(r.pendingClose),
     deletedTasks: coerceElementTombstones(r.deletedTasks),
     deletedAttachments: coerceElementTombstones(r.deletedAttachments),
@@ -580,6 +588,7 @@ function mergeTickets(x: WireTicket, y: WireTicket): WireTicket {
     deletedAttachments: attachments.tombstones,
     statusHistory: mergeStatusHistory(x.statusHistory, y.statusHistory),
     record: mergeRecord(x.record, y.record),
+    commits: mergeCommits(x.commits, y.commits),
     pendingClose: w.pendingClose ? { ...w.pendingClose } : null,
   };
 }
@@ -649,6 +658,23 @@ function mergeStatusHistory(a: StatusEvent[], b: StatusEvent[]): StatusEvent[] {
     const yb = y.by ?? "user";
     return xb < yb ? -1 : xb > yb ? 1 : 0;
   });
+}
+
+/**
+ * Union keyed by sha — append-only like `record`: NO tombstones, NO
+ * per-element updatedAt, never LWW (a loser replica's concurrent report must
+ * survive the winner's `...w` spread). Duplicate sha keeps the earliest `at`
+ * (min is a commutative/associative/idempotent join). Sorted (at, sha) so
+ * identical logical states canonicalJson-serialize identically on every
+ * replica — the LWW content-hash tiebreak depends on that.
+ */
+function mergeCommits(a: TicketCommit[], b: TicketCommit[]): TicketCommit[] {
+  const bySha = new Map<string, TicketCommit>();
+  for (const c of [...a, ...b]) {
+    const prev = bySha.get(c.sha);
+    if (!prev || c.at < prev.at) bySha.set(c.sha, c);
+  }
+  return [...bySha.values()].sort(compareCommits);
 }
 
 /** Union keyed (at, author, text), sorted ascending by at (tiebreak: author, then text). */

@@ -5,7 +5,7 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import type { ApplyIssueUpdate, AttachmentHandlers } from "./sidebarProvider";
+import { NO_OP_COMMIT_DETAILS, type ApplyIssueUpdate, type AttachmentHandlers, type FetchCommitDetails } from "./sidebarProvider";
 import type { Issue, Settings, WebviewToHost } from "./types";
 
 const ID_RE = /^DS-\d+$/;
@@ -45,6 +45,7 @@ export class BoardPanel {
       onPickForStaging: async () => [],
       onStageByUri: async () => null,
     },
+    fetchCommitDetails: FetchCommitDetails = NO_OP_COMMIT_DETAILS,
   ) {
     if (BoardPanel.current) {
       // Reveal in its current column — don't move the panel if the user has
@@ -68,7 +69,7 @@ export class BoardPanel {
       }
     );
 
-    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate, openLink, attachments);
+    BoardPanel.current = new BoardPanel(panel, extensionUri, store, applyUpdate, openLink, attachments, fetchCommitDetails);
   }
 
   /** Re-broadcast current truth to the live board panel, if any. */
@@ -110,6 +111,7 @@ export class BoardPanel {
       onPickForStaging: async () => [],
       onStageByUri: async () => null,
     },
+    private readonly fetchCommitDetails: FetchCommitDetails = NO_OP_COMMIT_DETAILS,
   ) {
     this.panel = panel;
     this.panel.iconPath = vscode.Uri.joinPath(extensionUri, "media", "icon.svg");
@@ -270,6 +272,21 @@ export class BoardPanel {
       case "openGraph":
         vscode.commands.executeCommand("dostuff.openGraph");
         break;
+      case "fetchCommitDetails": {
+        const id = (msg as { issueId?: unknown }).issueId;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected fetchCommitDetails: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        const result = await this.fetchCommitDetails(id);
+        this.panel.webview.postMessage({
+          type: "commitDetails",
+          issueId: id,
+          pathPrefix: result.pathPrefix,
+          details: result.details,
+        });
+        break;
+      }
       case "resolveClose": {
         const m = msg as { id?: unknown; verdict?: unknown };
         if (

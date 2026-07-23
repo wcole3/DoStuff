@@ -79,6 +79,37 @@ export interface Attachment {
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
 
 /**
+ * A commit reported against a ticket while implementing it. Only the sha and
+ * the report time are stored — the subject line and touched files are derived
+ * lazily from the workspace repo at render time (see `commitDetails.ts`), so a
+ * sha that no longer resolves (rebase, different machine) degrades to
+ * "not found" without breaking the ticket.
+ */
+export interface TicketCommit {
+  /** Lowercase hex, 7–40 chars, stored exactly as reported (after lowercasing). */
+  sha: string;
+  /** ISO 8601 — when the commit was reported via MCP. */
+  at: string;
+}
+
+/** Valid stored commit-sha shape. Inputs are lowercased before testing. */
+export const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/;
+
+/**
+ * Lazily-derived display data for one `TicketCommit`, resolved by the
+ * extension host against the workspace git repo. `found: false` means the sha
+ * doesn't resolve to a commit here (rebased away, not fetched, no repo).
+ */
+export interface CommitDetail {
+  sha: string;
+  found: boolean;
+  /** First line of the commit message; empty when not found. */
+  subject: string;
+  /** Repo-relative paths touched by the commit; empty when not found. */
+  files: string[];
+}
+
+/**
  * Stored relationship kinds from a source ticket to a target ticket. Only these
  * three "outbound" kinds persist; the matching inbound labels are derived for
  * display via `INVERSE_LINK_KIND` (see below). `relates-to` is symmetric and
@@ -208,6 +239,12 @@ export interface Issue {
    *  apply preserves remote values (`preserveTimestamps`). Legacy data
    *  defaults to `createdAt`. Additive. */
   updatedAt: string;
+  /** Append-only list of commits reported while implementing this ticket.
+   *  Server-derived: appended only by MCP `update_ticket_progress` (webview
+   *  input is never honored — `mergeIssueUpdate` carries it from prior).
+   *  Deduped by sha, sorted by (at, sha); sync merges by union (never LWW).
+   *  Additive — legacy tickets load with []. */
+  commits: TicketCommit[];
 }
 
 /** Statuses an MCP-connected agent is allowed to set via update_ticket_status.
@@ -244,15 +281,20 @@ export type HostToWebview =
   // ticket's IssueDetail. Originates from a graph node click; the host
   // routes it back to sidebar (open the detail overlay) and board (scroll
   // to the lane + open the detail).
-  | { type: "revealTicket"; id: string };
+  | { type: "revealTicket"; id: string }
+  // Host's reply to `fetchCommitDetails`: lazily-derived subject + files for
+  // each of the ticket's stored commit shas. `pathPrefix` is the posix
+  // relative path from the workspace root to the repo root ("." when equal)
+  // so the webview can compose openLink-able file paths.
+  | { type: "commitDetails"; issueId: string; pathPrefix: string; details: CommitDetail[] };
 
 export type WebviewToHost =
   | { type: "ready" }
   | {
       type: "createIssue";
-      // `guid`/`updatedAt` are server-derived like `pendingClose` — the
-      // webview never supplies them (see `buildCreatedIssue` / `IssueStore.upsert`).
-      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links" | "pendingClose" | "guid" | "updatedAt"> & {
+      // `guid`/`updatedAt`/`commits` are server-derived like `pendingClose` —
+      // the webview never supplies them (see `buildCreatedIssue` / `IssueStore.upsert`).
+      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links" | "pendingClose" | "guid" | "updatedAt" | "commits"> & {
         tasks?: Task[];
         // Inline attachments staged in the new-issue modal. The host loops
         // these through the regular appendAttachment chokepoint after upserting
@@ -312,7 +354,12 @@ export type WebviewToHost =
   // Routed through the registered `dostuff.resolveClose` command → the host
   // `resolveClose` handler, which applies `Closed` (approve) or clears the
   // request (deny).
-  | { type: "resolveClose"; id: string; verdict: "approve" | "deny" };
+  | { type: "resolveClose"; id: string; verdict: "approve" | "deny" }
+  // Ask the host to derive commit subjects + touched files for the ticket's
+  // stored shas. The webview never supplies shas — the host reads them from
+  // the store — so no sha crosses the webview trust boundary. Reply:
+  // `commitDetails`.
+  | { type: "fetchCommitDetails"; issueId: string };
 
 export interface Settings {
   storagePath: string;
@@ -401,6 +448,38 @@ export function coerceAttachments(input: unknown): Attachment[] {
     byId.set(id, { id, name, mimeType, sizeBytes, addedAt });
   }
   return Array.from(byId.values());
+}
+
+/**
+ * Total order for `TicketCommit` lists: ascending (at, sha). Shared by
+ * `coerceCommits`, the MCP append, and the sync union merge so identical
+ * logical states serialize byte-identically on every replica (stable
+ * canonical-JSON hashes for the LWW tiebreak).
+ */
+export function compareCommits(a: TicketCommit, b: TicketCommit): number {
+  if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+  return a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0;
+}
+
+/**
+ * Validate + dedupe a raw `commits` value into a clean `TicketCommit[]`.
+ * Mirrors the other coercers: forgiving (returns `[]` on bad shapes), never
+ * throws. Shas are lowercased and must be 7–40 hex chars; duplicate shas keep
+ * the earliest `at` (matching the sync union merge). Output sorted (at, sha).
+ */
+export function coerceCommits(input: unknown): TicketCommit[] {
+  if (!Array.isArray(input)) return [];
+  const bySha = new Map<string, TicketCommit>();
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const sha = typeof r.sha === "string" ? r.sha.toLowerCase() : "";
+    if (!COMMIT_SHA_RE.test(sha)) continue;
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) continue;
+    const prev = bySha.get(sha);
+    if (!prev || r.at < prev.at) bySha.set(sha, { sha, at: r.at });
+  }
+  return Array.from(bySha.values()).sort(compareCommits);
 }
 
 /**

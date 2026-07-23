@@ -11,6 +11,7 @@ import {
   isLinkKind,
   isPriority,
   isType,
+  type CommitDetail,
   type Issue,
   type LinkKind,
   type Settings,
@@ -29,6 +30,21 @@ export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>
  * reverts whatever optimistic UI state it had applied.
  */
 export type ApplyIssueUpdate = (issue: Issue) => Promise<void>;
+
+/**
+ * Host-supplied resolver for a ticket's commit anchors: reads the shas from
+ * the store itself (never from the webview) and derives subject + files from
+ * the workspace repo. See `createCommitDetailsFetcher` in commitDetails.ts.
+ * Defaulted to an empty result so tests without git keep working.
+ */
+export type FetchCommitDetails = (
+  issueId: string,
+) => Promise<{ pathPrefix: string; details: CommitDetail[] }>;
+
+export const NO_OP_COMMIT_DETAILS: FetchCommitDetails = async () => ({
+  pathPrefix: ".",
+  details: [],
+});
 
 /**
  * Host-side callbacks for cross-webview "drag from sidebar to board" flow.
@@ -144,6 +160,7 @@ export function buildCreatedIssue(
     record: [],
     guid: randomUUID(),
     updatedAt: opts.now,
+    commits: [],
   };
   return { issue, droppedLinks: dropped };
 }
@@ -233,6 +250,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     private readonly externalDrag: ExternalDragSignals = { onStart: () => {} },
     private readonly openLink: (url: string) => void | Promise<void> = () => {},
     private readonly attachments: AttachmentHandlers = NO_OP_ATTACHMENTS,
+    private readonly fetchCommitDetails: FetchCommitDetails = NO_OP_COMMIT_DETAILS,
   ) {
     this.output = vscode.window.createOutputChannel("DoStuff Webview");
     this.disposables.push(this.output);
@@ -517,6 +535,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
       case "openGraph":
         vscode.commands.executeCommand("dostuff.openGraph");
         break;
+      case "fetchCommitDetails": {
+        const id = (msg as { issueId?: unknown }).issueId;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected fetchCommitDetails: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        const result = await this.fetchCommitDetails(id);
+        this.view?.webview.postMessage({
+          type: "commitDetails",
+          issueId: id,
+          pathPrefix: result.pathPrefix,
+          details: result.details,
+        });
+        break;
+      }
       case "resolveClose": {
         const m = msg as { id?: unknown; verdict?: unknown };
         if (

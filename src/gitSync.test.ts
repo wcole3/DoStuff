@@ -179,6 +179,7 @@ function makeIssue(overrides: Partial<Issue> & { guid: string }): Issue {
     pendingClose: overrides.pendingClose ?? null,
     guid: overrides.guid,
     updatedAt: overrides.updatedAt ?? at,
+    commits: overrides.commits ?? [],
   };
 }
 

@@ -48,6 +48,7 @@ function makeWire(overrides: Partial<WireTicket> = {}): WireTicket {
     links: overrides.links ?? [],
     statusHistory: overrides.statusHistory ?? [],
     record: overrides.record ?? [],
+    commits: overrides.commits ?? [],
     pendingClose: overrides.pendingClose ?? null,
     deletedTasks: overrides.deletedTasks ?? [],
     deletedAttachments: overrides.deletedAttachments ?? [],
@@ -402,6 +403,45 @@ describe("mergeStates: attachments, links, pendingClose", () => {
     expect([...m.tickets.values()].every((t) => t.status === "Working")).toBe(true);
     expect(m.tickets.size).toBe(8);
   });
+
+  test("commits union by sha, sorted (at, sha); loser-only commit survives the winner's spread", () => {
+    const winner = makeWire({
+      guid: "g1",
+      updatedAt: T(5),
+      commits: [{ sha: "bbbbbbb", at: T(3) }],
+    });
+    const loser = makeWire({
+      guid: "g1",
+      updatedAt: T(2),
+      commits: [
+        { sha: "aaaaaaa", at: T(1) },
+        { sha: "bbbbbbb", at: T(3) }, // duplicate of the winner's
+      ],
+    });
+    for (const [x, y] of [
+      [winner, loser],
+      [loser, winner],
+    ] as const) {
+      const t = mergeStates(state([x]), state([y])).tickets.get("g1")!;
+      // Union — the loser's aaaaaaa is NOT wiped by the winner-wholesale spread.
+      expect(t.commits).toEqual([
+        { sha: "aaaaaaa", at: T(1) },
+        { sha: "bbbbbbb", at: T(3) },
+      ]);
+    }
+  });
+
+  test("commits duplicate sha across replicas keeps the earliest at (both orders)", () => {
+    const a = makeWire({ guid: "g1", updatedAt: T(2), commits: [{ sha: "abcdef0", at: T(1) }] });
+    const b = makeWire({ guid: "g1", updatedAt: T(3), commits: [{ sha: "abcdef0", at: T(4) }] });
+    for (const [x, y] of [
+      [a, b],
+      [b, a],
+    ] as const) {
+      const t = mergeStates(state([x]), state([y])).tickets.get("g1")!;
+      expect(t.commits).toEqual([{ sha: "abcdef0", at: T(1) }]);
+    }
+  });
 });
 
 // ----- semilattice properties ------------------------------------------------
@@ -416,6 +456,7 @@ describe("mergeStates: semilattice properties", () => {
           tasks: [{ id: "t1", text: "one", done: false, updatedAt: T(3) }],
           deletedTasks: [{ id: "t9", deletedAt: T(2) }],
           pendingClose: { by: "agent", at: T(3) },
+          commits: [{ sha: "aaaaaaa", at: T(1) }, { sha: "ccccccc", at: T(3) }],
         }),
         makeWire({ guid: "g2", number: 50, id: "DS-050", updatedAt: T(1) }),
       ],
@@ -428,6 +469,7 @@ describe("mergeStates: semilattice properties", () => {
           updatedAt: T(4),
           tasks: [{ id: "t9", text: "nine", done: true, updatedAt: T(4) }],
           tags: ["fresh"],
+          commits: [{ sha: "bbbbbbb", at: T(2) }, { sha: "aaaaaaa", at: T(4) }],
         }),
         makeWire({ guid: "g4", number: 51, id: "DS-051", updatedAt: T(2) }),
       ],
@@ -552,6 +594,7 @@ describe("toWire / fromWire", () => {
     pendingClose: { by: "agent", at: T(3) },
     guid: "g1",
     updatedAt: T(3),
+    commits: [{ sha: "a1b2c3d", at: T(2) }],
   };
 
   test("toWire projects links to guids (dropping unknowns) and defaults legacy task stamps", () => {
@@ -563,6 +606,7 @@ describe("toWire / fromWire", () => {
     expect(wire.tasks[1]).toEqual({ id: "t2", text: "legacy", done: true, updatedAt: T(1) });
     expect(wire.deletedTasks).toEqual([{ id: "tDead", deletedAt: T(2) }]);
     expect(wire.pendingClose).toEqual({ by: "agent", at: T(3) });
+    expect(wire.commits).toEqual([{ sha: "a1b2c3d", at: T(2) }]);
   });
 
   test("fromWire re-projects guids to ids, dropping tombstoned/unknown targets", () => {
@@ -572,6 +616,7 @@ describe("toWire / fromWire", () => {
     expect(issue.guid).toBe("g1");
     expect(issue.updatedAt).toBe(T(3));
     expect(issue.pendingClose).toEqual({ by: "agent", at: T(3) });
+    expect(issue.commits).toEqual([{ sha: "a1b2c3d", at: T(2) }]);
     // Unknown guid → link dropped.
     const scrubbed = fromWire(wire, new Map());
     expect(scrubbed.links).toEqual([]);
@@ -614,6 +659,11 @@ describe("coerceWireTicket", () => {
         { id: "tE", deletedAt: "bad" },
       ],
       record: "not-an-array",
+      commits: [
+        { sha: "ABCDEF0", at: T(2) }, // lowercased
+        { sha: "nope", at: T(2) }, // non-hex → dropped
+        { sha: "abcdef1", at: "bad" }, // bad stamp → dropped
+      ],
     });
     expect(out).not.toBeNull();
     expect(out!.type).toBe("Chore");
@@ -625,6 +675,12 @@ describe("coerceWireTicket", () => {
     expect(out!.pendingClose).toBeNull();
     expect(out!.deletedTasks).toEqual([{ id: "tD", deletedAt: T(2) }]);
     expect(out!.record).toEqual([]);
+    expect(out!.commits).toEqual([{ sha: "abcdef0", at: T(2) }]);
+  });
+
+  test("legacy wire without commits → []", () => {
+    const out = coerceWireTicket({ guid: "g1", id: "DS-001", title: "t", createdAt: T(1) });
+    expect(out!.commits).toEqual([]);
   });
 
   test("accepts terminal statuses — remote humans may legitimately Complete/Close", () => {

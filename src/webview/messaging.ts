@@ -129,6 +129,16 @@ export function startMessageBridge(): void {
           new CustomEvent("dostuff:revealTicket", { detail: { id: msg.id } }),
         );
         break;
+      case "commitDetails":
+        // Consumed by the CommitsSection of whichever IssueDetail requested
+        // it; window event (not the store) because the payload is per-detail
+        // ephemeral display data, not shared truth.
+        window.dispatchEvent(
+          new CustomEvent("dostuff:commitDetails", {
+            detail: { issueId: msg.issueId, pathPrefix: msg.pathPrefix, details: msg.details },
+          }),
+        );
+        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;
@@ -244,6 +254,10 @@ export function postExternalDragStart(issueId: string): void {
 
 export function postOpenLink(url: string): void {
   vscodeApi.postMessage({ type: "openLink", url });
+}
+
+export function postFetchCommitDetails(issueId: string): void {
+  vscodeApi.postMessage({ type: "fetchCommitDetails", issueId });
 }
 
 /**

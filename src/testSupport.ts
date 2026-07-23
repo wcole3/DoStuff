@@ -52,6 +52,7 @@ export function makeIssueFactory(): IssueFactory {
       pendingClose: overrides.pendingClose ?? null,
       guid: overrides.guid ?? `guid-${id}`,
       updatedAt: overrides.updatedAt ?? at,
+      commits: overrides.commits ?? [],
     };
   } as IssueFactory;
   makeIssue.reset = () => {

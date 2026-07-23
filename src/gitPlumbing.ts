@@ -273,6 +273,34 @@ export class GitRepo {
     return r.stdout.toString("utf8").trim() || null;
   }
 
+  /**
+   * First line of a commit's message, or null when `sha` doesn't resolve to a
+   * commit here (rebased away, not fetched, garbage input). Hex-validated
+   * defensively even though callers already validate — a sha can then never
+   * start with `-`, so argv option injection is structurally impossible. The
+   * `^{commit}` peel makes a blob/tree oid fail instead of dumping content.
+   */
+  async commitSubject(sha: string): Promise<string | null> {
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) return null;
+    const r = await this.local(["show", "-s", "--format=%s", `${sha}^{commit}`]);
+    if (r.code !== 0) return null;
+    return (r.stdout.toString("utf8").split("\n")[0] ?? "").trim();
+  }
+
+  /**
+   * Repo-relative paths touched by a commit, or null when it doesn't resolve.
+   * `--root` so the initial commit lists its files; merge commits yield []
+   * (diff-tree prints nothing for them without -c — accepted, the subject
+   * still renders). Same hex guard as `commitSubject`.
+   */
+  async diffTreeNameOnly(sha: string): Promise<string[] | null> {
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) return null;
+    const args = ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", `${sha}^{commit}`];
+    const r = await this.local(args);
+    if (r.code !== 0) return null;
+    return r.stdout.toString("utf8").split("\n").filter(Boolean);
+  }
+
   /** `git hash-object -w --stdin` — content over stdin, never argv. */
   async hashObjectStdin(content: Buffer): Promise<string> {
     const args = ["hash-object", "-w", "--stdin"];

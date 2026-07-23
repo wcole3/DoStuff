@@ -254,7 +254,9 @@ Rules:
   2. Active lanes (Planned, Working, Verification) are capped at 6 tickets
      each; over-cap moves are rejected, including promotions. Thinking is uncapped.
   3. As you work, call `update_ticket_progress` to tick tasks and append a terse,
-     factual note to the ticket's record.
+     factual note to the ticket's record. When you commit code for a ticket, pass
+     the commit sha in the same call (`commit: "<full sha>"`) so the ticket
+     records what it changed.
   4. `update_ticket_description` corrects or expands the description of any
      non-terminal ticket.
   5. File follow-up work with `create_ticket`; new tickets land in "Thinking" for
@@ -286,7 +288,7 @@ MCP. If those are wrong, file a new ticket.
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
 | `update_ticket_status` | `id`, `status` (one of Thinking / Planned / Working / Verification), optional `note` | Moves a ticket among the non-terminal states — promote a draft out of Thinking, shuffle the active lanes, or demote back to Thinking (uncapped). Honors the active-lane cap. Rejects Complete/Closed as either target or source. |
 | `update_ticket_description` | `id`, `description`, optional `note` | Replaces the ticket's description (and appends one record entry). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Only the description changes — title, priority, type, and verifyCriteria stay locked. |
-| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` | Toggles `tasks[].done` and appends one record entry. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
+| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry`, optional `commit` | Toggles `tasks[].done` and appends one record entry. Optional `commit` (a git sha, 7–40 hex — prefer the full 40) is appended to the ticket's append-only commits list; duplicates ignored. The ticket stores only `{sha, at}` — the UI derives the subject and touched files from your repo lazily. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 | `update_ticket_draft` | `id`, optional `tags[]`, `links[]`, `tasks[]` | Reshapes an untriaged draft's tags, links, and/or task list. **Thinking-only** — rejected once the ticket is triaged to an active lane (use the UI after that). Omit a field to leave it unchanged; pass `[]` to clear it. Unknown link targets are dropped. |
 | `request_ticket_close` | `id`, optional `note` | Flags a ticket as **OBE / no longer needed** and awaits human approval — does **not** change status. A human approves (→ Closed, "won't do") or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. For finished work use `request_ticket_complete` instead. Poll `get_ticket` for the outcome. |
 | `request_ticket_complete` | `id`, optional `note` | Flags a ticket's work as **finished** and awaits human acceptance — does **not** change status. A human accepts (→ Complete, stamping `resolvedAt`) or denies in the DoStuff UI. **Verification-only** — move the ticket there first. A completion request replaces a pending close request (and vice versa), recorded in the ticket history. Poll `get_ticket` for the outcome. |

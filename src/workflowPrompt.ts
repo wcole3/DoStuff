@@ -29,7 +29,9 @@ Rules:
   2. Active lanes (Planned, Working, Verification) are capped at ${cap} tickets
      each; over-cap moves are rejected, including promotions. Thinking is uncapped.
   3. As you work, call \`update_ticket_progress\` to tick tasks and append a terse,
-     factual note to the ticket's record.
+     factual note to the ticket's record. When you commit code for a ticket, pass
+     the commit sha in the same call (\`commit: "<full sha>"\`) so the ticket
+     records what it changed.
   4. \`update_ticket_description\` corrects or expands the description of any
      non-terminal ticket.
   5. File follow-up work with \`create_ticket\`; new tickets land in "Thinking" for

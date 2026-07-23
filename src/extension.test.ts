@@ -287,6 +287,24 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
     expect(next.updatedAt).toBe("2026-05-18T00:00:00.000Z");
     expect(next.title).toBe("edit");
   });
+
+  test("incoming.commits is ignored; prior.commits survive a normal edit", () => {
+    const prior = makeIssue({
+      status: "Working",
+      commits: [{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }],
+    });
+    const incoming: Partial<Issue> = {
+      title: "edit",
+      // The webview must not be able to forge or clear commit anchors —
+      // only MCP update_ticket_progress appends them.
+      commits: [{ sha: "0000000", at: "2026-07-02T00:00:00.000Z" }],
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+
+    expect(next.commits).toBe(prior.commits);
+    expect(next.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
+    expect(next.title).toBe("edit");
+  });
 });
 
 describe("resolveCloseRequest", () => {
@@ -378,6 +396,29 @@ describe("validateImportList — pendingClose", () => {
       note: "n",
     });
     expect(byId.get("DS-003")?.pendingClose).toBeNull();
+  });
+});
+
+describe("validateImportList — commits", () => {
+  test("round-trips valid commits, drops garbage, defaults missing to []", () => {
+    const { valid } = validateImportList([
+      { id: "DS-001", title: "no commits", createdAt: "2025-01-01T00:00:00.000Z" },
+      {
+        id: "DS-002",
+        title: "with commits",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        commits: [
+          { sha: "ABCDEF0", at: "2026-07-01T00:00:00.000Z" }, // lowercased
+          { sha: "nothex", at: "2026-07-01T00:00:00.000Z" }, // dropped
+          { sha: "abcdef1", at: "garbage" }, // dropped
+        ],
+      },
+      { id: "DS-003", title: "garbage shape", createdAt: "2025-01-01T00:00:00.000Z", commits: "nope" },
+    ]);
+    const byId = new Map(valid.map((i) => [i.id, i]));
+    expect(byId.get("DS-001")?.commits).toEqual([]);
+    expect(byId.get("DS-002")?.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
+    expect(byId.get("DS-003")?.commits).toEqual([]);
   });
 });
 

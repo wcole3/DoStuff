@@ -29,6 +29,7 @@ import {
 } from "./syncMerge";
 import {
   coerceAttachments,
+  coerceCommits,
   coerceLinks,
   coercePendingClose,
   coerceTags,
@@ -163,6 +164,17 @@ CREATE TABLE IF NOT EXISTS issue_pending_close (
   target   TEXT
 );
 
+-- Commit anchors reported against a ticket via MCP update_ticket_progress.
+-- Append-only (no delete path, no tombstones); subject/files are derived
+-- lazily from the workspace repo, never stored.
+CREATE TABLE IF NOT EXISTS issue_commits (
+  issue_id TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  sha      TEXT NOT NULL,
+  at       TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  PRIMARY KEY (issue_id, sha)
+);
+
 -- Deletion witnesses for git-native sync (docs/plans/ticket-sync/01 §6).
 -- Written on every delete even while sync is disabled; without a persisted
 -- witness the merge cannot distinguish "deleted here" from "created there".
@@ -235,6 +247,7 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
       links: coerceLinks((issue as any).links, (issue as any).id),
       resolvedAt: issue.resolvedAt ?? null,
       pendingClose: coercePendingClose((issue as any).pendingClose),
+      commits: coerceCommits((issue as any).commits),
       // Sync identity/ordering fields — server-derived, deterministic backfill
       // for legacy data (docs/plans/ticket-sync/01 §2-3).
       ...backfillSyncFields(
@@ -995,6 +1008,15 @@ export class IssueStore {
       }>(db, "SELECT * FROM issue_links ORDER BY source_id, position"),
       (r) => r.source_id,
     );
+    const commitsByIssue = groupBy(
+      selectAll<{
+        issue_id: string;
+        sha: string;
+        at: string;
+        position: number;
+      }>(db, "SELECT * FROM issue_commits ORDER BY issue_id, position"),
+      (r) => r.issue_id,
+    );
     // 0-or-1 relation, so a plain Map rather than groupBy. A main-era DB has no
     // such table row for any issue → the map is empty → all pendingClose null.
     const pendingCloseByIssue = new Map<string, PendingClose>();
@@ -1050,6 +1072,9 @@ export class IssueStore {
         (linksBySource.get(row.id) ?? []).map((l) => ({ targetId: l.target_id, kind: l.kind })),
         row.id,
       );
+      const commits = coerceCommits(
+        (commitsByIssue.get(row.id) ?? []).map((c) => ({ sha: c.sha, at: c.at })),
+      );
 
       return {
         id: row.id,
@@ -1068,6 +1093,7 @@ export class IssueStore {
         statusHistory,
         record,
         links,
+        commits,
         pendingClose: pendingCloseByIssue.get(row.id) ?? null,
         // NULLed by any older build's INSERT (its column list omits them) —
         // re-derive/fall back exactly like normalize() does for objects.
@@ -1078,7 +1104,7 @@ export class IssueStore {
   }
 
   /**
-   * Write one issue's seven-table fan-out. Caller is responsible for wrapping
+   * Write one issue's eight-table fan-out. Caller is responsible for wrapping
    * in BEGIN/COMMIT (so multi-issue calls like replaceAll / mergeAll can run
    * as one transaction).
    */
@@ -1156,6 +1182,16 @@ export class IssueStore {
       db.run(
         "INSERT OR IGNORE INTO issue_links (source_id, target_id, kind, position) VALUES (?, ?, ?, ?)",
         [issue.id, l.targetId, l.kind, i],
+      );
+    });
+
+    db.run("DELETE FROM issue_commits WHERE issue_id = ?", [issue.id]);
+    (issue.commits ?? []).forEach((c, i) => {
+      // PK (issue_id, sha): OR IGNORE keeps a stray duplicate sha from rolling
+      // back the transaction (coercers upstream already dedupe).
+      db.run(
+        "INSERT OR IGNORE INTO issue_commits (issue_id, sha, at, position) VALUES (?, ?, ?, ?)",
+        [issue.id, c.sha, c.at, i],
       );
     });
 

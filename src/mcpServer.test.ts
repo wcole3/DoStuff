@@ -29,6 +29,7 @@ import {
   runRequestTicketComplete,
   registerMcpTools,
   getWorkspaceContext,
+  publicView,
   DoStuffMcpServer,
   DEFAULT_WORKFLOW_PROMPT,
   WORKFLOW_POINTER,
@@ -1218,6 +1219,80 @@ describe("update_ticket_progress", () => {
     expect(updated.type).toBe("Feature");
     expect(updated.verifyCriteria).toBe("Locked");
     expect(updated.record).toHaveLength(0);
+  });
+
+  const FULL_SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0";
+
+  test("commit param appends a lowercased anchor and reports commitCount", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tasks: [] })]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      commit: FULL_SHA.toUpperCase(),
+      recordEntry: "wired the thing",
+    });
+    expect(res.isError).toBeFalsy();
+    const payload = JSON.parse(res.content[0].text);
+    expect(payload.commitCount).toBe(1);
+    const updated = store.get("DS-001")!;
+    expect(updated.commits).toHaveLength(1);
+    expect(updated.commits[0].sha).toBe(FULL_SHA);
+    expect(typeof updated.commits[0].at).toBe("string");
+  });
+
+  test("same sha reported twice → single entry keeping the original at", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tasks: [] })]);
+    await runUpdateTicketProgress(store, { id: "DS-001", commit: FULL_SHA });
+    const firstAt = store.get("DS-001")!.commits[0].at;
+    const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: FULL_SHA.toUpperCase() });
+    expect(res.isError).toBeFalsy();
+    const payload = JSON.parse(res.content[0].text);
+    expect(payload.commitCount).toBe(1);
+    expect(store.get("DS-001")!.commits).toEqual([{ sha: FULL_SHA, at: firstAt }]);
+  });
+
+  test("commit-only call leaves record and tasks unchanged", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: [{ id: "t1", text: "one", done: false }],
+        record: [{ at: "2025-01-01T00:00:00Z", author: "user", text: "existing" }],
+      }),
+    ]);
+    const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: "abcdef0" });
+    expect(res.isError).toBeFalsy();
+    const updated = store.get("DS-001")!;
+    expect(updated.record).toHaveLength(1);
+    expect(updated.tasks[0].done).toBe(false);
+    expect(updated.commits).toEqual([{ sha: "abcdef0", at: updated.commits[0].at }]);
+  });
+
+  test("schema rejects malformed commit shas without mutation", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tasks: [] })]);
+    for (const bad of ["zzzzzzz", "abc123", FULL_SHA + "0", "--format", "HEAD"]) {
+      const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: bad });
+      expect(res.isError).toBe(true);
+    }
+    expect(store.get("DS-001")!.commits).toEqual([]);
+  });
+
+  test("commit param is rejected on terminal tickets", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Complete", tasks: [] })]);
+    const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: FULL_SHA });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.commits).toEqual([]);
+  });
+
+  test("publicView exposes commits as {sha, at}", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        commits: [{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }],
+      }),
+    ]);
+    const view = publicView(store.get("DS-001")!, store.list());
+    expect(view.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
   });
 });
 

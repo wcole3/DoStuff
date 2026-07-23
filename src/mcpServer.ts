@@ -18,7 +18,8 @@
 //                               active-lane cap=6, Thinking uncapped). Never
 //                               targets Complete/Closed.
 //     update_ticket_description edit the description of any non-terminal ticket
-//     update_ticket_progress    toggle task[].done and append a record entry
+//     update_ticket_progress    toggle task[].done, append a record entry,
+//                               and/or report a commit sha for the ticket
 //     update_ticket_draft       reshape a Thinking draft's tags/links/tasks
 //     request_ticket_close      ask a human to close an OBE ticket (sets
 //                               pendingClose target "Closed"; human approves/denies)
@@ -37,7 +38,8 @@
 //       * moves into an active lane already at ACTIVE_LANE_CAP (Thinking uncapped)
 //   - update_ticket_description edits only the description (+ one record entry),
 //     on Thinking/Planned/Working/Verification. Complete/Closed rejected.
-//   - update_ticket_progress can only touch tasks[].done and append to record.
+//   - update_ticket_progress can only touch tasks[].done, append to record,
+//     and append one commit sha to the append-only commits list.
 //   - update_ticket_draft can replace tags/links/tasks, but ONLY while the
 //     ticket is in Thinking (untriaged). Title/priority/type/verifyCriteria
 //     remain UI-only (description is editable via update_ticket_description).
@@ -70,11 +72,13 @@ import {
   canMoveToActiveLane,
   coerceLinks,
   coerceTags,
+  compareCommits,
   effectiveCloseTarget,
   type Issue,
   type LinkKind,
   type RecordEntry,
   type Status,
+  type TicketCommit,
 } from "./types";
 import { formatIssueId } from "./syncMerge";
 import { validateLinks } from "./extension";
@@ -153,6 +157,15 @@ const PROGRESS_INPUT = {
     .optional()
     .default([]),
   recordEntry: z.string().max(5_000).optional(),
+  commit: z
+    .string()
+    .regex(/^[0-9a-fA-F]{7,40}$/, "Expected a git commit sha (7-40 hex chars)")
+    .optional()
+    .describe(
+      "Sha of a commit made while implementing this ticket. Prefer the full " +
+        "40-char sha. Appended to the ticket's append-only commits list; " +
+        "duplicates are ignored.",
+    ),
 };
 
 // Shape-edit a *draft* (Thinking) ticket: replace tags / links / tasks. Each
@@ -272,6 +285,7 @@ export function publicView(issue: Issue, allIssues: Issue[] = []) {
     })),
     links: issue.links.map((l) => ({ targetId: l.targetId, kind: l.kind })),
     inboundLinks,
+    commits: issue.commits.map((c) => ({ sha: c.sha, at: c.at })),
     createdAt: issue.createdAt,
     // Surfaced so a polling agent can see a close request it made is still
     // pending (non-null) vs. denied (cleared back to null); an approved close
@@ -343,6 +357,7 @@ export type UpdateProgressInput = {
   id: string;
   taskUpdates?: Array<{ id: string; done: boolean }>;
   recordEntry?: string;
+  commit?: string;
 };
 export type UpdateDraftInput = {
   id: string;
@@ -539,6 +554,7 @@ export async function runCreateTicket(
     pendingClose: null,
     guid: randomUUID(),
     updatedAt: now,
+    commits: [],
     statusHistory: [{ status: "Thinking", at: now, by: "agent" }],
     record: [
       {
@@ -686,10 +702,20 @@ export async function runUpdateTicketProgress(
     ? [...issue.record, { at: now, author: "agent", text: args.recordEntry }]
     : issue.record;
 
+  // Append the reported commit sha unless already recorded. Lowercased at this
+  // edge so dedup (here, in coerceCommits, and in the sync union merge) always
+  // compares like with like. Append-only: nothing over MCP removes an entry.
+  const sha = args.commit?.toLowerCase();
+  const newCommits: TicketCommit[] =
+    sha && !issue.commits.some((c) => c.sha === sha)
+      ? [...issue.commits, { sha, at: now }].sort(compareCommits)
+      : issue.commits;
+
   const next: Issue = {
     ...issue,
     tasks: newTasks,
     record: newRecord,
+    commits: newCommits,
   };
   await store.upsert(next);
   return ToolResultOk(
@@ -699,6 +725,7 @@ export async function runUpdateTicketProgress(
         id: next.id,
         tasks: next.tasks.map((t) => ({ id: t.id, done: t.done })),
         recordLength: next.record.length,
+        commitCount: next.commits.length,
       },
       null,
       2,
@@ -1461,6 +1488,8 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       title: "Update ticket progress",
       description:
         "Tick tasks done/undone and append a note to the ticket's record. " +
+        "Optionally pass `commit` (a git sha) when you have committed work for this ticket — " +
+        "it is appended to the ticket's commits list so the ticket records what it changed. " +
         "Title, priority, type, and verifyCriteria are not modifiable here (edit the description via update_ticket_description). " +
         "Allowed on Thinking, Planned, Working, and Verification tickets; Complete and Closed are rejected. " +
         "To reshape a draft's tags/links/task-list, use update_ticket_draft (Thinking only).",
