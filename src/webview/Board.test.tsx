@@ -463,6 +463,110 @@ describe("Thinking drawer card click semantics", () => {
   });
 });
 
+describe("Focus overlay after resolving a pending close request", () => {
+  const pendingComplete = { by: "agent" as const, at: "2025-01-02T00:00:00.000Z", target: "Complete" as const };
+
+  test("approve advances focus to the next ticket in the same lane", () => {
+    // High priority sorts first in the lane, so the overlay opens on `first`
+    // and approval should advance to `second`.
+    const first = makeIssue({
+      id: "DS-301", number: 301, title: "First verify", status: "Verification",
+      priority: "High", pendingClose: pendingComplete,
+    });
+    const second = makeIssue({
+      id: "DS-302", number: 302, title: "Second verify", status: "Verification",
+    });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([first, second]);
+
+    const card = Array.from(document.querySelectorAll(".bd-card")).find((c) =>
+      c.textContent?.includes("First verify"),
+    ) as HTMLElement;
+    fireEvent.click(card);
+    expect(document.querySelector(".bd-focus .ds-d-title")?.textContent).toContain("First verify");
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    const resolve = api.posted.find((m) => m.type === "resolveClose") as
+      | { type: "resolveClose"; id: string; verdict: string }
+      | undefined;
+    expect(resolve).toEqual({ type: "resolveClose", id: "DS-301", verdict: "approve" });
+    expect(document.querySelector(".bd-focus .ds-d-title")?.textContent).toContain("Second verify");
+  });
+
+  test("approve closes the overlay when the lane has no other tickets", () => {
+    const only = makeIssue({
+      id: "DS-311", number: 311, title: "Lone verify", status: "Verification",
+      pendingClose: pendingComplete,
+    });
+    // A ticket in a DIFFERENT lane must not become the next focus.
+    const elsewhere = makeIssue({ id: "DS-312", number: 312, title: "Elsewhere", status: "Working" });
+    installVsCodeApi();
+    render(<Board />);
+    pushInit([only, elsewhere]);
+
+    const card = Array.from(document.querySelectorAll(".bd-card")).find((c) =>
+      c.textContent?.includes("Lone verify"),
+    ) as HTMLElement;
+    fireEvent.click(card);
+    expect(document.querySelector(".bd-focus")).not.toBeNull();
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    expect(document.querySelector(".bd-focus")).toBeNull();
+  });
+
+  test("deny keeps the overlay on the same ticket", () => {
+    const first = makeIssue({
+      id: "DS-321", number: 321, title: "Denied verify", status: "Verification",
+      priority: "High", pendingClose: pendingComplete,
+    });
+    const second = makeIssue({ id: "DS-322", number: 322, title: "Other verify", status: "Verification" });
+    const api = installVsCodeApi();
+    render(<Board />);
+    pushInit([first, second]);
+
+    const card = Array.from(document.querySelectorAll(".bd-card")).find((c) =>
+      c.textContent?.includes("Denied verify"),
+    ) as HTMLElement;
+    fireEvent.click(card);
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-deny") as HTMLElement);
+
+    const resolve = api.posted.find((m) => m.type === "resolveClose") as
+      | { type: "resolveClose"; id: string; verdict: string }
+      | undefined;
+    expect(resolve).toEqual({ type: "resolveClose", id: "DS-321", verdict: "deny" });
+    expect(document.querySelector(".bd-focus .ds-d-title")?.textContent).toContain("Denied verify");
+  });
+
+  test("approving a close request from the Thinking drawer advances within the drawer lane", () => {
+    // OBE close (target Closed) filed against a Thinking draft: same
+    // next-in-lane rule, scoped to the drawer's lane.
+    const first = makeIssue({
+      id: "DS-331", number: 331, title: "Drop me", status: "Thinking",
+      priority: "High",
+      pendingClose: { by: "agent" as const, at: "2025-01-02T00:00:00.000Z", target: "Closed" as const },
+    });
+    const second = makeIssue({ id: "DS-332", number: 332, title: "Keep thinking", status: "Thinking" });
+    installVsCodeApi();
+    render(<Board />);
+    pushInit([first, second]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement);
+    const card = Array.from(document.querySelectorAll(".bd-drawer-card")).find((c) =>
+      c.textContent?.includes("Drop me"),
+    ) as HTMLElement;
+    fireEvent.click(card);
+    expect(document.querySelector(".bd-focus .ds-d-title")?.textContent).toContain("Drop me");
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    expect(document.querySelector(".bd-focus .ds-d-title")?.textContent).toContain("Keep thinking");
+  });
+});
+
 // The "Loading…" empty-state for Board is skipped: the webview store is a
 // module singleton and is `initialized: true` for the remainder of the test
 // process after any earlier test pushed an init message. Asserting against

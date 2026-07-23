@@ -126,9 +126,17 @@ export function absTime(iso: string | null | undefined): string {
 
 interface IssueDetailProps {
   issue: Issue;
+  /**
+   * Notified after the human resolves a pending close/complete request from
+   * this panel (the `resolveClose` message is already posted). Lets the host
+   * view decide where focus goes next — e.g. the board advances to the next
+   * ticket in the resolved ticket's lane. Optional; the sidebar omits it and
+   * keeps showing the same ticket.
+   */
+  onResolveClose?: (issue: Issue, verdict: "approve" | "deny") => void;
 }
 
-export function IssueDetail({ issue }: IssueDetailProps) {
+export function IssueDetail({ issue, onResolveClose }: IssueDetailProps) {
   const { issues, settings } = useIssues();
   // Unique tags across every ticket in the store, sorted for stable
   // datalist ordering. Cheap O(N tags) and recomputes only when the issue
@@ -293,13 +301,19 @@ export function IssueDetail({ issue }: IssueDetailProps) {
           <div className="ds-d-close-req-actions">
             <button
               className="ds-d-close-req-approve"
-              onClick={() => postResolveClose(issue.id, "approve")}
+              onClick={() => {
+                postResolveClose(issue.id, "approve");
+                onResolveClose?.(issue, "approve");
+              }}
             >
               {issue.pendingClose.target === "Complete" ? "Accept & complete" : "Approve & close"}
             </button>
             <button
               className="ds-d-close-req-deny"
-              onClick={() => postResolveClose(issue.id, "deny")}
+              onClick={() => {
+                postResolveClose(issue.id, "deny");
+                onResolveClose?.(issue, "deny");
+              }}
             >
               Deny
             </button>

@@ -546,3 +546,51 @@ describe("IssueDetail links", () => {
     expect(lastUpdate.issue.links).toEqual([]);
   });
 });
+
+describe("IssueDetail pending close request actions", () => {
+  const pending = { by: "agent" as const, at: "2025-01-02T00:00:00.000Z", target: "Complete" as const };
+
+  test("approve posts resolveClose and notifies onResolveClose", () => {
+    const issue = makeIssue({ id: "DS-050", number: 50, status: "Verification", pendingClose: pending });
+    pushInit([issue]);
+    const calls: Array<{ id: string; verdict: string }> = [];
+    render(
+      <IssueDetail
+        issue={issue}
+        onResolveClose={(i, verdict) => calls.push({ id: i.id, verdict })}
+      />,
+    );
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    expect(api.posted).toContainEqual({ type: "resolveClose", id: "DS-050", verdict: "approve" });
+    expect(calls).toEqual([{ id: "DS-050", verdict: "approve" }]);
+  });
+
+  test("deny notifies onResolveClose with the deny verdict", () => {
+    const issue = makeIssue({ id: "DS-051", number: 51, status: "Verification", pendingClose: pending });
+    pushInit([issue]);
+    const calls: Array<{ id: string; verdict: string }> = [];
+    render(
+      <IssueDetail
+        issue={issue}
+        onResolveClose={(i, verdict) => calls.push({ id: i.id, verdict })}
+      />,
+    );
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-deny") as HTMLElement);
+
+    expect(api.posted).toContainEqual({ type: "resolveClose", id: "DS-051", verdict: "deny" });
+    expect(calls).toEqual([{ id: "DS-051", verdict: "deny" }]);
+  });
+
+  test("approve without the optional callback still posts resolveClose (sidebar path)", () => {
+    const issue = makeIssue({ id: "DS-052", number: 52, status: "Verification", pendingClose: pending });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    expect(api.posted).toContainEqual({ type: "resolveClose", id: "DS-052", verdict: "approve" });
+  });
+});

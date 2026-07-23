@@ -666,9 +666,10 @@ function Drawer({
 interface FocusOverlayProps {
   issue: Issue | null;
   onClose: () => void;
+  onResolveClose: (issue: Issue, verdict: "approve" | "deny") => void;
 }
 
-function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
+function FocusOverlay({ issue, onClose, onResolveClose }: FocusOverlayProps) {
   useEffect(() => {
     if (!issue) return;
     const onKey = (e: KeyboardEvent) => {
@@ -684,7 +685,7 @@ function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
         <button className="bd-focus-close" onClick={onClose} aria-label="Close issue detail">
           <Icon name="close" size={12} />
         </button>
-        <IssueDetail issue={issue} />
+        <IssueDetail issue={issue} onResolveClose={onResolveClose} />
       </div>
     </div>
   );
@@ -797,6 +798,25 @@ export function Board() {
 
   const focused = focusId ? issues.find((i) => i.id === focusId) ?? null : null;
 
+  // Approving an agent's close/complete request removes the ticket from its
+  // lane, so advance the focus overlay to the next ticket in that lane (board
+  // sort order; falls back to the previous one when the resolved ticket was
+  // last). An empty lane dismisses the overlay. Deny keeps focus put.
+  const onResolveClose = useCallback(
+    (issue: Issue, verdict: "approve" | "deny") => {
+      if (verdict !== "approve") return;
+      const lane = byStatus[issue.status];
+      const idx = lane.findIndex((i) => i.id === issue.id);
+      const rest = lane.filter((i) => i.id !== issue.id);
+      if (rest.length === 0) {
+        setFocusId(null);
+        return;
+      }
+      setFocusId(rest[Math.min(Math.max(idx, 0), rest.length - 1)].id);
+    },
+    [byStatus],
+  );
+
   if (!initialized) {
     return <div style={{ padding: 40, color: "var(--vsc-fg-muted)" }}>Loading…</div>;
   }
@@ -852,7 +872,7 @@ export function Board() {
         justDraggedRef={justDraggedRef}
       />
 
-      <FocusOverlay issue={focused} onClose={() => setFocusId(null)} />
+      <FocusOverlay issue={focused} onClose={() => setFocusId(null)} onResolveClose={onResolveClose} />
 
       <DragGhost ghost={ghost} />
 
