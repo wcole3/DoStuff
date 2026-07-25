@@ -284,6 +284,14 @@
           "scope": "window",
           "markdownDescription": "Localhost port for this workspace's MCP server. `0` (default) lets the OS pick an ephemeral port each session. Set a fixed value (1024–65535) to keep `mcp.json` URLs stable across restarts. Easiest way to set this: run **DoStuff: Pin MCP Port to Workspace** while the server is running. If the chosen port is already in use, the server falls back to an ephemeral one."
         },
+        "dostuff.mcp.recordLimit": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 500,
+          "scope": "window",
+          "markdownDescription": "Number of newest record entries included when a ticket is served over MCP. The record log is append-only and never shrinks, so an old ticket can otherwise dominate every read. Three entries are enough to resume work after a context loss; raise it if your agents need deeper history by default. `0` = no limit. Agents can override per call with `get_ticket`'s `recordLimit`."
+        },
         "dostuff.mcp.instructions": {
           "type": "string",
           "default": "",

@@ -6,50 +6,61 @@
 
 import { ACTIVE_LANE_CAP } from "./types";
 
-// The full prompt is served once per connection as MCP initialize
-// `instructions` (plus the dostuff://instructions/workflow resource and the
-// `workflow` MCP prompt). Tool responses embed only WORKFLOW_POINTER below,
-// so keep this terse — but it is no longer paid for on every call.
+/**
+ * Byte ceiling for the workflow prompt and for each registered tool
+ * description. Claude Code truncates both at 2KB; this sits below that so the
+ * `activeLaneCap` interpolation and ordinary edits have room before anything
+ * is silently cut. Asserted in `mcpServer.test.ts`.
+ */
+export const PROMPT_BYTE_BUDGET = 1800;
+
+// Served once per connection as MCP initialize `instructions` (plus the
+// dostuff://instructions/workflow resource and the `workflow` MCP prompt).
+//
+// HARD BUDGET — see PROMPT_BYTE_BUDGET. Claude Code truncates server
+// instructions at 2KB and drops the remainder with no error. An earlier draft
+// of this prompt ran to 2,830 bytes, which cut the OBE close flow and the
+// field-immutability contract off the end: the two rules least safe to lose.
+// Keep additions inside the budget, or move the detail into a tool's own
+// `description` (each of those gets its own 2KB).
+//
+// Ordering is deliberate. Claude Code defers MCP tool schemas by default and
+// discovers them via tool search, so these instructions are what decides
+// whether an agent reaches for DoStuff at all. Lead with what the server is,
+// then carry only the rules no single tool description can: cross-tool
+// sequencing, the human-approval boundary, and immutability.
 export function buildDefaultWorkflowPrompt(cap: number = ACTIVE_LANE_CAP): string {
   return `\
-You are an engineering agent working the DoStuff issue queue.
+DoStuff is this workspace's engineering ticket queue. Reach for these tools
+whenever the task involves finding, starting, updating, or filing work.
 
-Address tickets by number ("42"), id ("DS-042"), or a title substring — e.g.
-"get ticket 42 and begin work" or "start on the OAuth ticket" (use \`get_ticket\`).
-Discover work via \`list_issues\` or the \`dostuff://tickets\` resource (Thinking +
-active lanes; Complete/Closed hidden). Read the description and verify criteria
-before starting.
+You may NOT change a ticket's title, priority, type, or verify criteria over
+MCP, and only a human can set Complete or Closed. If those are wrong, say so or
+file a new ticket.
 
-Rules:
-  1. \`update_ticket_status\` moves tickets among Thinking, Planned, Working, and
-     Verification: promote a draft out of Thinking, shuffle the active lanes, or
-     demote back to Thinking. Set "Working" when you start, "Verification" when
-     ready for review. Only a human can set Complete or Closed; if verification
-     fails, move the ticket back to "Working".
-  2. Active lanes (Planned, Working, Verification) are capped at ${cap} tickets
-     each; over-cap moves are rejected, including promotions. Thinking is uncapped.
-  3. As you work, call \`update_ticket_progress\` to tick tasks and append a terse,
-     factual note to the ticket's record. When you commit code for a ticket, pass
-     the commit sha in the same call (\`commit: "<full sha>"\`) so the ticket
-     records what it changed.
-  4. \`update_ticket_description\` corrects or expands the description of any
-     non-terminal ticket.
-  5. File follow-up work with \`create_ticket\`; new tickets land in "Thinking" for
-     human triage. Optionally pass \`links: [{ targetId, kind }]\`
-     (kinds: blocks, child-of, relates-to).
-  6. Reshape a ticket's tags, links, or task list with \`update_ticket_draft\` —
-     Thinking only. Once triaged, scope locks; demote the ticket back to Thinking
-     first if its scope genuinely needs reshaping.
-  7. When the work is finished, move the ticket to "Verification" and call
-     \`request_ticket_complete\`. It does not change status — a human accepts
-     (→ Complete) or denies in DoStuff. Poll \`get_ticket\` for the outcome.
-  8. When a ticket is OBE — no longer needed, superseded, or won't be done —
-     call \`request_ticket_close\` instead. Same approval flow, but approval
-     moves it to Closed ("won't do"). Keep the two distinct: close is for
-     dropped work, complete is for finished work.
+Find work with \`list_issues\` or the \`dostuff://tickets\` resource, then
+\`get_ticket\` by number ("42"), id ("DS-042"), or title substring. Read the
+description and verify criteria before starting.
 
-You may NOT modify a ticket's title, priority, type, or verify criteria via
-MCP. If those are wrong, file a new ticket.`;
+\`update_ticket_status\` moves a ticket among Thinking, Planned, Working, and
+Verification (active lanes cap at ${cap} each; Thinking is uncapped). Set Working
+when you start. As you go, \`update_ticket_progress\` ticks tasks, appends a
+terse factual note, and records the sha of each commit you make. When the work
+is done move to Verification and call \`request_ticket_complete\`; if
+verification fails, move back to Working.
+
+When a ticket is OBE — superseded, or won't be done — call
+\`request_ticket_close\` instead. Both requests need human approval and neither
+changes status itself: poll \`get_ticket\` with \`view: "status"\` for the
+outcome. Keep them distinct — close is dropped work, complete is finished work.
+
+File follow-ups with \`create_ticket\` (they land in Thinking for triage).
+Reshape a draft's tags, links, or tasks with \`update_ticket_draft\` — Thinking
+only; demote a ticket back there first if its scope genuinely needs reshaping.
+
+Lead every description with one or two sentences on what the ticket is and why
+it matters; board views show only that opening. Reads return just the newest
+record entries — pass \`recordLimit: 0\` when you need the full history.`;
 }
 
 // One-line stand-in embedded in per-call tool/resource responses instead of

@@ -2,6 +2,10 @@
 
 > Series: [00-overview](00-overview.md) · [01-schema-groundwork](01-schema-groundwork.md) · [02-merge-spec](02-merge-spec.md) · [03-git-plumbing](03-git-plumbing.md) · [04-controller-wiring](04-controller-wiring.md) · [05-attachments](05-attachments.md) · [06-testing-and-docs](06-testing-and-docs.md) · **07**
 
+> **Historical record — the prompt below has since been rewritten wholesale.** The MCP token-cost work found that Claude Code truncates server instructions at **2KB, silently**, and that the amended version of this prompt had grown to 2,830 bytes: ~782 bytes were being dropped, taking the OBE-close flow and the field-immutability contract with them. The current prompt is restructured (critical rules first, per-tool mechanics pushed into each tool's own `description`, an opening line that earns the tool search Claude Code now applies by default) and held under `PROMPT_BYTE_BUDGET` by a test. `src/workflowPrompt.ts` is the source of truth; read the block below only as a record of what this phase shipped.
+>
+> The lesson worth carrying forward: this phase's own framing — "compresses the prompt, no rules lost" — was right about the rules and wrong about the ceiling. There *was* a hard limit, nobody knew it, and the prompt quietly grew back past it.
+
 Phase 0 — **independent of sync, execute first.** Compresses the agent workflow prompt (~58% of current length, no rules lost) and restructures how it is served: today the full prompt is embedded in **every** `get_ticket`/`list_issues`/ticket-resource response (`src/mcpServer.ts:409/443/1189/1229`), a per-call context tax on agents. The MCP SDK supports `ServerOptions.instructions` — surfaced in the `initialize` result and auto-injected by clients like Claude Code — which DoStuff never sets. After this phase: full text at initialize + the `dostuff://instructions/workflow` resource + the `workflow` MCP prompt; a one-line pointer everywhere else.
 
 The prompt gains **nothing sync-specific** — sync is transparent to agents. `publicView` (`src/mcpServer.ts:213`) does **not** gain `guid`: no MCP tool accepts one, agents address by number/id/title, and exposing it invites agents to persist a handle the server won't honor while adding context weight to every response. Renumbering staleness after a first-sync collision merge is handled in docs (README; [06 §2 step 8](06-testing-and-docs.md)) — agents recover via `list_issues`.
@@ -72,7 +76,7 @@ MCP. If those are wrong, file a new ticket.
 - `:2147-2156` (ticket resource) → assert `payload.workflow === WORKFLOW_POINTER`.
 - `:2212-2222` (resource honors custom instructions) and `:2436-2447` (prompt) — unchanged.
 - New: **initialize result carries instructions** — raw JSON-RPC `initialize` POST against the `bootServer` port (helper at `:1513` already takes `{ instructions }`), assert `result.instructions === DEFAULT_WORKFLOW_PROMPT`; second case with a custom override.
-- New: **responses don't embed the full prompt** — `get_ticket`/`list_issues` `workflow` field is short (`< 200` chars, does not contain `"Rules:"`).
+- New: **responses don't embed the full prompt** — `get_ticket`/`list_issues` `workflow` field is short (`< 200` chars, does not contain the full text). *(As shipped this asserted `not.toContain("Rules:")`; the rewrite dropped the numbered-rules heading, so the check now targets a tool name instead. Assert on something the pointer could never contain, not on prompt wording.)*
 
 ## 4. Doc touch list
 

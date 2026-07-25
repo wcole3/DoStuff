@@ -34,14 +34,21 @@ sections relevant to your change; run everything before a release.
 Setup: enable the server (**DoStuff: Toggle MCP Server**), pin or read the port, connect an agent (e.g. Claude Code per README).
 
 - [ ] `list_issues` returns the compact index; response `workflow` field is the **one-line pointer**, not the full prompt.
+- [ ] `list_issues` paging: with more tickets than `limit`, `count` is the **total** while `returned` is the page size and `nextOffset` points at the next page; walking `nextOffset` to the end yields every ticket once, and the last page has no `nextOffset`.
+- [ ] `update_ticket_progress` response carries `tasksChanged` (only the ids you passed) and `tasks: {total, done}` — **not** every task id on the ticket.
+- [ ] Task ids: a ticket created via `create_ticket` with tasks gets short ids (`t<base36>`), and toggling a task on an older ticket that still has `t-<uuid>` ids works unchanged.
 - [ ] `get_ticket` by number, `DS-id`, and title substring all resolve; Complete/Closed are refused.
-- [ ] `create_ticket` lands in **Thinking**.
+- [ ] Read resource `dostuff://tickets`: **summary rows only** — no `description`, `record`, or `verifyCriteria` on any row; each has `tasks: "done/total"` and a one-line `excerpt`; the envelope has `count` and a single `detailUriTemplate`. Full bodies still come from `dostuff://tickets/{id}`.
+- [ ] Excerpt quality: on a ticket whose description opens with a `## Heading`, the excerpt shows the **prose**, not the heading; on a ticket with an empty description the `excerpt` key is absent. Every excerpt on the board should be intelligible on its own — if one isn't, the prompt wording or the heuristic needs another pass.
+- [ ] Record windowing: on a ticket with more than 10 record entries, `get_ticket` returns the **newest 10** plus `recordCount`/`recordOmitted`; `recordLimit: 0` returns the whole log; a ticket under the limit gets no `recordOmitted` key at all.
+- [ ] `get_ticket` with `view: "status"` returns only id/number/title/status/pendingClose/tasks counts, and no `workflow` pointer — and is visibly tiny next to the full read.
+- [ ] `create_ticket` lands in **Thinking**. After the prompt change, an agent's description should lead with what/why rather than a `## Context` heading.
 - [ ] The full loop: agent **promotes** the ticket to Planned (`update_ticket_status`), moves it to Working, **demotes** it back to Thinking, reshapes it (`update_ticket_draft`), re-promotes, edits the description (`update_ticket_description`), ticks a task + appends a record (`update_ticket_progress`), then files `request_ticket_close` → UI shows the awaiting-decision badge; approve → ticket Closed; agent's `get_ticket` for it is now refused.
 - [ ] Completion flow: agent moves a ticket to Verification, files `request_ticket_complete` → "work finished" badge; **Accept & complete** → ticket Complete with `resolvedAt`; history records "Completion request approved".
 - [ ] `request_ticket_complete` from a non-Verification lane is rejected, pointing at `update_ticket_status`; a completion request replaces a pending close request (record entry notes the switch).
 - [ ] Lane cap: with a full lane, agent promotion into it is rejected with the cap message.
 - [ ] `update_ticket_status` to Complete/Closed is rejected, pointing at `request_ticket_close`.
-- [ ] Commit anchors: `update_ticket_progress` with `commit: $(git rev-parse HEAD)` → response `commitCount: 1`; same sha again → still 1; `get_ticket` lists it under `commits`. A **Commits** section appears in the ticket detail without a reload: short sha + subject; expanding lists the touched files; clicking a file opens it in the editor (verify once from a workspace at the repo root and once from a workspace that is a subfolder of the repo). A ticket with no commits shows no section.
+- [ ] Commit anchors: `update_ticket_progress` with `commit: $(git rev-parse HEAD)` → response `commitCount: 1`; same sha again → still 1; `get_ticket` reports `commitCount: 1` and names `commits` under `omitted`, and `get_ticket` with `include: ["commits"]` lists the sha. A **Commits** section appears in the ticket detail without a reload: short sha + subject; expanding lists the touched files; clicking a file opens it in the editor (verify once from a workspace at the repo root and once from a workspace that is a subfolder of the repo). A ticket with no commits shows no section.
 - [ ] Commit anchor degradation: report a sha then `git commit --amend` (or fabricate one) → row shows "not found in this repo", detail otherwise usable, no error toast. Also holds with `dostuff.sync.enabled` off and in a non-git workspace.
 
 ## 5. Workflow prompt surfaces
@@ -49,6 +56,9 @@ Setup: enable the server (**DoStuff: Toggle MCP Server**), pin or read the port,
 - [ ] Client's server info (Claude Code `/mcp`) shows the workflow **initialize instructions**.
 - [ ] `dostuff://instructions/workflow` resource and the `workflow` MCP prompt return the full text.
 - [ ] Set `dostuff.mcp.instructions` to a custom string → all three surfaces reflect it **without an extension restart**; clearing it restores the default with the live lane cap interpolated.
+- [ ] **Arrives untruncated.** Claude Code cuts server instructions at 2KB silently, and the loss is always at the *tail*. Ask a connected agent — without pasting the prompt at it — to state (a) what to do when a ticket is OBE, and (b) which fields it may not change over MCP. Both live in the back half of the prompt; if either answer is missing or invented, the prompt is being truncated and the byte budget in `src/workflowPrompt.ts` needs to come down further.
+- [ ] **Earns the tool search.** Claude Code defers MCP tool schemas by default, so an agent only loads them if the instructions convince it to look. In a fresh session that has *not* been told about DoStuff, ask "what am I supposed to be working on?" and confirm it finds and calls the DoStuff tools rather than guessing or asking.
+- [ ] A custom `dostuff.mcp.instructions` longer than 2KB is the user's own footgun — worth re-checking the two questions above after setting one.
 
 ## 6. Git ticket sync
 

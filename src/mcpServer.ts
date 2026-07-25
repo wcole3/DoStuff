@@ -51,6 +51,7 @@
 import * as http from "http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
+import { newTaskId } from "./ids";
 import * as vscode from "vscode";
 import { z } from "zod";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -85,7 +86,12 @@ import { validateLinks } from "./extension";
 
 // The default workflow prompt lives in its own small module so the extension
 // host can import it without dragging the full MCP SDK + zod into its bundle.
-export { DEFAULT_WORKFLOW_PROMPT, buildDefaultWorkflowPrompt, WORKFLOW_POINTER } from "./workflowPrompt";
+export {
+  DEFAULT_WORKFLOW_PROMPT,
+  buildDefaultWorkflowPrompt,
+  WORKFLOW_POINTER,
+  PROMPT_BYTE_BUDGET,
+} from "./workflowPrompt";
 import { buildDefaultWorkflowPrompt, WORKFLOW_POINTER } from "./workflowPrompt";
 
 // ----- Tool result helpers ---------------------------------------------------
@@ -120,9 +126,52 @@ function assertAgentMutable(issue: Issue, action: string): ToolResult | null {
 
 // ----- Input schemas (raw zod shapes per SDK v1.x) ---------------------------
 
+// Declared here rather than beside `readMcpViewOptions` because the schemas
+// below reference MAX_RECORD_LIMIT at module-evaluation time.
+// Newest record entries served by default. The log is append-only and
+// union-merged by sync, so it only grows; three entries carry the thread far
+// enough to resume after a context loss, and `recordLimit` is the escape hatch.
+export const DEFAULT_RECORD_LIMIT = 3;
+export const MAX_RECORD_LIMIT = 500;
+
+export const DEFAULT_LIST_LIMIT = 100;
+// At ~148 ch/row, 250 rows is ~37,000 ch (~9k tokens) — just under the 10k
+// mark where Claude Code warns about MCP output size. The documented maximum
+// should not be able to trip that warning on its own.
+export const MAX_LIST_LIMIT = 250;
+
+// Read-side ceiling for `verifyCriteria`. Write accepts 10,000 (and the field
+// is never editable over MCP), so this bounds the tail without touching what
+// is stored. Recover the full text with `include: ["verifyCriteria"]`.
+export const MAX_VERIFY_CRITERIA_CHARS = 2_000;
+
+/**
+ * Sections `publicView` demotes by default and restores on request.
+ *
+ * `commits` are shas the agent itself reported via `update_ticket_progress`
+ * and that git holds authoritatively; `verifyCriteria` is truncated rather
+ * than dropped. `record` deliberately is NOT a member — `recordLimit` already
+ * covers it, and two mechanisms for one field invites mis-selection.
+ */
+export const INCLUDE_SECTIONS = ["commits", "verifyCriteria"] as const;
+export type IncludeSection = (typeof INCLUDE_SECTIONS)[number];
+
+// Point-of-use reminder for the excerpt contract: `summaryView` shows only a
+// description's opening paragraph, so a description that buries its point under
+// "## Context" boilerplate reads as blank on the board. The workflow prompt says
+// the same thing, but it is read at session start and descriptions get written
+// many turns later.
+const DESCRIPTION_GUIDANCE =
+  "Lead with 1-2 sentences of what and why; board views show only the opening. Detail goes below.";
+
 const NEW_TICKET_INPUT = {
   title: z.string().min(1).max(200),
-  description: z.string().max(20_000).optional().default(""),
+  description: z
+    .string()
+    .max(20_000)
+    .optional()
+    .default("")
+    .describe(DESCRIPTION_GUIDANCE),
   type: z.enum(["Bug", "Feature", "Refactor", "Chore", "Spike"]).default("Feature"),
   priority: z.enum(["Critical", "High", "Regular", "Low"]).default("Regular"),
   verifyCriteria: z.string().max(10_000).optional().default(""),
@@ -161,11 +210,7 @@ const PROGRESS_INPUT = {
     .string()
     .regex(/^[0-9a-fA-F]{7,40}$/, "Expected a git commit sha (7-40 hex chars)")
     .optional()
-    .describe(
-      "Sha of a commit made while implementing this ticket. Prefer the full " +
-        "40-char sha. Appended to the ticket's append-only commits list; " +
-        "duplicates are ignored.",
-    ),
+    .describe("Sha of a commit made for this ticket; prefer the full 40 chars."),
 };
 
 // Shape-edit a *draft* (Thinking) ticket: replace tags / links / tasks. Each
@@ -196,7 +241,7 @@ const DRAFT_INPUT = {
 // Planned, Working, Verification); Complete/Closed are rejected in-handler.
 const DESCRIPTION_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
-  description: z.string().max(20_000),
+  description: z.string().max(20_000).describe(DESCRIPTION_GUIDANCE),
   note: z.string().max(2_000).optional(),
 };
 
@@ -213,21 +258,40 @@ const GET_TICKET_INPUT = {
     .string()
     .min(1)
     .describe("Ticket number, DS-id, or a substring of the title."),
+  view: z
+    .enum(["full", "status"])
+    .optional()
+    .default("full")
+    .describe(
+      'Use "status" when polling for a close/complete decision — returns only ' +
+        "status, pendingClose and task counts.",
+    ),
+  recordLimit: z
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_RECORD_LIMIT)
+    .optional()
+    .describe("Newest record entries to return. 0 = the whole log."),
+  include: z
+    .array(z.enum(INCLUDE_SECTIONS))
+    .optional()
+    .describe(
+      "Restore sections the response lists under `omitted`: the full commit " +
+        "sha list, or untruncated verify criteria.",
+    ),
 };
 
 const LIST_ISSUES_INPUT = {
-  type: z
-    .enum(["Bug", "Feature", "Refactor", "Chore", "Spike"])
-    .optional()
-    .describe("Narrow to one issue type."),
-  priority: z
-    .enum(["Critical", "High", "Regular", "Low"])
-    .optional()
-    .describe("Narrow to one priority level."),
+  // The three filters are self-describing enums — no `.describe()` needed, and
+  // every character here is paid on `tools/list` once per session.
+  type: z.enum(["Bug", "Feature", "Refactor", "Chore", "Spike"]).optional(),
+  priority: z.enum(["Critical", "High", "Regular", "Low"]).optional(),
   status: z
     .enum(["Thinking", "Planned", "Working", "Verification", "Complete", "Closed"])
-    .optional()
-    .describe("Narrow to one status. Omit to list all statuses."),
+    .optional(),
+  limit: z.number().int().min(1).max(MAX_LIST_LIMIT).optional().default(DEFAULT_LIST_LIMIT),
+  offset: z.number().int().min(0).optional().default(0),
 };
 
 // Strict schemas used at handler entry to reject smuggled-in extra fields.
@@ -245,7 +309,101 @@ const ListIssuesSchema  = z.object(LIST_ISSUES_INPUT).strict();
 
 // ----- Helpers ---------------------------------------------------------------
 
-export function publicView(issue: Issue, allIssues: Issue[] = []) {
+// Characters of description prose carried on a summary row. Deliberately not
+// exposed as a setting — see `excerpt` for why the number is not load-bearing.
+export const EXCERPT_MAX = 140;
+
+/**
+ * Reduce a markdown description to a single-line excerpt for summary rows.
+ *
+ * Not a raw first-N-chars cut: descriptions are markdown, so a naive slice
+ * spends the budget on structure. Skip leading blank lines and headings, take
+ * the first paragraph, collapse whitespace, then cut on a word boundary. A
+ * short opening paragraph therefore ends at its own boundary and costs *less*
+ * than `max`. Returns "" for blank/structure-only input so callers can omit
+ * the key entirely rather than emit `"excerpt": ""`.
+ */
+export function excerpt(text: unknown, max: number = EXCERPT_MAX): string {
+  if (typeof text !== "string") return "";
+  const lines = text.split(/\r?\n/);
+  let i = 0;
+  // "## Problem" is structure, not prose — excerpting it tells a reader nothing.
+  while (i < lines.length && (!lines[i].trim() || /^\s{0,3}#{1,6}\s/.test(lines[i]))) {
+    i++;
+  }
+  const para: string[] = [];
+  while (i < lines.length && lines[i].trim()) {
+    para.push(lines[i]);
+    i++;
+  }
+  const flat = para.join(" ").replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  if (flat.length <= max) return flat;
+  const cut = flat.slice(0, max);
+  const space = cut.lastIndexOf(" ");
+  const kept = space > 0 ? cut.slice(0, space) : cut;
+  return kept.replace(/[\s,;:.\-–—]+$/, "") + "…";
+}
+
+/**
+ * Compact row for the `dostuff://tickets` collection: enough to decide whether
+ * a ticket is worth fetching, and nothing more. The full body — description,
+ * record, tasks, links, attachments — lives behind `dostuff://tickets/{id}`.
+ *
+ * This is deliberately NOT the same projection as `list_issues` (which is
+ * leaner still); unifying them upward would regress every list call.
+ */
+export function summaryView(issue: Issue) {
+  const done = issue.tasks.filter((t) => t.done).length;
+  const ex = excerpt(issue.description);
+  return {
+    id: issue.id,
+    number: issue.number,
+    title: issue.title,
+    type: issue.type,
+    priority: issue.priority,
+    status: issue.status,
+    tags: issue.tags,
+    tasks: `${done}/${issue.tasks.length}`,
+    ...(ex ? { excerpt: ex } : {}),
+  };
+}
+
+/**
+ * Full ticket projection.
+ *
+ * `opts.recordLimit` windows the append-only record log to its newest N
+ * entries. `opts.include` restores sections that are demoted by default.
+ * Both default to the *old* behavior — unlimited record, everything included —
+ * on purpose: this is a pure function, and changing its defaults would
+ * silently alter every existing call site. Callers resolve the configured
+ * values (`readMcpViewOptions`) and pass them in.
+ */
+export function publicView(
+  issue: Issue,
+  allIssues: Issue[] = [],
+  opts: { recordLimit?: number; include?: readonly IncludeSection[] } = {},
+) {
+  const include = opts.include ?? INCLUDE_SECTIONS;
+  const withCommits = include.includes("commits");
+  const withFullCriteria = include.includes("verifyCriteria");
+
+  // `verifyCriteria` accepts up to 10,000 chars on create and is never editable
+  // over MCP, so a single verbose ticket would otherwise tax every read of it
+  // forever. Raw slice, not `excerpt()` — criteria are usually a structured
+  // list, and collapsing them to one paragraph would drop items silently.
+  const criteria = issue.verifyCriteria ?? "";
+  const criteriaTruncated = !withFullCriteria && criteria.length > MAX_VERIFY_CRITERIA_CHARS;
+  const verifyCriteria = criteriaTruncated
+    ? criteria.slice(0, MAX_VERIFY_CRITERIA_CHARS) + "…"
+    : criteria;
+
+  // Sections actually withheld on THIS ticket — a demoted section with nothing
+  // to show (no commits, short criteria) is not an omission worth reporting.
+  const omitted: IncludeSection[] = [];
+  if (!withCommits && issue.commits.length > 0) omitted.push("commits");
+  if (criteriaTruncated) omitted.push("verifyCriteria");
+
   // Derive inbound links by scanning every other issue's outbound list and
   // inverting the kind via INVERSE_LINK_KIND. Single-source — no dual-write.
   const inboundLinks = allIssues.flatMap((other) => {
@@ -258,6 +416,14 @@ export function publicView(issue: Issue, allIssues: Issue[] = []) {
         kind: INVERSE_LINK_KIND[l.kind],
       }));
   });
+  // Window the record log to its newest entries. `record` is append-only and
+  // union-merged by sync, so it only ever grows; an old ticket would otherwise
+  // dominate every read. Newest-N, not newest-N-plus-oldest: the first entry is
+  // near-always the "Created via …" boilerplate, and the ticket's origin is
+  // already in `description` + `createdAt`.
+  const limit = opts.recordLimit ?? 0;
+  const recordOmitted = limit > 0 ? Math.max(0, issue.record.length - limit) : 0;
+  const record = recordOmitted > 0 ? issue.record.slice(-limit) : issue.record;
   return {
     id: issue.id,
     number: issue.number,
@@ -266,15 +432,21 @@ export function publicView(issue: Issue, allIssues: Issue[] = []) {
     priority: issue.priority,
     status: issue.status,
     description: issue.description,
-    verifyCriteria: issue.verifyCriteria,
+    verifyCriteria,
+    ...(criteriaTruncated ? { verifyCriteriaTruncated: true } : {}),
     tags: issue.tags,
     tasks: issue.tasks.map((t) => ({ id: t.id, text: t.text, done: t.done })),
-    record: issue.record.map((r) => ({
+    record: record.map((r) => ({
       at: r.at,
       author: r.author,
       source: r.source,
       text: r.text,
     })),
+    // Only emitted when entries were actually dropped, so an unwindowed read
+    // stays byte-identical to what earlier builds returned.
+    ...(recordOmitted > 0
+      ? { recordCount: issue.record.length, recordOmitted }
+      : {}),
     attachments: issue.attachments.map((a) => ({
       id: a.id,
       name: a.name,
@@ -285,13 +457,58 @@ export function publicView(issue: Issue, allIssues: Issue[] = []) {
     })),
     links: issue.links.map((l) => ({ targetId: l.targetId, kind: l.kind })),
     inboundLinks,
-    commits: issue.commits.map((c) => ({ sha: c.sha, at: c.at })),
+    // Always present so the shape stays predictable; the sha list itself is
+    // opt-in because it grows without bound and the agent reported it.
+    commitCount: issue.commits.length,
+    ...(withCommits
+      ? { commits: issue.commits.map((c) => ({ sha: c.sha, at: c.at })) }
+      : {}),
     createdAt: issue.createdAt,
     // Surfaced so a polling agent can see a close request it made is still
     // pending (non-null) vs. denied (cleared back to null); an approved close
     // makes the ticket Closed, which the read gate then hides.
     pendingClose: issue.pendingClose,
+    // Name what was withheld, in the exact spelling `include` expects, and only
+    // when something actually was. tools/list is deferred and the workflow
+    // prompt has a hard byte budget, so the response is the cheapest place to
+    // advertise the escape hatch — right where an agent would want it.
+    ...(omitted.length ? { omitted } : {}),
   };
+}
+
+/**
+ * Minimal projection for the rule-7 approval poll: an agent waiting on a human
+ * to accept a `request_ticket_complete` needs `status` and `pendingClose` and
+ * nothing else, but was re-fetching the whole ticket — description, record and
+ * all — on every poll.
+ */
+export function statusView(issue: Issue) {
+  return {
+    id: issue.id,
+    number: issue.number,
+    title: issue.title,
+    status: issue.status,
+    pendingClose: issue.pendingClose,
+    tasks: {
+      total: issue.tasks.length,
+      done: issue.tasks.filter((t) => t.done).length,
+    },
+  };
+}
+
+/**
+ * Resolve read-shaping options from config. Mirrors `readWorkflowPrompt` — the
+ * config lookup lives here, at the call site, never inside the pure
+ * projections (which keep unlimited defaults so their meaning can't shift).
+ * Falls back to the default on any non-integer or negative value.
+ */
+export function readMcpViewOptions(): { recordLimit: number } {
+  const cfg = vscode.workspace.getConfiguration("dostuff");
+  const raw = cfg.get<number>("mcp.recordLimit", DEFAULT_RECORD_LIMIT);
+  if (!Number.isInteger(raw) || (raw as number) < 0) {
+    return { recordLimit: DEFAULT_RECORD_LIMIT };
+  }
+  return { recordLimit: Math.min(raw as number, MAX_RECORD_LIMIT) };
 }
 
 export function readWorkflowPrompt(): string {
@@ -336,11 +553,18 @@ export function getWorkspaceContext(): { name: string; rootPath: string } | null
 
 // ----- Pure tool handlers (exported for tests) -------------------------------
 
-export type GetTicketInput = { query: string };
+export type GetTicketInput = {
+  query: string;
+  view?: "full" | "status";
+  recordLimit?: number;
+  include?: IncludeSection[];
+};
 export type ListIssuesInput = {
   type?: "Bug" | "Feature" | "Refactor" | "Chore" | "Spike";
   priority?: "Critical" | "High" | "Regular" | "Low";
   status?: Status;
+  limit?: number;
+  offset?: number;
 };
 export type CreateTicketInput = {
   title: string;
@@ -441,12 +665,25 @@ export async function runGetTicket(
     );
   }
 
+  // The poll view deliberately drops the workflow pointer too: an agent in the
+  // rule-7 wait loop already has the rules, and the pointer is ~a quarter of
+  // this payload.
+  // Compact from here down. These payloads are consumed by a model, not read
+  // by eye, and the indentation on a nested ticket costs more bytes than the
+  // description does. The collection resource already made this trade.
+  if (args.view === "status") {
+    return ToolResultOk(
+      JSON.stringify({ workspace: getWorkspaceContext(), ticket: statusView(match) }),
+    );
+  }
+
+  const recordLimit = args.recordLimit ?? readMcpViewOptions().recordLimit;
   return ToolResultOk(
-    JSON.stringify(
-      { workspace: getWorkspaceContext(), workflow: WORKFLOW_POINTER, ticket: publicView(match, all) },
-      null,
-      2,
-    ),
+    JSON.stringify({
+      workspace: getWorkspaceContext(),
+      workflow: WORKFLOW_POINTER,
+      ticket: publicView(match, all, { recordLimit, include: args.include ?? [] }),
+    }),
   );
 }
 
@@ -465,7 +702,7 @@ export async function runListIssues(
 ): Promise<ToolResult> {
   const parsed = ListIssuesSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for list_issues: ${parsed.error.message}`);
-  const { type, priority, status } = parsed.data;
+  const { type, priority, status, limit, offset } = parsed.data;
 
   let issues = store.list();
   if (type)     issues = issues.filter((i) => i.type === type);
@@ -473,13 +710,24 @@ export async function runListIssues(
   if (status)   issues = issues.filter((i) => i.status === status);
   issues = [...issues].sort((a, b) => a.number - b.number);
 
+  // Offset, not a cursor: the sort is deterministic on `number`, so a stateless
+  // offset is stable without the server holding cursor state. `count` stays the
+  // TOTAL matching — callers rely on it to know the board size — with the page
+  // size reported separately as `returned`.
+  const count = issues.length;
+  const page = issues.slice(offset, offset + limit);
+  const nextOffset = offset + page.length;
+
   return ToolResultOk(
     JSON.stringify(
       {
         workspace: getWorkspaceContext(),
         workflow: WORKFLOW_POINTER,
-        count: issues.length,
-        issues: issues.map((i) => ({
+        count,
+        returned: page.length,
+        // Only present when there is actually another page to ask for.
+        ...(nextOffset < count ? { nextOffset } : {}),
+        issues: page.map((i) => ({
           id:       i.id,
           number:   i.number,
           title:    i.title,
@@ -541,7 +789,7 @@ export async function runCreateTicket(
     status: "Thinking",
     verifyCriteria: validated.verifyCriteria ?? "",
     tasks: (validated.tasks ?? []).map((text) => ({
-      id: `t-${randomUUID()}`,
+      id: newTaskId(),
       text,
       done: false,
       updatedAt: now,
@@ -718,12 +966,23 @@ export async function runUpdateTicketProgress(
     commits: newCommits,
   };
   await store.upsert(next);
+  // Echo only what changed. This used to return every task id on the ticket —
+  // a dozen 38-char uuids the caller already had — on the most frequently
+  // called write in the workflow. The caller supplied these ids; the rest it
+  // can read from `get_ticket`.
+  const changedIds = new Set(taskUpdates.map((u) => u.id));
   return ToolResultOk(
     JSON.stringify(
       {
         workspace: getWorkspaceContext(),
         id: next.id,
-        tasks: next.tasks.map((t) => ({ id: t.id, done: t.done })),
+        tasksChanged: next.tasks
+          .filter((t) => changedIds.has(t.id))
+          .map((t) => ({ id: t.id, done: t.done })),
+        tasks: {
+          total: next.tasks.length,
+          done: next.tasks.filter((t) => t.done).length,
+        },
         recordLength: next.record.length,
         commitCount: next.commits.length,
       },
@@ -784,7 +1043,7 @@ export async function runUpdateTicketDraft(
     // Replace the task list wholesale with fresh ids — drafts aren't being
     // worked yet, so there's no done-state correlation worth preserving.
     next.tasks = validated.tasks.map((t) => ({
-      id: `t-${randomUUID()}`,
+      id: newTaskId(),
       text: t.text,
       done: t.done ?? false,
     }));
@@ -1257,28 +1516,32 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
     {
       title: "DoStuff tickets (Thinking + active lanes)",
       description:
-        "All tickets currently in a non-terminal state (Thinking, Planned, Working, Verification). Complete and Closed are hidden.",
+        "Summary index of every non-terminal ticket. Fetch a full body from dostuff://tickets/{id}.",
       mimeType: "application/json",
     },
     async (uri) => {
-      const all = store.list();
-      const servable = all
+      // Summary rows, not full bodies. Mapping `publicView` here was O(N) full
+      // tickets *and* O(N²) inbound-link scans; on a 25-ticket board that is
+      // ~116 KB per read, nearly all of it description and record log the
+      // agent did not ask for. One `detailUriTemplate` replaces a per-row uri.
+      const tickets = store
+        .list()
         .filter((i) => AGENT_VISIBLE_STATUSES.includes(i.status))
-        .map((i) => publicView(i, all));
+        .map(summaryView);
       return {
         contents: [
           {
             uri: uri.href,
             mimeType: "application/json",
-            text: JSON.stringify(
-              {
-                workspace: getWorkspaceContext(),
-                workflow: WORKFLOW_POINTER,
-                tickets: servable,
-              },
-              null,
-              2,
-            ),
+            // Compact on purpose — these rows are uniform and shallow, so the
+            // indentation bought readability that nothing was consuming.
+            text: JSON.stringify({
+              workspace: getWorkspaceContext(),
+              workflow: WORKFLOW_POINTER,
+              count: tickets.length,
+              detailUriTemplate: "dostuff://tickets/{id}",
+              tickets,
+            }),
           },
         ],
       };
@@ -1297,7 +1560,10 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
     async (uri, variables) => {
       const raw = variables.id;
       const id = Array.isArray(raw) ? String(raw[0] ?? "") : String(raw ?? "");
-      const issue = store.get(id);
+      // One materialization, used for both the lookup and the inbound-link
+      // derivation — this handler used to call store.get() then store.list().
+      const all = store.list();
+      const issue = all.find((i) => i.id === id);
       if (!issue) {
         throw new Error(`Ticket ${id} not found`);
       }
@@ -1311,14 +1577,16 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
           {
             uri: uri.href,
             mimeType: "application/json",
-            text: JSON.stringify(
-              {
-                workflow: WORKFLOW_POINTER,
-                ticket: publicView(issue, store.list()),
-              },
-              null,
-              2,
-            ),
+            // Compact, and default-shaped: a resource is a bare URI template
+            // with nowhere to put an `include` argument. An agent that needs a
+            // demoted section calls `get_ticket`.
+            text: JSON.stringify({
+              workflow: WORKFLOW_POINTER,
+              ticket: publicView(issue, all, {
+                recordLimit: readMcpViewOptions().recordLimit,
+                include: [],
+              }),
+            }),
           },
         ],
       };
@@ -1427,11 +1695,19 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
     {
       title: "Get ticket",
       description:
-        "Look up a ticket and return its full content + the workflow prompt. " +
-        "`query` may be a ticket number (e.g. '#42' or '42'), an id (e.g. 'DS-042'), " +
-        "or a case-insensitive substring of the ticket title. Thinking, Planned, " +
-        "Working, and Verification tickets are servable; Complete and Closed are rejected.",
+        "Look up a ticket and return its full content. `query` may be a ticket " +
+        "number (e.g. '#42' or '42'), an id (e.g. 'DS-042'), or a case-insensitive " +
+        "substring of the title. Non-terminal tickets only.",
       inputSchema: GET_TICKET_INPUT,
+      // Claude Code dispatches read-only tools concurrently; anything without
+      // the hint is serialized against other tool calls to avoid conflicting
+      // mutations. This tool only reads.
+      annotations: { readOnlyHint: true },
+      // `get_ticket({recordLimit: 0})` on a long-lived ticket is a legitimate
+      // call that can produce a large payload. Without this, Claude Code
+      // persists over-threshold results to disk and hands the model a file
+      // reference instead of the ticket. Ceiling is 500,000.
+      _meta: { "anthropic/maxResultSizeChars": 200_000 },
     },
     async (args) => runGetTicket(store, args as GetTicketInput),
   );
@@ -1444,8 +1720,10 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "Return a compact index of all issues (id, number, title, type, priority, status). " +
         "Use this to discover work: pass `status: 'Planned'` to see tickets ready to pick up, " +
         "or omit all filters to survey the entire board including Thinking and Complete. " +
+        "Paged — `count` is the total matching, `returned` this page; follow `nextOffset` if present. " +
         "To fetch the full content of a ticket, use `get_ticket` with its id or number.",
       inputSchema: LIST_ISSUES_INPUT,
+      annotations: { readOnlyHint: true },
     },
     async (args) => runListIssues(store, args as ListIssuesInput),
   );
@@ -1491,7 +1769,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "Optionally pass `commit` (a git sha) when you have committed work for this ticket — " +
         "it is appended to the ticket's commits list so the ticket records what it changed. " +
         "Title, priority, type, and verifyCriteria are not modifiable here (edit the description via update_ticket_description). " +
-        "Allowed on Thinking, Planned, Working, and Verification tickets; Complete and Closed are rejected. " +
+        "Non-terminal tickets only. " +
         "To reshape a draft's tags/links/task-list, use update_ticket_draft (Thinking only).",
       inputSchema: PROGRESS_INPUT,
     },
@@ -1518,8 +1796,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
     {
       title: "Update ticket description",
       description:
-        "Replace a ticket's description. Allowed on Thinking, Planned, Working, and " +
-        "Verification tickets; Complete and Closed are rejected. Only the description " +
+        "Replace a ticket's description. Non-terminal tickets only. Only the description " +
         "changes (plus a record entry) — title, priority, type, and verifyCriteria stay locked.",
       inputSchema: DESCRIPTION_INPUT,
     },
@@ -1536,7 +1813,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "DoStuff, where a human approves (moving it to Closed, the \"won't do\" state) or " +
         "denies. Allowed on any non-terminal ticket. For FINISHED work use " +
         "request_ticket_complete instead — the two are distinct so history records why a " +
-        "ticket left the board. Poll get_ticket to see the outcome.",
+        "ticket left the board. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
     async (args) => runRequestTicketClose(store, args as RequestCloseInput),
@@ -1552,7 +1829,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "(moving it to Complete) or denies. Only allowed while the ticket is in " +
         "Verification — move it there with update_ticket_status when the work is ready " +
         "for review. For a ticket that is no longer needed, use request_ticket_close " +
-        "instead. Poll get_ticket to see the outcome.",
+        "instead. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
     async (args) => runRequestTicketComplete(store, args as RequestCloseInput),

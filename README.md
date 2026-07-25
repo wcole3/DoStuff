@@ -99,6 +99,7 @@ Run **DoStuff: Export Issues (JSON)…** or **DoStuff: Import Issues (JSON)…**
 | `dostuff.mcp.port` | number | `0` | Localhost port for this workspace's MCP server. `0` lets the OS pick an ephemeral port each session. Set a fixed value to keep `mcp.json` URLs stable. Easiest set: **DoStuff: Pin MCP Port to Workspace**. Window-scoped. |
 | `dostuff.mcp.workspaceOverride` | string | `""` | Absolute path to advertise in the multi-workspace registry. Leave blank to use the first workspace folder. Window-scoped. |
 | `dostuff.mcp.instructions` | string | (built-in workflow prompt) | System-level workflow prompt served as MCP initialize instructions and at `dostuff://instructions/workflow`. Leave blank to use the default. User-level only. |
+| `dostuff.mcp.recordLimit` | number | `3` | Newest record entries included when a ticket is served over MCP. The record log is append-only and never shrinks, so an old ticket would otherwise dominate every agent read. `0` = no limit. Agents override per call with `get_ticket`'s `recordLimit`. Window-scoped. |
 | `dostuff.sync.enabled` | boolean | `false` | Sync the ticket board across clones through a hidden git ref. Off = exactly current single-writer behavior. Window-scoped. |
 | `dostuff.sync.remote` | string | `origin` | Git remote used to fetch/push the sync ref. |
 | `dostuff.sync.ref` | string | `refs/dostuff/state` | Full ref name the ticket state is stored under (must start with `refs/`). |
@@ -237,68 +238,78 @@ The full prompt is served **once per connection** as the MCP server's initialize
 This is intentionally terse.
 
 ```text
-You are an engineering agent working the DoStuff issue queue.
+DoStuff is this workspace's engineering ticket queue. Reach for these tools
+whenever the task involves finding, starting, updating, or filing work.
 
-Address tickets by number ("42"), id ("DS-042"), or a title substring — e.g.
-"get ticket 42 and begin work" or "start on the OAuth ticket" (use `get_ticket`).
-Discover work via `list_issues` or the `dostuff://tickets` resource (Thinking +
-active lanes; Complete/Closed hidden). Read the description and verify criteria
-before starting.
+You may NOT change a ticket's title, priority, type, or verify criteria over
+MCP, and only a human can set Complete or Closed. If those are wrong, say so or
+file a new ticket.
 
-Rules:
-  1. `update_ticket_status` moves tickets among Thinking, Planned, Working, and
-     Verification: promote a draft out of Thinking, shuffle the active lanes, or
-     demote back to Thinking. Set "Working" when you start, "Verification" when
-     ready for review. Only a human can set Complete or Closed; if verification
-     fails, move the ticket back to "Working".
-  2. Active lanes (Planned, Working, Verification) are capped at 6 tickets
-     each; over-cap moves are rejected, including promotions. Thinking is uncapped.
-  3. As you work, call `update_ticket_progress` to tick tasks and append a terse,
-     factual note to the ticket's record. When you commit code for a ticket, pass
-     the commit sha in the same call (`commit: "<full sha>"`) so the ticket
-     records what it changed.
-  4. `update_ticket_description` corrects or expands the description of any
-     non-terminal ticket.
-  5. File follow-up work with `create_ticket`; new tickets land in "Thinking" for
-     human triage. Optionally pass `links: [{ targetId, kind }]`
-     (kinds: blocks, child-of, relates-to).
-  6. Reshape a ticket's tags, links, or task list with `update_ticket_draft` —
-     Thinking only. Once triaged, scope locks; demote the ticket back to Thinking
-     first if its scope genuinely needs reshaping.
-  7. When the work is finished, move the ticket to "Verification" and call
-     `request_ticket_complete`. It does not change status — a human accepts
-     (→ Complete) or denies in DoStuff. Poll `get_ticket` for the outcome.
-  8. When a ticket is OBE — no longer needed, superseded, or won't be done —
-     call `request_ticket_close` instead. Same approval flow, but approval
-     moves it to Closed ("won't do"). Keep the two distinct: close is for
-     dropped work, complete is for finished work.
+Find work with `list_issues` or the `dostuff://tickets` resource, then
+`get_ticket` by number ("42"), id ("DS-042"), or title substring. Read the
+description and verify criteria before starting.
 
-You may NOT modify a ticket's title, priority, type, or verify criteria via
-MCP. If those are wrong, file a new ticket.
+`update_ticket_status` moves a ticket among Thinking, Planned, Working, and
+Verification (active lanes cap at 6 each; Thinking is uncapped). Set Working
+when you start. As you go, `update_ticket_progress` ticks tasks, appends a
+terse factual note, and records the sha of each commit you make. When the work
+is done move to Verification and call `request_ticket_complete`; if
+verification fails, move back to Working.
+
+When a ticket is OBE — superseded, or won't be done — call
+`request_ticket_close` instead. Both requests need human approval and neither
+changes status itself: poll `get_ticket` with `view: "status"` for the
+outcome. Keep them distinct — close is dropped work, complete is finished work.
+
+File follow-ups with `create_ticket` (they land in Thinking for triage).
+Reshape a draft's tags, links, or tasks with `update_ticket_draft` — Thinking
+only; demote a ticket back there first if its scope genuinely needs reshaping.
+
+Lead every description with one or two sentences on what the ticket is and why
+it matters; board views show only that opening. Reads return just the newest
+record entries — pass `recordLimit: 0` when you need the full history.
 ```
 
 (The lane-cap number tracks your `dostuff.activeLaneCap` setting.) Override the text per-user via **DoStuff: Edit MCP Workflow Instructions…** or `dostuff.mcp.instructions` in Settings. Leave the setting blank to use the built-in text above.
+
+> **Keep a custom prompt under 2KB.** Claude Code truncates MCP server instructions at 2KB and drops the remainder with no error — a prompt that overruns loses its *tail*, which is where rules usually put the things you least want dropped. The built-in text is ~1.7KB for this reason, and a test enforces the budget. Detail that doesn't fit belongs in a tool's own `description`, which gets its own 2KB.
 
 ### Tools
 
 | Tool | Inputs | Behavior |
 | --- | --- | --- |
-| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring | Returns the ticket plus a one-line workflow pointer (the full prompt is served as MCP initialize instructions and at `dostuff://instructions/workflow`). Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped; outbound `links` and derived `inboundLinks` are included. |
-| `list_issues` | optional `type`, `priority`, `status` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Includes a one-line workflow pointer and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. |
+| `get_ticket` | `query` — `#NN`, `DS-id`, or title substring; optional `view`, `recordLimit`, `include[]` | Returns the ticket plus a one-line workflow pointer (the full prompt is served as MCP initialize instructions and at `dostuff://instructions/workflow`). Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped; outbound `links` and derived `inboundLinks` are included. The append-only `record` log is windowed to its newest `dostuff.mcp.recordLimit` entries (default 3), adding `recordCount`/`recordOmitted` when entries were dropped; `recordLimit: 0` returns the whole log. Commit shas are replaced by `commitCount`, and `verifyCriteria` is truncated past 2,000 chars (flagged with `verifyCriteriaTruncated`); both are restored with `include: ["commits"]` / `include: ["verifyCriteria"]`. Whatever was withheld is named in `omitted`, spelled exactly as `include` expects. `view: "status"` returns only `{id, number, title, status, pendingClose, tasks: {total, done}}` — for the approval-poll loop, so a waiting agent stops re-fetching the description and record on every check. Marked `readOnlyHint`, so Claude Code can dispatch it concurrently. |
+| `list_issues` | optional `type`, `priority`, `status`, `limit`, `offset` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Paged: `limit` defaults to 100 (max 250), `offset` defaults to 0. `count` is the **total matching**, `returned` is this page's size, and `nextOffset` appears only when another page exists. Includes a one-line workflow pointer and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. Marked `readOnlyHint`. |
 | `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
 | `update_ticket_status` | `id`, `status` (one of Thinking / Planned / Working / Verification), optional `note` | Moves a ticket among the non-terminal states — promote a draft out of Thinking, shuffle the active lanes, or demote back to Thinking (uncapped). Honors the active-lane cap. Rejects Complete/Closed as either target or source. |
 | `update_ticket_description` | `id`, `description`, optional `note` | Replaces the ticket's description (and appends one record entry). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Only the description changes — title, priority, type, and verifyCriteria stay locked. |
-| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry`, optional `commit` | Toggles `tasks[].done` and appends one record entry. Optional `commit` (a git sha, 7–40 hex — prefer the full 40) is appended to the ticket's append-only commits list; duplicates ignored. The ticket stores only `{sha, at}` — the UI derives the subject and touched files from your repo lazily. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
+| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry`, optional `commit` | Toggles `tasks[].done` and appends one record entry. Optional `commit` (a git sha, 7–40 hex — prefer the full 40) is appended to the ticket's append-only commits list; duplicates ignored. The ticket stores only `{sha, at}` — the UI derives the subject and touched files from your repo lazily. Responds with `tasksChanged` (only the tasks this call touched) plus `tasks: {total, done}` — it does not echo back every task id on the ticket. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 | `update_ticket_draft` | `id`, optional `tags[]`, `links[]`, `tasks[]` | Reshapes an untriaged draft's tags, links, and/or task list. **Thinking-only** — rejected once the ticket is triaged to an active lane (use the UI after that). Omit a field to leave it unchanged; pass `[]` to clear it. Unknown link targets are dropped. |
-| `request_ticket_close` | `id`, optional `note` | Flags a ticket as **OBE / no longer needed** and awaits human approval — does **not** change status. A human approves (→ Closed, "won't do") or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. For finished work use `request_ticket_complete` instead. Poll `get_ticket` for the outcome. |
-| `request_ticket_complete` | `id`, optional `note` | Flags a ticket's work as **finished** and awaits human acceptance — does **not** change status. A human accepts (→ Complete, stamping `resolvedAt`) or denies in the DoStuff UI. **Verification-only** — move the ticket there first. A completion request replaces a pending close request (and vice versa), recorded in the ticket history. Poll `get_ticket` for the outcome. |
+| `request_ticket_close` | `id`, optional `note` | Flags a ticket as **OBE / no longer needed** and awaits human approval — does **not** change status. A human approves (→ Closed, "won't do") or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. For finished work use `request_ticket_complete` instead. Poll `get_ticket` with `view: "status"` for the outcome. |
+| `request_ticket_complete` | `id`, optional `note` | Flags a ticket's work as **finished** and awaits human acceptance — does **not** change status. A human accepts (→ Complete, stamping `resolvedAt`) or denies in the DoStuff UI. **Verification-only** — move the ticket there first. A completion request replaces a pending close request (and vice versa), recorded in the ticket history. Poll `get_ticket` with `view: "status"` for the outcome. |
 
 ### Resources
 
-- `dostuff://tickets` — list of Thinking + active-lane tickets (Complete and Closed hidden).
-- `dostuff://tickets/{id}` — one Thinking or active-lane ticket.
+- `dostuff://tickets` — **summary index** of Thinking + active-lane tickets (Complete and Closed hidden). One compact row per ticket — `id`, `number`, `title`, `type`, `priority`, `status`, `tags`, a `done/total` task count, and a short `excerpt` of the description's opening paragraph — plus `count` and a single `detailUriTemplate`. Full bodies are deliberately *not* served here: fetch one from `dostuff://tickets/{id}`.
+- `dostuff://tickets/{id}` — one Thinking or active-lane ticket, full body (record windowed as in `get_ticket`).
 - `dostuff://attachments/{ticketId}/{attachmentId}` — raw attachment bytes (base64).
 - `dostuff://instructions/workflow` — the workflow prompt.
+
+Resources are URI templates with nowhere to put arguments, so they always serve the default shape. An agent that needs a demoted section calls `get_ticket` with `include`.
+
+### Why the reads are lean
+
+Everything an MCP tool returns lands in the agent's context window and is paid for on every call, so DoStuff's reads are shaped to be small by default and complete on request:
+
+- **The `record` log is windowed** to its newest few entries (`dostuff.mcp.recordLimit`, default 3). It is append-only and git sync only ever unions it, so on a long-lived ticket it grows without bound and would otherwise dominate every read of that ticket. `recordLimit: 0` returns all of it.
+- **Commit shas collapse to a `commitCount`.** They're shas the agent itself reported, and git holds them authoritatively. `include: ["commits"]` brings the list back.
+- **`verifyCriteria` is truncated past 2,000 characters** — insurance against one verbose ticket taxing every read of it, not something you'll normally hit.
+- **The board listing serves summary rows**, not full ticket bodies. Fetching 25 full tickets to decide which one to work on costs roughly 20× what the index does.
+- Anything withheld is named in **`omitted`**, spelled exactly as `include` expects — so the escape hatch is visible at the moment an agent wants it, rather than only in the tool docs.
+
+If your agents routinely need deeper history, raise `dostuff.mcp.recordLimit`; that is the one knob most worth tuning. `src/measure.bench.test.ts` prints the byte cost of each of these on every `bun test` run if you want to see the tradeoff on your own tickets.
+
+Two Claude Code behaviors also shape this ([docs](https://code.claude.com/docs/en/mcp)): it truncates MCP server instructions at **2KB** silently, and it **defers tool schemas by default** (tool search), so the workflow prompt — not the tool list — is what costs context each session. Both are why the built-in prompt is terse and leads with what the server is for.
 
 ## Multi-workspace agent discovery
 
@@ -328,13 +339,18 @@ Legacy `<id>.json` ticket files from earlier versions are migrated into the DB o
 
 On first use, DoStuff writes a nested `.gitignore` inside the storage folder so the DB and attachments are excluded from Git even when `.vscode/` is tracked. The gitignore itself is kept trackable (via `!.gitignore`) so teammates can see why their tickets aren't there. Disable via `dostuff.writeStorageGitignore: false`.
 
-**Known limitation**: the ticket DB is single-writer. Each clone keeps its own local board, and opening the *same* workspace in two VSCode windows at once can silently overwrite edits (last save wins). Multi-clone sync is planned — see [Roadmap](#roadmap).
+**With sync off (the default), the ticket DB is single-writer.** Each clone keeps its own local board, and opening the *same* workspace in two VSCode windows at once can silently overwrite edits (last save wins). Turning on [git sync](#sharing-tickets-across-clones-git-sync) fixes both: clones converge through a hidden git ref, and two windows on one workspace reconcile within ~15 seconds.
 
 ## Roadmap
 
-**Shared ticket boards via git (planned, not yet shipped).** The next major feature syncs the ticket DB across clones and contributors with zero infrastructure: ticket state is stored as git objects under a hidden ref (`refs/dostuff/state`) — no files in your working tree, no PR noise, no server, no new dependencies. You push and pull tickets through the same remote you already use; conflicts resolve automatically (per-ticket last-write-wins with deterministic id-collision renumbering), and MCP-connected agents keep working against the local board, which converges with everyone else's. It also fixes the two-windows-clobbering limitation above. Opt-in via a `dostuff.sync.enabled` setting; off means exactly today's behavior.
+Nothing committed yet — [git sync](#sharing-tickets-across-clones-git-sync) was the headline item and has shipped. Design docs for it live in [docs/plans/ticket-sync/](docs/plans/ticket-sync/00-overview.md); they're a historical record of how it was built, not a description of current behavior.
 
-Full design docs live in [docs/plans/ticket-sync/](docs/plans/ticket-sync/00-overview.md).
+Ideas under consideration, none promised:
+
+- **Sync status per ticket** — surfacing which tickets are ahead of the remote, rather than only a global status-bar state.
+- **Richer agent read shaping** — the `include` mechanism currently covers commits and verify criteria; attachments and status history are the obvious next candidates if reads get heavy again.
+
+If you want something, open an issue — the roadmap is mostly "what someone asked for."
 
 ## Building from source
 
@@ -348,6 +364,35 @@ bun run package
 `bun run package` produces a `.vsix`. In VSCode, right-click the file and choose **Install Extension VSIX**.
 
 ## Changelog
+
+<details open>
+<summary><strong>v2.0.0</strong> (unreleased) — shared ticket boards via git, leaner MCP reads</summary>
+
+**Added**
+
+- **Git ticket sync** — share a ticket board across clones and contributors with no server and no new dependencies. Ticket state lives as git objects under a hidden ref (`refs/dostuff/state`) that never touches your worktree, branches, or PRs; you push and pull tickets over the remote you already use. Opt in with `dostuff.sync.enabled` or **DoStuff: Toggle Git Ticket Sync**; **DoStuff: Sync Tickets Now** forces a cycle, and a `$(sync)` status-bar item shows state and doubles as the button. Off by default, and off means exactly the old single-writer behavior.
+  - Offline-first: local edits always commit to the ref and pushes retry on the next cycle (`dostuff.sync.intervalMinutes`, default 5).
+  - Conflicts resolve without prompting — per-ticket last-writer-wins on `updatedAt` with a deterministic content-hash tiebreak, per-task and per-attachment LWW for concurrent delete-vs-edit, and append-only union for history and records. Replicas converge; clock skew biases who wins a concurrent edit but never causes divergence. Deletes propagate as tombstones, GC'd after 90 days.
+  - Two clones that filed tickets independently collide on `DS-NNN`; the first sync renumbers deterministically (oldest ticket keeps its number) and both sides toast the rename list.
+  - Attachments sync too, under `dostuff.sync.syncAttachments` with a per-file ceiling (`dostuff.sync.maxAttachmentSyncBytes`, default 5 MB).
+  - Sync is invisible to MCP agents — every write boundary holds unchanged. One caveat: after a renumbering merge, a `DS-NNN` an agent memorized mid-session can change, and it recovers via `list_issues` / `get_ticket` by title.
+
+**Fixed**
+
+- **Enabling sync also fixes same-machine clobbering.** Two VSCode windows on one workspace previously overwrote each other's edits (last save wins); with sync on they converge within ~15 seconds.
+- **The workflow prompt was being silently truncated.** Claude Code cuts MCP server instructions at 2KB; the prompt had grown to 2,830 bytes, so ~780 bytes were dropped — taking the OBE/close flow and the "you may not change title, priority, type, or verify criteria" contract with it. Agents were never seeing either. The prompt is rewritten to ~1.7KB with every rule intact, and a test now enforces the budget.
+
+**Changed**
+
+- **MCP reads are substantially smaller.** A ticket read on a well-worked ticket drops ~50%: the append-only `record` log is now windowed to its newest few entries (`dostuff.mcp.recordLimit`, default 3), commit shas collapse to a `commitCount`, long `verifyCriteria` is truncated, and single-ticket payloads are no longer pretty-printed. `get_ticket` gained `include: ["commits" | "verifyCriteria"]` to restore any of it, and every response names what it withheld in `omitted`.
+- **`dostuff://tickets` serves a summary index**, not full ticket bodies — ~95% smaller on a 25-ticket board. Each row carries an `excerpt` of the description's opening paragraph, so **lead your descriptions with the point**.
+- **`get_ticket` gained `view: "status"`** for the approval-poll loop — the wait after `request_ticket_complete` no longer re-sends the whole ticket on every check.
+- **`list_issues` is paged** (`limit`, default 100, max 250; `offset`). `count` stays the total matching; `returned` and `nextOffset` describe the page.
+- **`update_ticket_progress` echoes only what changed** — `tasksChanged` plus a `{total, done}` count, instead of every task id on the ticket.
+- `get_ticket` and `list_issues` are marked `readOnlyHint`, so Claude Code can dispatch them concurrently rather than serializing them.
+- Task ids minted over MCP now use the same short format the UI has always used. Existing ids keep working untouched.
+
+</details>
 
 <details>
 <summary><strong>v1.1.0</strong> — graph view, ticket links, MCP draft editing</summary>

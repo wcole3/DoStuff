@@ -96,6 +96,37 @@ describe("normalize", () => {
     expect(issue.pendingClose).toBeNull();
   });
 
+  test("preserves legacy t-<uuid> task ids verbatim (MCP now mints a shorter form)", () => {
+    // Task ids are persisted (issue_tasks.task_id) and are the per-element LWW
+    // merge key in syncMerge. Changing the format NEW ids are minted in must
+    // never rewrite ids already on disk — normalize is the load-side boundary.
+    const legacy = {
+      id: "DS-051",
+      number: 51,
+      title: "legacy tasks",
+      type: "Bug",
+      priority: "High",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      tasks: [
+        { id: "t-3f2504e0-4f89-11d3-9a0c-0305e82c3301", text: "uuid era", done: true },
+        { id: "tm8x2k1abc123", text: "short era", done: false },
+      ],
+    } as unknown as Issue;
+
+    const { issue, coerced } = normalize(legacy);
+
+    expect(coerced).toEqual([]);
+    expect(issue.tasks.map((t) => t.id)).toEqual([
+      "t-3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "tm8x2k1abc123",
+    ]);
+    expect(issue.tasks[0].done).toBe(true);
+    expect(issue.tasks[1].done).toBe(false);
+  });
+
   test("defaults a missing pendingClose to null and coerces a malformed one to null", () => {
     const missing = {
       id: "DS-050",

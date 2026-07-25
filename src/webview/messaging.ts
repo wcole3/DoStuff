@@ -272,6 +272,6 @@ export function clearExternalDragLocal(): void {
   }
 }
 
-export function newTaskId(): string {
-  return "t" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
+// Re-exported so existing webview imports keep working; the implementation now
+// lives in `src/ids.ts` so the MCP tools mint the same format.
+export { newTaskId } from "../ids";

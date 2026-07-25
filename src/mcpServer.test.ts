@@ -30,10 +30,18 @@ import {
   registerMcpTools,
   getWorkspaceContext,
   publicView,
+  summaryView,
+  statusView,
+  excerpt,
+  DEFAULT_RECORD_LIMIT,
+  MAX_VERIFY_CRITERIA_CHARS,
   DoStuffMcpServer,
   DEFAULT_WORKFLOW_PROMPT,
   WORKFLOW_POINTER,
+  buildDefaultWorkflowPrompt,
+  PROMPT_BYTE_BUDGET,
   type CreateTicketInput,
+  type GetTicketInput,
   type ToolResult,
 } from "./mcpServer";
 import { ACTIVE_LANE_CAP, type Issue, type Priority, type IssueType, type Status } from "./types";
@@ -96,6 +104,277 @@ function payload(r: ToolResult): unknown {
 
 beforeEach(() => {
   makeIssue.reset();
+});
+
+// ----- read-shaping projections ---------------------------------------------
+
+function recordEntries(n: number, prefix = "entry") {
+  return Array.from({ length: n }, (_, i) => ({
+    at: `2025-06-01T00:${String(i).padStart(2, "0")}:00.000Z`,
+    author: "agent" as const,
+    text: `${prefix}-${i}`,
+  }));
+}
+
+describe("excerpt", () => {
+  test("returns '' for blank, whitespace, or non-string input", () => {
+    expect(excerpt("")).toBe("");
+    expect(excerpt("   \n\n  ")).toBe("");
+    expect(excerpt(undefined)).toBe("");
+    expect(excerpt(null)).toBe("");
+    expect(excerpt(42)).toBe("");
+  });
+
+  test("skips a leading markdown heading and excerpts the prose", () => {
+    expect(excerpt("## Problem\n\nThe sync loop clobbers edits.")).toBe(
+      "The sync loop clobbers edits.",
+    );
+  });
+
+  test("skips several leading headings and blank lines", () => {
+    expect(excerpt("\n\n# Title\n\n### Sub\n\nActual prose here.")).toBe(
+      "Actual prose here.",
+    );
+  });
+
+  test("returns '' when the description is only structure", () => {
+    expect(excerpt("## Problem\n\n### Detail")).toBe("");
+  });
+
+  test("stops at the first paragraph break and stays under max", () => {
+    const out = excerpt("First para.\n\nSecond para that should not appear.", 140);
+    expect(out).toBe("First para.");
+    expect(out.length).toBeLessThan(140);
+  });
+
+  test("collapses newlines and runs of whitespace inside one paragraph", () => {
+    expect(excerpt("wrapped line one\nline   two")).toBe("wrapped line one line two");
+  });
+
+  test("cuts on a word boundary and appends an ellipsis when longer than max", () => {
+    const out = excerpt("alpha bravo charlie delta echo", 14);
+    expect(out).toBe("alpha bravo…");
+    expect(out.endsWith("…")).toBe(true);
+    // Never emits a dangling partial word.
+    expect(out).not.toContain("char");
+  });
+
+  test("does not append an ellipsis when the text fits exactly", () => {
+    expect(excerpt("exactly", 7)).toBe("exactly");
+  });
+});
+
+describe("summaryView", () => {
+  test("omits the heavy fields entirely", () => {
+    const row = summaryView(
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Working",
+        description: "Some prose.",
+        verifyCriteria: "must pass",
+        record: recordEntries(5),
+      }),
+    ) as Record<string, unknown>;
+    for (const heavy of [
+      "description",
+      "record",
+      "verifyCriteria",
+      "attachments",
+      "links",
+      "inboundLinks",
+      "commits",
+      "pendingClose",
+    ]) {
+      expect(heavy in row).toBe(false);
+    }
+  });
+
+  test("renders tasks as a done/total string", () => {
+    const row = summaryView(
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        tasks: [
+          { id: "t1", text: "a", done: true },
+          { id: "t2", text: "b", done: false },
+          { id: "t3", text: "c", done: true },
+        ],
+      }),
+    );
+    expect(row.tasks).toBe("2/3");
+  });
+
+  test("omits the excerpt key when the description is blank", () => {
+    const row = summaryView(makeIssue({ id: "DS-001", number: 1, description: "" }));
+    expect("excerpt" in row).toBe(false);
+  });
+
+  test("carries an excerpt when the description has prose", () => {
+    const row = summaryView(
+      makeIssue({ id: "DS-001", number: 1, description: "## Why\n\nBecause it breaks." }),
+    ) as { excerpt?: string };
+    expect(row.excerpt).toBe("Because it breaks.");
+  });
+});
+
+describe("publicView demoted sections", () => {
+  const withCommits = (n: number) =>
+    makeIssue({
+      id: "DS-001",
+      number: 1,
+      commits: Array.from({ length: n }, (_, i) => ({
+        sha: String(i).padStart(40, "0"),
+        at: "2026-01-01T00:00:00.000Z",
+      })),
+    });
+
+  test("pure-function default keeps every section (call sites opt in to demotion)", () => {
+    const view = publicView(withCommits(3)) as Record<string, unknown>;
+    expect(view.commits).toHaveLength(3);
+    expect(view.commitCount).toBe(3);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("include: [] demotes commits to a count and names the omission", () => {
+    const view = publicView(withCommits(6), [], { include: [] }) as Record<string, unknown>;
+    expect("commits" in view).toBe(false);
+    expect(view.commitCount).toBe(6);
+    expect(view.omitted).toEqual(["commits"]);
+  });
+
+  test('include: ["commits"] restores the sha list', () => {
+    const view = publicView(withCommits(6), [], { include: ["commits"] }) as Record<
+      string,
+      unknown
+    >;
+    expect(view.commits).toHaveLength(6);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("a ticket with no commits reports no omission", () => {
+    // Demoted-but-empty is not an omission worth spending bytes on.
+    const view = publicView(withCommits(0), [], { include: [] }) as Record<string, unknown>;
+    expect(view.commitCount).toBe(0);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("verifyCriteria truncates past the ceiling, flags it, and include restores it", () => {
+    const long = "x".repeat(MAX_VERIFY_CRITERIA_CHARS + 500);
+    const issue = makeIssue({ id: "DS-001", number: 1, verifyCriteria: long });
+
+    const trimmed = publicView(issue, [], { include: [] }) as Record<string, unknown>;
+    expect((trimmed.verifyCriteria as string).length).toBe(MAX_VERIFY_CRITERIA_CHARS + 1); // + ellipsis
+    expect(trimmed.verifyCriteriaTruncated).toBe(true);
+    expect(trimmed.omitted).toEqual(["verifyCriteria"]);
+
+    const full = publicView(issue, [], { include: ["verifyCriteria"] }) as Record<string, unknown>;
+    expect(full.verifyCriteria).toBe(long);
+    expect("verifyCriteriaTruncated" in full).toBe(false);
+  });
+
+  test("short verifyCriteria is untouched and unflagged", () => {
+    const issue = makeIssue({ id: "DS-001", number: 1, verifyCriteria: "tests pass" });
+    const view = publicView(issue, [], { include: [] }) as Record<string, unknown>;
+    expect(view.verifyCriteria).toBe("tests pass");
+    expect("verifyCriteriaTruncated" in view).toBe(false);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("omitted lists every withheld section, spelled as include expects", () => {
+    const issue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      verifyCriteria: "y".repeat(MAX_VERIFY_CRITERIA_CHARS + 1),
+      commits: [{ sha: "a".repeat(40), at: "2026-01-01T00:00:00.000Z" }],
+    });
+    const view = publicView(issue, [], { include: [] }) as { omitted: string[] };
+    expect(view.omitted.sort()).toEqual(["commits", "verifyCriteria"]);
+  });
+});
+
+describe("publicView record windowing", () => {
+  test("defaults to the whole log when no limit is passed", () => {
+    const view = publicView(makeIssue({ id: "DS-001", number: 1, record: recordEntries(40) }));
+    expect(view.record).toHaveLength(40);
+    // No windowing keys on an unwindowed read — byte-identical to prior builds.
+    expect("recordCount" in view).toBe(false);
+    expect("recordOmitted" in view).toBe(false);
+  });
+
+  test("recordLimit: 0 is explicit 'no limit'", () => {
+    const view = publicView(
+      makeIssue({ id: "DS-001", number: 1, record: recordEntries(40) }),
+      [],
+      { recordLimit: 0 },
+    );
+    expect(view.record).toHaveLength(40);
+    expect("recordOmitted" in view).toBe(false);
+  });
+
+  test("keeps the NEWEST entries and reports what it dropped", () => {
+    const view = publicView(
+      makeIssue({ id: "DS-001", number: 1, record: recordEntries(40) }),
+      [],
+      { recordLimit: 10 },
+    ) as { record: Array<{ text: string }>; recordCount?: number; recordOmitted?: number };
+    expect(view.record).toHaveLength(10);
+    expect(view.record[0].text).toBe("entry-30");
+    expect(view.record[9].text).toBe("entry-39");
+    expect(view.recordCount).toBe(40);
+    expect(view.recordOmitted).toBe(30);
+  });
+
+  test("does not add windowing keys when the log is shorter than the limit", () => {
+    const view = publicView(
+      makeIssue({ id: "DS-001", number: 1, record: recordEntries(3) }),
+      [],
+      { recordLimit: 10 },
+    );
+    expect(view.record).toHaveLength(3);
+    expect("recordOmitted" in view).toBe(false);
+  });
+
+  test("windowing leaves every other field untouched", () => {
+    const issue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      description: "keep me",
+      verifyCriteria: "keep me too",
+      record: recordEntries(40),
+    });
+    const view = publicView(issue, [], { recordLimit: 5 });
+    expect(view.description).toBe("keep me");
+    expect(view.verifyCriteria).toBe("keep me too");
+    expect("statusHistory" in view).toBe(false);
+  });
+});
+
+describe("statusView", () => {
+  test("carries only what the rule-7 approval poll needs", () => {
+    const view = statusView(
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Verification",
+        description: "long prose",
+        record: recordEntries(20),
+        tasks: [
+          { id: "t1", text: "a", done: true },
+          { id: "t2", text: "b", done: false },
+        ],
+      }),
+    ) as Record<string, unknown>;
+    expect(Object.keys(view).sort()).toEqual([
+      "id",
+      "number",
+      "pendingClose",
+      "status",
+      "tasks",
+      "title",
+    ]);
+    expect(view.tasks).toEqual({ total: 2, done: 1 });
+  });
 });
 
 // ----- get_ticket ------------------------------------------------------------
@@ -343,9 +622,246 @@ describe("get_ticket", () => {
     // It went to substring search, did not find a '#' in "X", returns no-match
     expect(res.content[0].text).toContain("No ticket matches");
   });
+
+  test("serializes compactly — no pretty-print indentation", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "Compact", status: "Working" }),
+    ]);
+    for (const args of [{ query: "DS-001" }, { query: "DS-001", view: "status" as const }]) {
+      const text = (await runGetTicket(store, args)).content[0].text;
+      // Indentation on a nested ticket costs more bytes than the description.
+      expect(text).not.toContain("\n  ");
+      expect(() => JSON.parse(text)).not.toThrow();
+    }
+  });
+
+  test("demotes commits by default and restores them via include", async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Commits",
+        status: "Working",
+        commits: [
+          { sha: "a".repeat(40), at: "2026-01-01T00:00:00.000Z" },
+          { sha: "b".repeat(40), at: "2026-01-02T00:00:00.000Z" },
+        ],
+      }),
+    ]);
+
+    const lean = payload(await runGetTicket(store, { query: "DS-001" })) as {
+      ticket: Record<string, unknown>;
+    };
+    expect("commits" in lean.ticket).toBe(false);
+    expect(lean.ticket.commitCount).toBe(2);
+    expect(lean.ticket.omitted).toEqual(["commits"]);
+
+    const full = payload(
+      await runGetTicket(store, { query: "DS-001", include: ["commits"] }),
+    ) as { ticket: Record<string, unknown> };
+    expect(full.ticket.commits).toHaveLength(2);
+    expect("omitted" in full.ticket).toBe(false);
+  });
+
+  test("rejects an unknown include value", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "Bad include", status: "Working" }),
+    ]);
+    const res = await runGetTicket(store, {
+      query: "DS-001",
+      include: ["statusHistory"] as unknown as GetTicketInput["include"],
+    });
+    expect(res.isError).toBe(true);
+  });
+
+  test('view: "status" returns only the poll fields and drops the workflow pointer', async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Polling",
+        status: "Verification",
+        description: "a long description that must not be re-sent on every poll",
+        record: recordEntries(20),
+      }),
+    ]);
+    const res = await runGetTicket(store, { query: "DS-001", view: "status" });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { ticket: Record<string, unknown>; workflow?: string };
+    expect(body.ticket.id).toBe("DS-001");
+    expect(body.ticket.status).toBe("Verification");
+    expect("description" in body.ticket).toBe(false);
+    expect("record" in body.ticket).toBe(false);
+    // The pointer is a quarter of this payload and the agent already has it.
+    expect("workflow" in body).toBe(false);
+    // Workspace stays — it disambiguates multi-board agents.
+    expect("workspace" in body).toBe(true);
+  });
+
+  test('view defaults to "full" when omitted', async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "Full", status: "Planned", description: "prose" }),
+    ]);
+    const body = payload(await runGetTicket(store, { query: "DS-001" })) as {
+      ticket: Record<string, unknown>;
+      workflow: string;
+    };
+    expect(body.ticket.description).toBe("prose");
+    expect(body.workflow).toBe(WORKFLOW_POINTER);
+  });
+
+  test("windows the record log to the configured default", async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Chatty",
+        status: "Working",
+        record: recordEntries(40),
+      }),
+    ]);
+    const body = payload(await runGetTicket(store, { query: "DS-001" })) as {
+      ticket: { record: Array<{ text: string }>; recordCount: number; recordOmitted: number };
+    };
+    // Pinned deliberately: the record log is the single largest key in a
+    // ticket read, and 3 is a judgment call about how much history an agent
+    // needs to resume after a context loss. Changing it should be a decision,
+    // not a drift.
+    expect(DEFAULT_RECORD_LIMIT).toBe(3);
+    expect(body.ticket.record).toHaveLength(DEFAULT_RECORD_LIMIT);
+    expect(body.ticket.record[DEFAULT_RECORD_LIMIT - 1].text).toBe("entry-39");
+    expect(body.ticket.recordCount).toBe(40);
+    expect(body.ticket.recordOmitted).toBe(40 - DEFAULT_RECORD_LIMIT);
+  });
+
+  test("recordLimit param overrides the default, and 0 returns the whole log", async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Chatty",
+        status: "Working",
+        record: recordEntries(40),
+      }),
+    ]);
+    const three = payload(
+      await runGetTicket(store, { query: "DS-001", recordLimit: 3 }),
+    ) as { ticket: { record: unknown[]; recordOmitted: number } };
+    expect(three.ticket.record).toHaveLength(3);
+    expect(three.ticket.recordOmitted).toBe(37);
+
+    const whole = payload(
+      await runGetTicket(store, { query: "DS-001", recordLimit: 0 }),
+    ) as { ticket: { record: unknown[] } };
+    expect(whole.ticket.record).toHaveLength(40);
+  });
+
+  test("rejects an out-of-range recordLimit and an unknown view", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "X", status: "Planned" }),
+    ]);
+    expect(
+      (await runGetTicket(store, { query: "DS-001", recordLimit: -1 } as never)).isError,
+    ).toBe(true);
+    expect(
+      (await runGetTicket(store, { query: "DS-001", recordLimit: 9_999 } as never)).isError,
+    ).toBe(true);
+    expect(
+      (await runGetTicket(store, { query: "DS-001", view: "brief" } as never)).isError,
+    ).toBe(true);
+  });
 });
 
 // ----- list_issues -----------------------------------------------------------
+
+describe("list_issues paging", () => {
+  const board = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      makeIssue({
+        id: `DS-${String(i + 1).padStart(3, "0")}`,
+        number: i + 1,
+        title: `T${i + 1}`,
+        status: "Planned",
+      }),
+    );
+
+  test("count stays TOTAL matching while returned reports the page", async () => {
+    const store = await makeStore(board(12));
+    const body = payload(await runListIssues(store, { limit: 5 })) as {
+      count: number;
+      returned: number;
+      nextOffset?: number;
+      issues: Array<{ number: number }>;
+    };
+    expect(body.count).toBe(12);
+    expect(body.returned).toBe(5);
+    expect(body.nextOffset).toBe(5);
+    expect(body.issues.map((i) => i.number)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("offset walks the deterministic number sort without gaps or repeats", async () => {
+    const store = await makeStore(board(12));
+    const seen: number[] = [];
+    let offset = 0;
+    for (;;) {
+      const body = payload(await runListIssues(store, { limit: 5, offset })) as {
+        nextOffset?: number;
+        issues: Array<{ number: number }>;
+      };
+      seen.push(...body.issues.map((i) => i.number));
+      if (body.nextOffset === undefined) break;
+      offset = body.nextOffset;
+    }
+    expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
+  test("omits nextOffset on the last page and when everything fits", async () => {
+    const store = await makeStore(board(12));
+    const last = payload(await runListIssues(store, { limit: 5, offset: 10 })) as {
+      returned: number;
+      nextOffset?: number;
+    };
+    expect(last.returned).toBe(2);
+    expect("nextOffset" in last).toBe(false);
+
+    const all = payload(await runListIssues(store, {})) as { nextOffset?: number };
+    expect("nextOffset" in all).toBe(false);
+  });
+
+  test("an offset past the end returns an empty page, not an error", async () => {
+    const store = await makeStore(board(3));
+    const body = payload(await runListIssues(store, { offset: 99 })) as {
+      count: number;
+      returned: number;
+      issues: unknown[];
+    };
+    expect(body.count).toBe(3);
+    expect(body.returned).toBe(0);
+    expect(body.issues).toEqual([]);
+  });
+
+  test("paging composes with filters — count is the filtered total", async () => {
+    const store = await makeStore([
+      ...board(6),
+      makeIssue({ id: "DS-007", number: 7, title: "W", status: "Working" }),
+    ]);
+    const body = payload(await runListIssues(store, { status: "Planned", limit: 2 })) as {
+      count: number;
+      returned: number;
+      issues: Array<{ status: string }>;
+    };
+    expect(body.count).toBe(6);
+    expect(body.returned).toBe(2);
+    expect(body.issues.every((i) => i.status === "Planned")).toBe(true);
+  });
+
+  test("rejects an out-of-range limit or a negative offset", async () => {
+    const store = await makeStore(board(3));
+    expect((await runListIssues(store, { limit: 0 })).isError).toBe(true);
+    expect((await runListIssues(store, { limit: 9_999 })).isError).toBe(true);
+    expect((await runListIssues(store, { offset: -1 })).isError).toBe(true);
+  });
+});
 
 describe("list_issues", () => {
   test("no filters returns all issues sorted by number ascending", async () => {
@@ -536,7 +1052,7 @@ describe("workspace context and workflow in tool responses", () => {
     const res = payload(await runListIssues(store, {})) as { workflow: string };
     expect(res.workflow).toBe(WORKFLOW_POINTER);
     expect(res.workflow.length).toBeLessThan(200);
-    expect(res.workflow).not.toContain("Rules:");
+    expect(res.workflow).not.toContain("update_ticket_status");
   });
 
   test("get_ticket embeds the one-line WORKFLOW_POINTER, not the full prompt", async () => {
@@ -545,7 +1061,37 @@ describe("workspace context and workflow in tool responses", () => {
     ]);
     const res = payload(await runGetTicket(store, { query: "DS-001" })) as { workflow: string };
     expect(res.workflow).toBe(WORKFLOW_POINTER);
-    expect(res.workflow).not.toContain("Rules:");
+    expect(res.workflow).not.toContain("update_ticket_status");
+  });
+});
+
+// ----- workflow prompt byte budget -------------------------------------------
+
+describe("workflow prompt byte budget", () => {
+  // Claude Code truncates server instructions and tool descriptions at 2KB,
+  // silently. A prompt that overruns loses its TAIL — which is where the
+  // close/complete flow and the field-immutability contract live. This suite
+  // is the regression guard; if it fails, cut prose rather than raising the
+  // budget.
+  for (const cap of [1, 6, 12, 50]) {
+    test(`fits PROMPT_BYTE_BUDGET at activeLaneCap=${cap}`, () => {
+      const bytes = Buffer.byteLength(buildDefaultWorkflowPrompt(cap), "utf8");
+      expect(bytes).toBeLessThanOrEqual(PROMPT_BYTE_BUDGET);
+    });
+  }
+
+  test("keeps the rules that used to fall past the truncation point", () => {
+    const prompt = buildDefaultWorkflowPrompt(6);
+    // Everything asserted here was being dropped when the prompt was 2,830
+    // bytes. Each is a safety contract an agent cannot infer from a single
+    // tool description.
+    expect(prompt).toContain("request_ticket_close");
+    expect(prompt).toContain("only a human can set Complete or Closed");
+    expect(prompt).toMatch(/NOT change a ticket's title, priority, type, or verify criteria/);
+    expect(prompt).toContain("recordLimit: 0");
+    // The tool-search trigger: with schemas deferred, this is what tells an
+    // agent the server is worth searching at all.
+    expect(prompt.slice(0, 160)).toMatch(/ticket queue/i);
   });
 });
 
@@ -630,10 +1176,12 @@ describe("create_ticket", () => {
     });
   });
 
-  test("rapid-fire produces unique task ids across many creates (no UUID collisions)", async () => {
+  test("rapid-fire produces unique task ids across many creates (no collisions)", async () => {
     const store = await makeStore([]);
     // Fire 50 creates with NO awaits in between so they overlap. Each create
-    // produces two task ids; collect them all and assert uniqueness.
+    // produces two task ids; collect them all and assert uniqueness. This is
+    // the load-bearing property — task ids are the per-element LWW merge key
+    // in syncMerge, so a duplicate would silently merge two distinct tasks.
     const promises: Promise<ToolResult>[] = [];
     for (let i = 0; i < 50; i++) {
       promises.push(runCreateTicket(store, { title: `T${i}`, tasks: ["a", "b"] }));
@@ -646,9 +1194,12 @@ describe("create_ticket", () => {
     }
     expect(allTaskIds.length).toBe(100);
     expect(new Set(allTaskIds).size).toBe(100);
-    // Sanity: ids follow the t-<uuid> shape.
+    // Shape sanity only — ids are opaque and nothing validates their format.
+    // MCP now mints the same short form the webview always has (`newTaskId`),
+    // rather than `t-<uuid>`; legacy uuid ids keep resolving untouched.
     for (const id of allTaskIds) {
-      expect(id.startsWith("t-")).toBe(true);
+      expect(id.startsWith("t")).toBe(true);
+      expect(id.length).toBeLessThan(20);
     }
   });
 
@@ -1022,6 +1573,79 @@ describe("update_ticket_status", () => {
 // ----- update_ticket_progress ------------------------------------------------
 
 describe("update_ticket_progress", () => {
+  test("echoes only the changed tasks, plus done/total counts", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: Array.from({ length: 12 }, (_, i) => ({
+          id: `t-${"0123456789abcdef".repeat(2)}-${i}`,
+          text: `step ${i}`,
+          done: i < 2,
+        })),
+      }),
+    ]);
+    const target = store.get("DS-001")!.tasks[5].id;
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      taskUpdates: [{ id: target, done: true }],
+    });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as {
+      tasksChanged: Array<{ id: string; done: boolean }>;
+      tasks: { total: number; done: number };
+    };
+    expect(body.tasksChanged).toEqual([{ id: target, done: true }]);
+    expect(body.tasks).toEqual({ total: 12, done: 3 });
+    // The eleven untouched ids must not be echoed back at the caller.
+    expect(res.content[0].text).not.toContain(store.get("DS-001")!.tasks[0].id);
+  });
+
+  test("echoes an empty tasksChanged when only a record entry is appended", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: [{ id: "t1", text: "a", done: false }],
+      }),
+    ]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      recordEntry: "note only",
+    });
+    const body = payload(res) as {
+      tasksChanged: unknown[];
+      tasks: { total: number; done: number };
+      recordLength: number;
+    };
+    expect(body.tasksChanged).toEqual([]);
+    expect(body.tasks).toEqual({ total: 1, done: 0 });
+    expect(body.recordLength).toBe(1);
+  });
+
+  test("legacy t-<uuid> task ids still resolve after the id-format change", async () => {
+    // Storage tenet: task ids are persisted (issue_tasks.task_id) and are the
+    // per-element LWW merge key in syncMerge. Ids minted by earlier builds must
+    // keep working — only NEWLY minted ids change format.
+    const legacyId = "t-3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: [{ id: legacyId, text: "legacy task", done: false }],
+      }),
+    ]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      taskUpdates: [{ id: legacyId, done: true }],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.tasks[0].done).toBe(true);
+    expect(store.get("DS-001")!.tasks[0].id).toBe(legacyId);
+    const body = payload(res) as { tasksChanged: Array<{ id: string }> };
+    expect(body.tasksChanged[0].id).toBe(legacyId);
+  });
+
   test("toggles task.done; other ticket fields are untouched", async () => {
     const store = await makeStore([
       makeIssue({
@@ -2204,6 +2828,59 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     }
   });
 
+  test("MEASURE tools/list and initialize instructions (fixed per-session floor)", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+
+    const tools = await mcpJsonRpc(port, "tools/list", {});
+    const toolsBytes = JSON.stringify((tools.result as { tools: unknown[] }).tools).length;
+
+    const init = await mcpJsonRpc(port, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "measure", version: "0" },
+    });
+    const instructions =
+      (init.result as { instructions?: string }).instructions ?? "";
+
+    const perTool = (tools.result as { tools: Array<{ name: string }> }).tools
+      .map((t) => `    ${t.name.padEnd(26)} ${String(JSON.stringify(t).length).padStart(5)} ch`)
+      .sort()
+      .join("\n");
+    console.log(
+      `\nper-session fixed floor\n  tools/list          ${toolsBytes} ch` +
+        `\n  initialize instrs   ${instructions.length} ch` +
+        `\n  total               ${toolsBytes + instructions.length} ch\n${perTool}`,
+    );
+    // Guard rails, not exact assertions — the point is to notice unbounded
+    // growth, not to pin a number. Note tool schemas are DEFERRED by default in
+    // Claude Code (tool search), so tools/list is not a per-session context
+    // cost the way the instructions are.
+    expect(toolsBytes).toBeLessThan(12_000);
+    expect(Buffer.byteLength(instructions, "utf8")).toBeLessThanOrEqual(
+      PROMPT_BYTE_BUDGET,
+    );
+  });
+
+  test("every tool description fits the 2KB Claude Code ceiling", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+
+    const listed = await mcpJsonRpc(port, "tools/list", {});
+    const tools = (listed.result as {
+      tools: Array<{ name: string; description?: string }>;
+    }).tools;
+    expect(tools.length).toBeGreaterThan(0);
+    for (const t of tools) {
+      const bytes = Buffer.byteLength(t.description ?? "", "utf8");
+      // Same silent-truncation rule as server instructions. Descriptions have
+      // their own budget, so detail pushed out of the workflow prompt can land
+      // here — but not without limit.
+      expect({ tool: t.name, bytes }).toMatchObject({ tool: t.name });
+      expect(bytes).toBeLessThanOrEqual(2048);
+    }
+  });
+
   // Helper: send a JSON-RPC request to /mcp and parse the response.
   async function mcpJsonRpc(
     p: number,
@@ -2247,6 +2924,66 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     for (const t of payload.tickets) {
       expect(["Thinking", "Planned", "Working", "Verification"]).toContain(t.status);
     }
+  });
+
+  test("resource dostuff://tickets serves summary rows, not full ticket bodies", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        title: "Heavy",
+        status: "Working",
+        description: "## Context\n\nSync clobbers edits across two windows.\n\nMore detail here.",
+        verifyCriteria: "must not clobber",
+        record: recordEntries(30),
+        tasks: [
+          { id: "t1", text: "a", done: true },
+          { id: "t2", text: "b", done: false },
+        ],
+      }),
+    ]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets" });
+    const contents = (json.result as { contents: Array<{ text: string }> }).contents;
+    const body = JSON.parse(contents[0].text) as {
+      count: number;
+      detailUriTemplate: string;
+      tickets: Array<Record<string, unknown>>;
+    };
+
+    expect(body.count).toBe(1);
+    // Emitted once for the whole collection instead of a uri on every row.
+    expect(body.detailUriTemplate).toBe("dostuff://tickets/{id}");
+
+    const row = body.tickets[0];
+    for (const heavy of ["description", "record", "verifyCriteria", "attachments", "links"]) {
+      expect(heavy in row).toBe(false);
+    }
+    expect(row.tasks).toBe("1/2");
+    // The excerpt skips the leading heading and stops at the paragraph break.
+    expect(row.excerpt).toBe("Sync clobbers edits across two windows.");
+  });
+
+  test("resource dostuff://tickets windows nothing but is materially smaller than full bodies", async () => {
+    const seed = Array.from({ length: 5 }, (_, i) =>
+      makeIssue({
+        id: `DS-00${i + 1}`,
+        number: i + 1,
+        title: `Ticket number ${i + 1} with a reasonably typical title`,
+        status: "Working",
+        description: "Prose paragraph explaining the ticket.\n\n" + "filler. ".repeat(200),
+        record: recordEntries(20),
+      }),
+    );
+    const store = await makeStore(seed);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets" });
+    const contents = (json.result as { contents: Array<{ text: string }> }).contents;
+    // Each ticket alone carries ~1.6 KB of description plus 20 record entries;
+    // the whole summary index must stay far under a single full body.
+    expect(contents[0].text.length).toBeLessThan(2_000);
   });
 
   test("resource dostuff://tickets/{id} for a servable ticket returns publicView payload", async () => {
@@ -2599,8 +3336,10 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].role).toBe("user");
     expect(result.messages[0].content.type).toBe("text");
-    // Default workflow prompt mentions DoStuff ticket queue.
-    expect(result.messages[0].content.text).toContain("DoStuff issue queue");
+    // Assert identity with the constant, not a substring: the prompt's wording
+    // is free to change (and did, to fit the 2KB ceiling); what this test locks
+    // in is that the `workflow` prompt serves the full text, not the pointer.
+    expect(result.messages[0].content.text).toBe(DEFAULT_WORKFLOW_PROMPT);
   });
 
   test("dispose() releases the port (asynchronously)", async () => {
