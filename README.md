@@ -238,41 +238,43 @@ The full prompt is served **once per connection** as the MCP server's initialize
 This is intentionally terse.
 
 ```text
-DoStuff is this workspace's engineering ticket queue. Reach for these tools
-whenever the task involves finding, starting, updating, or filing work.
+DoStuff is this workspace's engineering ticket queue. Use these tools to find,
+start, update, and file work.
 
 You may NOT change a ticket's title, priority, type, or verify criteria over
-MCP, and only a human can set Complete or Closed. If those are wrong, say so or
-file a new ticket.
+MCP, and only a human can set Complete or Closed. Wrong? Say so, or file a new
+ticket.
 
-Find work with `list_issues` or the `dostuff://tickets` resource, then
-`get_ticket` by number ("42"), id ("DS-042"), or title substring. Read the
-description and verify criteria before starting.
+Write terse — every byte is re-read on each later ticket read. Fragments fine,
+grammar not important. Record notes: one line, ~15 words, facts and outcomes.
+No narration, no restating the ticket, no summarizing what you read or plan.
+Descriptions: 1-2 sentences of what + why, detail below; boards show only that
+opening.
 
-`update_ticket_status` moves a ticket among Thinking, Planned, Working, and
-Verification (active lanes cap at 6 each; Thinking is uncapped). Set Working
-when you start. As you go, `update_ticket_progress` ticks tasks, appends a
-terse factual note, and records the sha of each commit you make. When the work
-is done move to Verification and call `request_ticket_complete`; if
-verification fails, move back to Working.
+Find work: `list_issues` or `dostuff://tickets`, then `get_ticket` by number
+("42"), id ("DS-042"), or title substring. Read description + verify criteria
+first.
 
-When a ticket is OBE — superseded, or won't be done — call
-`request_ticket_close` instead. Both requests need human approval and neither
-changes status itself: poll `get_ticket` with `view: "status"` for the
-outcome. Keep them distinct — close is dropped work, complete is finished work.
+`update_ticket_status` moves among Thinking, Planned, Working, Verification
+(active lanes cap 6 each; Thinking uncapped). Working when you start. As you
+go, `update_ticket_progress` ticks tasks, appends one note, records each commit
+sha. Done → Verification, then `request_ticket_complete`. Verify fails → back
+to Working.
 
-File follow-ups with `create_ticket` (they land in Thinking for triage).
-Reshape a draft's tags, links, or tasks with `update_ticket_draft` — Thinking
-only; demote a ticket back there first if its scope genuinely needs reshaping.
+OBE — superseded or won't be done → `request_ticket_close` instead. Both
+requests need human approval, neither changes status: poll `get_ticket` with
+`view: "status"`. Close = dropped work, complete = finished work.
 
-Lead every description with one or two sentences on what the ticket is and why
-it matters; board views show only that opening. Reads return just the newest
-record entries — pass `recordLimit: 0` when you need the full history.
+Follow-ups → `create_ticket` (lands in Thinking). Reshape a draft's tags,
+links, tasks with `update_ticket_draft` — Thinking only. Reads return newest
+record entries only — `recordLimit: 0` for full history.
 ```
 
 (The lane-cap number tracks your `dostuff.activeLaneCap` setting.) Override the text per-user via **DoStuff: Edit MCP Workflow Instructions…** or `dostuff.mcp.instructions` in Settings. Leave the setting blank to use the built-in text above.
 
-> **Keep a custom prompt under 2KB.** Claude Code truncates MCP server instructions at 2KB and drops the remainder with no error — a prompt that overruns loses its *tail*, which is where rules usually put the things you least want dropped. The built-in text is ~1.7KB for this reason, and a test enforces the budget. Detail that doesn't fit belongs in a tool's own `description`, which gets its own 2KB.
+> **Keep a custom prompt under 2KB.** Claude Code truncates MCP server instructions at 2KB and drops the remainder with no error — a prompt that overruns loses its *tail*, which is where rules usually put the things you least want dropped. The built-in text is ~1.5KB for this reason, and a test enforces the budget. Detail that doesn't fit belongs in a tool's own `description`, which gets its own 2KB.
+
+> **The prompt also bounds what agents write.** Ticket prose is replayed on every later read of that ticket, by every agent, so the built-in text caps record notes at one ~15-word line and descriptions at a 1-2 sentence lead. The schema backs it up: `recordEntry` / `note` are capped at 500 chars and `description` at 10,000 (an over-long value is rejected, not truncated). These caps apply **only to agent writes over MCP** — the UI is uncapped, and tickets already on disk with longer prose load and are served unchanged. A custom prompt that drops the write-terse rule gives that back.
 
 ### Tools
 
@@ -280,10 +282,10 @@ record entries — pass `recordLimit: 0` when you need the full history.
 | --- | --- | --- |
 | `get_ticket` | `query` — `#NN`, `DS-id`, or title substring; optional `view`, `recordLimit`, `include[]` | Returns the ticket plus a one-line workflow pointer (the full prompt is served as MCP initialize instructions and at `dostuff://instructions/workflow`). Thinking, Planned, Working, and Verification tickets are servable; Complete and Closed are rejected. `statusHistory` and `resolvedAt` are stripped; outbound `links` and derived `inboundLinks` are included. The append-only `record` log is windowed to its newest `dostuff.mcp.recordLimit` entries (default 3), adding `recordCount`/`recordOmitted` when entries were dropped; `recordLimit: 0` returns the whole log. Commit shas are replaced by `commitCount`, and `verifyCriteria` is truncated past 2,000 chars (flagged with `verifyCriteriaTruncated`); both are restored with `include: ["commits"]` / `include: ["verifyCriteria"]`. Whatever was withheld is named in `omitted`, spelled exactly as `include` expects. `view: "status"` returns only `{id, number, title, status, pendingClose, tasks: {total, done}}` — for the approval-poll loop, so a waiting agent stops re-fetching the description and record on every check. Marked `readOnlyHint`, so Claude Code can dispatch it concurrently. |
 | `list_issues` | optional `type`, `priority`, `status`, `limit`, `offset` | Returns a compact id/title index of all issues (including Thinking and Complete), filtered by any combination of type, priority, and status. Paged: `limit` defaults to 100 (max 250), `offset` defaults to 0. `count` is the **total matching**, `returned` is this page's size, and `nextOffset` appears only when another page exists. Includes a one-line workflow pointer and workspace context in every response. Use for dynamic discovery before calling `get_ticket`. Marked `readOnlyHint`. |
-| `create_ticket` | `title`, optional `description`, `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
+| `create_ticket` | `title`, optional `description` (≤10,000 chars), `type`, `priority`, `verifyCriteria`, `tasks[]`, `tags[]`, `links[]` | Files a new ticket in **Thinking** for the human to triage. Agents cannot create tickets in any other lane. `links[]` entries are `{ targetId, kind }` (kinds: `blocks` / `child-of` / `relates-to`); unknown target ids are dropped. |
 | `update_ticket_status` | `id`, `status` (one of Thinking / Planned / Working / Verification), optional `note` | Moves a ticket among the non-terminal states — promote a draft out of Thinking, shuffle the active lanes, or demote back to Thinking (uncapped). Honors the active-lane cap. Rejects Complete/Closed as either target or source. |
-| `update_ticket_description` | `id`, `description`, optional `note` | Replaces the ticket's description (and appends one record entry). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Only the description changes — title, priority, type, and verifyCriteria stay locked. |
-| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry`, optional `commit` | Toggles `tasks[].done` and appends one record entry. Optional `commit` (a git sha, 7–40 hex — prefer the full 40) is appended to the ticket's append-only commits list; duplicates ignored. The ticket stores only `{sha, at}` — the UI derives the subject and touched files from your repo lazily. Responds with `tasksChanged` (only the tasks this call touched) plus `tasks: {total, done}` — it does not echo back every task id on the ticket. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
+| `update_ticket_description` | `id`, `description` (≤10,000 chars), optional `note` (≤500) | Replaces the ticket's description (and appends one record entry). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. Only the description changes — title, priority, type, and verifyCriteria stay locked. |
+| `update_ticket_progress` | `id`, `taskUpdates[]`, optional `recordEntry` (≤500 chars), optional `commit` | Toggles `tasks[].done` and appends one record entry. Optional `commit` (a git sha, 7–40 hex — prefer the full 40) is appended to the ticket's append-only commits list; duplicates ignored. The ticket stores only `{sha, at}` — the UI derives the subject and touched files from your repo lazily. Responds with `tasksChanged` (only the tasks this call touched) plus `tasks: {total, done}` — it does not echo back every task id on the ticket. **Locked**: cannot edit title, priority, type, verifyCriteria, or links (edit the description via `update_ticket_description`). Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. |
 | `update_ticket_draft` | `id`, optional `tags[]`, `links[]`, `tasks[]` | Reshapes an untriaged draft's tags, links, and/or task list. **Thinking-only** — rejected once the ticket is triaged to an active lane (use the UI after that). Omit a field to leave it unchanged; pass `[]` to clear it. Unknown link targets are dropped. |
 | `request_ticket_close` | `id`, optional `note` | Flags a ticket as **OBE / no longer needed** and awaits human approval — does **not** change status. A human approves (→ Closed, "won't do") or denies in the DoStuff UI. Allowed on Thinking + active-lane tickets; Complete and Closed are rejected. For finished work use `request_ticket_complete` instead. Poll `get_ticket` with `view: "status"` for the outcome. |
 | `request_ticket_complete` | `id`, optional `note` | Flags a ticket's work as **finished** and awaits human acceptance — does **not** change status. A human accepts (→ Complete, stamping `resolvedAt`) or denies in the DoStuff UI. **Verification-only** — move the ticket there first. A completion request replaces a pending close request (and vice versa), recorded in the ticket history. Poll `get_ticket` with `view: "status"` for the outcome. |

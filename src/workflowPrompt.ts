@@ -28,39 +28,41 @@ export const PROMPT_BYTE_BUDGET = 1800;
 // discovers them via tool search, so these instructions are what decides
 // whether an agent reaches for DoStuff at all. Lead with what the server is,
 // then carry only the rules no single tool description can: cross-tool
-// sequencing, the human-approval boundary, and immutability.
+// sequencing, the human-approval boundary, immutability, and the write-terse
+// rule (every byte an agent writes is re-read on every later ticket read, by
+// this agent and the next one).
 export function buildDefaultWorkflowPrompt(cap: number = ACTIVE_LANE_CAP): string {
   return `\
-DoStuff is this workspace's engineering ticket queue. Reach for these tools
-whenever the task involves finding, starting, updating, or filing work.
+DoStuff is this workspace's engineering ticket queue. Use these tools to find,
+start, update, and file work.
 
 You may NOT change a ticket's title, priority, type, or verify criteria over
-MCP, and only a human can set Complete or Closed. If those are wrong, say so or
-file a new ticket.
+MCP, and only a human can set Complete or Closed. Wrong? Say so, or file a new
+ticket.
 
-Find work with \`list_issues\` or the \`dostuff://tickets\` resource, then
-\`get_ticket\` by number ("42"), id ("DS-042"), or title substring. Read the
-description and verify criteria before starting.
+Write terse — every byte is re-read on each later ticket read. Fragments fine,
+grammar not important. Record notes: one line, ~15 words, facts and outcomes.
+No narration, no restating the ticket, no summarizing what you read or plan.
+Descriptions: 1-2 sentences of what + why, detail below; boards show only that
+opening.
 
-\`update_ticket_status\` moves a ticket among Thinking, Planned, Working, and
-Verification (active lanes cap at ${cap} each; Thinking is uncapped). Set Working
-when you start. As you go, \`update_ticket_progress\` ticks tasks, appends a
-terse factual note, and records the sha of each commit you make. When the work
-is done move to Verification and call \`request_ticket_complete\`; if
-verification fails, move back to Working.
+Find work: \`list_issues\` or \`dostuff://tickets\`, then \`get_ticket\` by number
+("42"), id ("DS-042"), or title substring. Read description + verify criteria
+first.
 
-When a ticket is OBE — superseded, or won't be done — call
-\`request_ticket_close\` instead. Both requests need human approval and neither
-changes status itself: poll \`get_ticket\` with \`view: "status"\` for the
-outcome. Keep them distinct — close is dropped work, complete is finished work.
+\`update_ticket_status\` moves among Thinking, Planned, Working, Verification
+(active lanes cap ${cap} each; Thinking uncapped). Working when you start. As you
+go, \`update_ticket_progress\` ticks tasks, appends one note, records each commit
+sha. Done → Verification, then \`request_ticket_complete\`. Verify fails → back
+to Working.
 
-File follow-ups with \`create_ticket\` (they land in Thinking for triage).
-Reshape a draft's tags, links, or tasks with \`update_ticket_draft\` — Thinking
-only; demote a ticket back there first if its scope genuinely needs reshaping.
+OBE — superseded or won't be done → \`request_ticket_close\` instead. Both
+requests need human approval, neither changes status: poll \`get_ticket\` with
+\`view: "status"\`. Close = dropped work, complete = finished work.
 
-Lead every description with one or two sentences on what the ticket is and why
-it matters; board views show only that opening. Reads return just the newest
-record entries — pass \`recordLimit: 0\` when you need the full history.`;
+Follow-ups → \`create_ticket\` (lands in Thinking). Reshape a draft's tags,
+links, tasks with \`update_ticket_draft\` — Thinking only. Reads return newest
+record entries only — \`recordLimit: 0\` for full history.`;
 }
 
 // One-line stand-in embedded in per-call tool/resource responses instead of

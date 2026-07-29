@@ -1093,6 +1093,16 @@ describe("workflow prompt byte budget", () => {
     // agent the server is worth searching at all.
     expect(prompt.slice(0, 160)).toMatch(/ticket queue/i);
   });
+
+  test("carries the write-terse rule for agent-authored ticket content", () => {
+    const prompt = buildDefaultWorkflowPrompt(6);
+    // Agent prose is the dominant per-read cost of a long-lived ticket: every
+    // record note is replayed on every later read. This rule is what bounds it,
+    // and no single tool description can state it for all write paths.
+    expect(prompt).toMatch(/Write terse/);
+    expect(prompt).toMatch(/~15 words/);
+    expect(prompt).toMatch(/No narration/);
+  });
 });
 
 // ----- create_ticket ---------------------------------------------------------
@@ -1795,6 +1805,19 @@ describe("update_ticket_progress", () => {
     expect(updated.record).toHaveLength(0);
   });
 
+  test("over-long recordEntry is rejected by the 500-char cap", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", tasks: [], record: [] }),
+    ]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      taskUpdates: [],
+      recordEntry: "x".repeat(501),
+    });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.record).toHaveLength(0);
+  });
+
   test("not-found id returns isError (404-style)", async () => {
     const store = await makeStore([]);
     const res = await runUpdateTicketProgress(store, {
@@ -2048,6 +2071,20 @@ describe("update_ticket_description", () => {
       expect(u.record[0]).toMatchObject({ author: "agent" });
     });
   }
+
+  test("over-long description is rejected by the 10,000-char cap", async () => {
+    // Input-only cap: a longer description already on disk still loads and is
+    // served untouched — this only bounds what an agent can write.
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", description: "old", record: [] }),
+    ]);
+    const res = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "x".repeat(10_001),
+    });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.description).toBe("old");
+  });
 
   test("leaves title/priority/type/verifyCriteria untouched", async () => {
     const store = await makeStore([

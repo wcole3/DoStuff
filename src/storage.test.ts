@@ -96,6 +96,33 @@ describe("normalize", () => {
     expect(issue.pendingClose).toBeNull();
   });
 
+  test("preserves over-cap legacy prose verbatim (MCP input caps never truncate on load)", () => {
+    // The MCP write path caps `description` at 10,000 chars and record notes at
+    // 500. Those are *input* validations on agent writes only — tickets written
+    // by an older build (or by a human in the UI, which has no cap) must load
+    // and round-trip byte-for-byte.
+    const longDescription = "d".repeat(30_000);
+    const longNote = "n".repeat(5_000);
+    const legacy = {
+      id: "DS-007",
+      number: 7,
+      title: "legacy verbose ticket",
+      type: "Bug",
+      priority: "High",
+      status: "Working",
+      description: longDescription,
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      record: [{ at: "2025-01-02T00:00:00.000Z", author: "agent", text: longNote }],
+    } as unknown as Issue;
+
+    const { issue, coerced } = normalize(legacy);
+
+    expect(coerced).toEqual([]);
+    expect(issue.description).toBe(longDescription);
+    expect(issue.record[0].text).toBe(longNote);
+  });
+
   test("preserves legacy t-<uuid> task ids verbatim (MCP now mints a shorter form)", () => {
     // Task ids are persisted (issue_tasks.task_id) and are the per-element LWW
     // merge key in syncMerge. Changing the format NEW ids are minted in must

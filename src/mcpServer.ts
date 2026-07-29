@@ -162,13 +162,21 @@ export type IncludeSection = (typeof INCLUDE_SECTIONS)[number];
 // the same thing, but it is read at session start and descriptions get written
 // many turns later.
 const DESCRIPTION_GUIDANCE =
-  "Lead with 1-2 sentences of what and why; board views show only the opening. Detail goes below.";
+  "Lead with 1-2 sentences of what and why; board views show only the opening. Detail goes below. " +
+  "Terse — this text is re-read on every later read of the ticket. No narration or restated context.";
+
+// Record notes are the highest-churn agent write: one per progress call, all of
+// them replayed on later reads. The cap is deliberately tight (was 5,000) so a
+// note cannot grow into a work log; long-form reasoning belongs in the reply to
+// the human, not in the ticket.
+const RECORD_ENTRY_GUIDANCE =
+  "One line, ~15 words: facts and outcomes only. No narration, no restating the ticket.";
 
 const NEW_TICKET_INPUT = {
   title: z.string().min(1).max(200),
   description: z
     .string()
-    .max(20_000)
+    .max(10_000)
     .optional()
     .default("")
     .describe(DESCRIPTION_GUIDANCE),
@@ -205,7 +213,7 @@ const PROGRESS_INPUT = {
     )
     .optional()
     .default([]),
-  recordEntry: z.string().max(5_000).optional(),
+  recordEntry: z.string().max(500).optional().describe(RECORD_ENTRY_GUIDANCE),
   commit: z
     .string()
     .regex(/^[0-9a-fA-F]{7,40}$/, "Expected a git commit sha (7-40 hex chars)")
@@ -241,8 +249,8 @@ const DRAFT_INPUT = {
 // Planned, Working, Verification); Complete/Closed are rejected in-handler.
 const DESCRIPTION_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
-  description: z.string().max(20_000).describe(DESCRIPTION_GUIDANCE),
-  note: z.string().max(2_000).optional(),
+  description: z.string().max(10_000).describe(DESCRIPTION_GUIDANCE),
+  note: z.string().max(500).optional().describe(RECORD_ENTRY_GUIDANCE),
 };
 
 // Shared input for the two terminal-request tools (request_ticket_close /
@@ -250,7 +258,7 @@ const DESCRIPTION_INPUT = {
 // state change is a human action in the DoStuff UI.
 const CLOSE_REQUEST_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
-  note: z.string().max(2_000).optional(),
+  note: z.string().max(500).optional().describe(RECORD_ENTRY_GUIDANCE),
 };
 
 const GET_TICKET_INPUT = {
@@ -1735,6 +1743,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       description:
         "File a new ticket. It lands in 'Thinking' for the human to triage. " +
         "Use this when you discover follow-up work that doesn't belong on the current ticket. " +
+        "Keep the description short — 1-2 sentences of what and why, then only detail a reader needs. " +
         "Optionally supply `links` to record relationships at creation time " +
         "(kinds: blocks, child-of, relates-to). Unknown target ids are dropped " +
         "with a warning; links cannot be edited afterwards via the MCP server.",
@@ -1766,6 +1775,8 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       title: "Update ticket progress",
       description:
         "Tick tasks done/undone and append a note to the ticket's record. " +
+        "Keep `recordEntry` to one terse line (~15 words) of facts and outcomes — it is " +
+        "re-read on every later read of the ticket; long-form reasoning belongs in your reply, not here. " +
         "Optionally pass `commit` (a git sha) when you have committed work for this ticket — " +
         "it is appended to the ticket's commits list so the ticket records what it changed. " +
         "Title, priority, type, and verifyCriteria are not modifiable here (edit the description via update_ticket_description). " +
