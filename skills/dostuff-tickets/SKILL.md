@@ -102,6 +102,12 @@ Resources (`resource` subcommand): `dostuff://tickets` (summary index),
   Close = dropped work, complete = finished work.
 - Follow-ups → `create_ticket`. Reshape a draft's tags/links/tasks with
   `update_ticket_draft` — Thinking only.
+- **Parallel subagents: one writer per ticket.** Skill calls are raw HTTP with
+  no client-side serialization. Partition tickets across concurrent workers;
+  if two must touch one ticket, use only the delta tools
+  (`update_ticket_progress` toggles by task id, records/commits append) —
+  never `update_ticket_draft`, which replaces whole lists and silently drops
+  the other writer's edit. Reads are always safe to parallelize.
 - **Write terse** — every byte you write is re-read on each later ticket read.
   Record notes: one line, ~15 words, facts and outcomes; no narration, no
   restating the ticket. Descriptions: 1-2 sentences of what + why first
