@@ -1,0 +1,13 @@
+{
+  "name": "dostuff",
+  "owner": {
+    "name": "wcole3"
+  },
+  "plugins": [
+    {
+      "name": "dostuff",
+      "source": "./",
+      "description": "Agent skill for the DoStuff VSCode ticket-queue extension — drive its loopback MCP HTTP API with curl, no MCP client registration needed."
+    }
+  ]
+}

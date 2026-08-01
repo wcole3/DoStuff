@@ -83,6 +83,7 @@ import {
 } from "./types";
 import { formatIssueId } from "./syncMerge";
 import { validateLinks } from "./extension";
+import { COMMIT_SHA_PATTERN, FIELD_LIMITS } from "./mcpLimits";
 
 // The default workflow prompt lives in its own small module so the extension
 // host can import it without dragging the full MCP SDK + zod into its bundle.
@@ -132,13 +133,13 @@ function assertAgentMutable(issue: Issue, action: string): ToolResult | null {
 // union-merged by sync, so it only grows; three entries carry the thread far
 // enough to resume after a context loss, and `recordLimit` is the escape hatch.
 export const DEFAULT_RECORD_LIMIT = 3;
-export const MAX_RECORD_LIMIT = 500;
+export const MAX_RECORD_LIMIT = FIELD_LIMITS.recordLimitMax;
 
 export const DEFAULT_LIST_LIMIT = 100;
 // At ~148 ch/row, 250 rows is ~37,000 ch (~9k tokens) — just under the 10k
 // mark where Claude Code warns about MCP output size. The documented maximum
 // should not be able to trip that warning on its own.
-export const MAX_LIST_LIMIT = 250;
+export const MAX_LIST_LIMIT = FIELD_LIMITS.listLimitMax;
 
 // Read-side ceiling for `verifyCriteria`. Write accepts 10,000 (and the field
 // is never editable over MCP), so this bounds the tail without touching what
@@ -173,18 +174,18 @@ const RECORD_ENTRY_GUIDANCE =
   "One line, ~15 words: facts and outcomes only. No narration, no restating the ticket.";
 
 const NEW_TICKET_INPUT = {
-  title: z.string().min(1).max(200),
+  title: z.string().min(1).max(FIELD_LIMITS.title),
   description: z
     .string()
-    .max(10_000)
+    .max(FIELD_LIMITS.description)
     .optional()
     .default("")
     .describe(DESCRIPTION_GUIDANCE),
   type: z.enum(["Bug", "Feature", "Refactor", "Chore", "Spike"]).default("Feature"),
   priority: z.enum(["Critical", "High", "Regular", "Low"]).default("Regular"),
-  verifyCriteria: z.string().max(10_000).optional().default(""),
-  tasks: z.array(z.string().min(1).max(500)).optional().default([]),
-  tags: z.array(z.string().max(64)).optional().default([]),
+  verifyCriteria: z.string().max(FIELD_LIMITS.verifyCriteria).optional().default(""),
+  tasks: z.array(z.string().min(1).max(FIELD_LIMITS.taskText)).optional().default([]),
+  tags: z.array(z.string().max(FIELD_LIMITS.tag)).optional().default([]),
   links: z
     .array(
       z.object({
@@ -199,7 +200,7 @@ const NEW_TICKET_INPUT = {
 const STATUS_INPUT = {
   id: z.string().regex(/^DS-\d+$/, "Expected an id like DS-001"),
   status: z.enum(["Thinking", "Planned", "Working", "Verification", "Complete", "Closed"] as const),
-  note: z.string().max(2_000).optional(),
+  note: z.string().max(FIELD_LIMITS.statusNote).optional(),
 };
 
 const PROGRESS_INPUT = {
@@ -213,10 +214,10 @@ const PROGRESS_INPUT = {
     )
     .optional()
     .default([]),
-  recordEntry: z.string().max(500).optional().describe(RECORD_ENTRY_GUIDANCE),
+  recordEntry: z.string().max(FIELD_LIMITS.recordEntry).optional().describe(RECORD_ENTRY_GUIDANCE),
   commit: z
     .string()
-    .regex(/^[0-9a-fA-F]{7,40}$/, "Expected a git commit sha (7-40 hex chars)")
+    .regex(COMMIT_SHA_PATTERN, "Expected a git commit sha (7-40 hex chars)")
     .optional()
     .describe("Sha of a commit made for this ticket; prefer the full 40 chars."),
 };
@@ -226,7 +227,7 @@ const PROGRESS_INPUT = {
 // ticket is in Thinking — once triaged, scope is locked (use the UI).
 const DRAFT_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
-  tags: z.array(z.string().max(64)).optional(),
+  tags: z.array(z.string().max(FIELD_LIMITS.tag)).optional(),
   links: z
     .array(
       z.object({
@@ -238,7 +239,7 @@ const DRAFT_INPUT = {
   tasks: z
     .array(
       z.object({
-        text: z.string().min(1).max(500),
+        text: z.string().min(1).max(FIELD_LIMITS.taskText),
         done: z.boolean().optional().default(false),
       }),
     )
@@ -249,8 +250,8 @@ const DRAFT_INPUT = {
 // Planned, Working, Verification); Complete/Closed are rejected in-handler.
 const DESCRIPTION_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
-  description: z.string().max(10_000).describe(DESCRIPTION_GUIDANCE),
-  note: z.string().max(500).optional().describe(RECORD_ENTRY_GUIDANCE),
+  description: z.string().max(FIELD_LIMITS.description).describe(DESCRIPTION_GUIDANCE),
+  note: z.string().max(FIELD_LIMITS.note).optional().describe(RECORD_ENTRY_GUIDANCE),
 };
 
 // Shared input for the two terminal-request tools (request_ticket_close /
@@ -258,7 +259,7 @@ const DESCRIPTION_INPUT = {
 // state change is a human action in the DoStuff UI.
 const CLOSE_REQUEST_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
-  note: z.string().max(500).optional().describe(RECORD_ENTRY_GUIDANCE),
+  note: z.string().max(FIELD_LIMITS.note).optional().describe(RECORD_ENTRY_GUIDANCE),
 };
 
 const GET_TICKET_INPUT = {

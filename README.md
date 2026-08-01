@@ -233,6 +233,19 @@ Customize the workflow prompt via the `dostuff.mcp.instructions` setting or the 
 
 The full prompt is served **once per connection** as the MCP server's initialize `instructions` (clients like Claude Code inject it into agent context automatically — visible under `/mcp`), and stays readable at the `dostuff://instructions/workflow` resource and the `workflow` MCP prompt. Individual tool responses carry only a one-line pointer instead of repeating the full text, keeping per-call context small.
 
+### Claude Code Agent Skill (skip MCP registration)
+
+The repo ships a Claude Code [Agent Skill](https://code.claude.com/docs/en/skills) — `skills/dostuff-tickets/` — that covers the entire MCP surface without registering the server as an MCP client. The server is stateless loopback HTTP, so the skill's helper script (`scripts/dostuff.sh`) drives it with bare one-shot `curl` POSTs: it discovers the right port from the instance registry, validates field length caps locally before sending, wraps the JSON-RPC envelope, and unwraps SSE framing. Full parameter schemas live in a lazy-loaded reference file.
+
+Why bother: a registered MCP server costs every Claude Code session the workflow instructions (~1.5 KB) plus connection metadata, whether or not any ticket work happens. The skill costs only its one-line listing entry at session start; the body loads when ticket work actually comes up, and the schema reference only if the agent needs exact shapes.
+
+Install one of two ways:
+
+- **From the extension** — run **DoStuff: Install Claude Code Agent Skill** (command palette). Copies the bundled skill to `~/.claude/skills/dostuff-tickets`; new Claude Code sessions pick it up automatically. Re-run after extension updates.
+- **As a plugin** — `/plugin marketplace add wcole3/DoStuff`, then `/plugin install dostuff@dostuff`. Versioned with the repo.
+
+Keep registering the MCP server instead when you want typed tool schemas with client-side validation, concurrent dispatch of read-only tools (`readOnlyHint`), per-tool permission gating, or a non-Claude-Code client. The two paths coexist: the skill detects registered `mcp__dostuff__*` tools and defers to them, so installing both is safe.
+
 ### Default workflow prompt
 
 This is intentionally terse.
@@ -378,6 +391,7 @@ bun run package
   - Two clones that filed tickets independently collide on `DS-NNN`; the first sync renumbers deterministically (oldest ticket keeps its number) and both sides toast the rename list.
   - Attachments sync too, under `dostuff.sync.syncAttachments` with a per-file ceiling (`dostuff.sync.maxAttachmentSyncBytes`, default 5 MB).
   - Sync is invisible to MCP agents — every write boundary holds unchanged. One caveat: after a renumbering merge, a `DS-NNN` an agent memorized mid-session can change, and it recovers via `list_issues` / `get_ticket` by title.
+- **Claude Code agent skill** — `skills/dostuff-tickets/` covers the full MCP surface over bare curl, so Claude Code can drive the queue without registering the server as an MCP client (near-zero per-session context cost). Ships in the vsix: install with **DoStuff: Install Claude Code Agent Skill**, or as a plugin via `/plugin marketplace add wcole3/DoStuff`. The helper script discovers the per-workspace port from the instance registry and enforces the server's field caps locally before sending. See "Claude Code Agent Skill" above.
 
 **Fixed**
 

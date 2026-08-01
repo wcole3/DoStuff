@@ -1036,6 +1036,31 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showErrorMessage(`DoStuff: could not pin port (${msg}).`);
       }
     }),
+    vscode.commands.registerCommand("dostuff.installAgentSkill", async () => {
+      const os = await import("node:os");
+      const { installAgentSkill, SkillInstallError } = await import("./skillInstall");
+      const src = context.asAbsolutePath(path.join("skills", "dostuff-tickets"));
+      const dest = path.join(os.homedir(), ".claude", "skills", "dostuff-tickets");
+      const fsNode = await import("node:fs");
+      if (fsNode.existsSync(dest)) {
+        const pick = await vscode.window.showWarningMessage(
+          `Replace the existing Claude Code skill at ${dest}?`,
+          { modal: true },
+          "Replace",
+        );
+        if (pick !== "Replace") return;
+      }
+      try {
+        const { copied } = installAgentSkill(src, dest);
+        vscode.window.showInformationMessage(
+          `DoStuff: installed the Claude Code agent skill (${copied.length} files) to ${dest}. ` +
+            "New Claude Code sessions pick it up automatically.",
+        );
+      } catch (e) {
+        const msg = e instanceof SkillInstallError ? e.message : e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`DoStuff: skill install failed — ${msg}`);
+      }
+    }),
   );
   // Fire-and-forget so the extension is marked active before the MCP SDK
   // dynamic import + port bind + registry write resolve (~50–200 ms).

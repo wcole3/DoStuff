@@ -60,6 +60,13 @@ Setup: enable the server (**DoStuff: Toggle MCP Server**), pin or read the port,
 - [ ] **Earns the tool search.** Claude Code defers MCP tool schemas by default, so an agent only loads them if the instructions convince it to look. In a fresh session that has *not* been told about DoStuff, ask "what am I supposed to be working on?" and confirm it finds and calls the DoStuff tools rather than guessing or asking.
 - [ ] A custom `dostuff.mcp.instructions` longer than 2KB is the user's own footgun — worth re-checking the two questions above after setting one.
 
+## 5b. Agent skill (Claude Code without MCP registration)
+
+- [ ] **DoStuff: Install Claude Code Agent Skill** copies the skill to `~/.claude/skills/dostuff-tickets` (toast names the path); re-running prompts before replacing.
+- [ ] In a fresh Claude Code session with **no** dostuff MCP server registered, `/dostuff-tickets` loads the skill; asking to "list my tickets" runs `scripts/dostuff.sh` and returns the board.
+- [ ] On Windows (Git Bash), `dostuff.sh discover` resolves the right instance despite the registry's lowercased `C:\` paths; if it misses, `DOSTUFF_PORT` and the pinned-port fallback both work.
+- [ ] With the MCP server *also* registered, the agent prefers the `mcp__dostuff__*` tools over curl (coexistence rule in SKILL.md).
+
 ## 6. Git ticket sync
 
 Setup (two clones + a bare origin):

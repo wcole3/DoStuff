@@ -45,7 +45,13 @@ import {
   type ToolResult,
 } from "./mcpServer";
 import { ACTIVE_LANE_CAP, type Issue, type Priority, type IssueType, type Status } from "./types";
-import { makeIssueFactory } from "./testSupport";
+import {
+  bootServer,
+  makeIssueFactory,
+  makeWorkspaceId,
+  restoreMcpConfig,
+  setMcpConfig,
+} from "./testSupport";
 
 // ----- Test helpers ----------------------------------------------------------
 
@@ -2268,49 +2274,8 @@ describe("DoStuffMcpServer HTTP", () => {
   });
 });
 
-// Helpers for booting a real HTTP-backed MCP server in tests.
-const __origGetConfig = vscode.workspace.getConfiguration;
-function setMcpConfig(values: Record<string, unknown>): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (vscode.workspace as any).getConfiguration = (_section?: string) => ({
-    get: <T,>(key: string, defaultValue?: T): T | undefined =>
-      (key in values ? (values[key] as T) : defaultValue),
-    update: () => Promise.resolve(),
-    inspect: () => undefined,
-    has: () => false,
-  });
-}
-function restoreMcpConfig(): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (vscode.workspace as any).getConfiguration = __origGetConfig;
-}
-
-// Each booted server gets a distinct synthetic workspace path so registry
-// entries don't collide across tests.
-let __nextWs = 0;
-function makeWorkspaceId(): () => { path: string; name: string } {
-  __nextWs += 1;
-  const path = `/tmp/dostuff-test-ws-${process.pid}-${__nextWs}`;
-  return () => ({ path, name: `ws-${__nextWs}` });
-}
-
-async function bootServer(
-  store: IssueStore,
-  opts: {
-    enabled?: boolean;
-    instructions?: string;
-    workspaceId?: () => { path: string; name: string } | null;
-    preferredPort?: number;
-  } = {},
-): Promise<{ server: DoStuffMcpServer; port: number }> {
-  const cfg: Record<string, unknown> = { "mcp.enabled": opts.enabled ?? true };
-  if (opts.instructions !== undefined) cfg["mcp.instructions"] = opts.instructions;
-  if (opts.preferredPort !== undefined) cfg["mcp.port"] = opts.preferredPort;
-  setMcpConfig(cfg);
-  const server = new DoStuffMcpServer(store, opts.workspaceId ?? makeWorkspaceId());
-  await server.reconcile();
-  return { server, port: server.status.port ?? 0 };
-}
+// The HTTP boot harness (setMcpConfig / bootServer / makeWorkspaceId) lives in
+// testSupport.ts, shared with agentSkill.test.ts.
 
 async function rawRequest(
   port: number,

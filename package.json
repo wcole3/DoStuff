@@ -132,6 +132,11 @@
         "category": "DoStuff"
       },
       {
+        "command": "dostuff.installAgentSkill",
+        "title": "Install Claude Code Agent Skill",
+        "category": "DoStuff"
+      },
+      {
         "command": "dostuff.openSettings",
         "title": "Settings",
         "category": "DoStuff",

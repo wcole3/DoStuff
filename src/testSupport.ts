@@ -5,7 +5,10 @@
 // private copy (the tax that motivated this module: adding guid/updatedAt/
 // pendingClose meant touching seven near-identical factories).
 
+import * as vscode from "vscode";
 import { formatIssueId } from "./syncMerge";
+import { IssueStore } from "./storage";
+import type { DoStuffMcpServer } from "./mcpServer";
 import type { Issue, IssueType, Priority, Status } from "./types";
 
 /**
@@ -59,4 +62,100 @@ export function makeIssueFactory(): IssueFactory {
     counter = 0;
   };
   return makeIssue;
+}
+
+// ----- MCP HTTP test harness -------------------------------------------------
+// Shared by mcpServer.test.ts and agentSkill.test.ts: boot a real HTTP-backed
+// MCP server against a mocked `dostuff.*` configuration. `./mcpServer` is
+// imported lazily so suites that only want `makeIssueFactory` don't pay for
+// the MCP SDK.
+
+function makeMemento(): vscode.Memento {
+  const map = new Map<string, unknown>();
+  return {
+    get<T>(key: string, defaultValue?: T): T | undefined {
+      return map.has(key) ? (map.get(key) as T) : (defaultValue as T | undefined);
+    },
+    update(key: string, value: unknown): Promise<void> {
+      map.set(key, value);
+      return Promise.resolve();
+    },
+    keys(): readonly string[] {
+      return Array.from(map.keys());
+    },
+  } as unknown as vscode.Memento;
+}
+
+export function makeTestContext(): vscode.ExtensionContext {
+  const fakeUri = vscode.Uri.file("/tmp/dostuff-test");
+  return {
+    subscriptions: [],
+    globalState: makeMemento(),
+    workspaceState: makeMemento(),
+    extensionUri: fakeUri,
+    globalStorageUri: fakeUri,
+    extensionPath: "/tmp/dostuff-test",
+    secrets: {
+      get: () => Promise.resolve(undefined),
+      store: () => Promise.resolve(),
+      delete: () => Promise.resolve(),
+    },
+    asAbsolutePath: (p: string) => `/tmp/dostuff-test/${p}`,
+  } as unknown as vscode.ExtensionContext;
+}
+
+/** In-memory IssueStore (globalState-backed — no workspace folder in tests). */
+export async function makeTestStore(seed: Issue[] = []): Promise<IssueStore> {
+  const store = new IssueStore(makeTestContext());
+  await store.init();
+  for (const issue of seed) await store.upsert(issue);
+  return store;
+}
+
+let __origGetConfig: typeof vscode.workspace.getConfiguration | null = null;
+
+export function setMcpConfig(values: Record<string, unknown>): void {
+  if (!__origGetConfig) __origGetConfig = vscode.workspace.getConfiguration;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (vscode.workspace as any).getConfiguration = (_section?: string) => ({
+    get: <T,>(key: string, defaultValue?: T): T | undefined =>
+      (key in values ? (values[key] as T) : defaultValue),
+    update: () => Promise.resolve(),
+    inspect: () => undefined,
+    has: () => false,
+  });
+}
+
+export function restoreMcpConfig(): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  if (__origGetConfig) (vscode.workspace as any).getConfiguration = __origGetConfig;
+}
+
+// Each booted server gets a distinct synthetic workspace path so registry
+// entries don't collide across tests.
+let __nextWs = 0;
+export function makeWorkspaceId(): () => { path: string; name: string } {
+  __nextWs += 1;
+  const path = `/tmp/dostuff-test-ws-${process.pid}-${__nextWs}`;
+  const n = __nextWs;
+  return () => ({ path, name: `ws-${n}` });
+}
+
+export async function bootServer(
+  store: IssueStore,
+  opts: {
+    enabled?: boolean;
+    instructions?: string;
+    workspaceId?: () => { path: string; name: string } | null;
+    preferredPort?: number;
+  } = {},
+): Promise<{ server: DoStuffMcpServer; port: number }> {
+  const cfg: Record<string, unknown> = { "mcp.enabled": opts.enabled ?? true };
+  if (opts.instructions !== undefined) cfg["mcp.instructions"] = opts.instructions;
+  if (opts.preferredPort !== undefined) cfg["mcp.port"] = opts.preferredPort;
+  setMcpConfig(cfg);
+  const { DoStuffMcpServer: ServerCtor } = await import("./mcpServer");
+  const server = new ServerCtor(store, opts.workspaceId ?? makeWorkspaceId());
+  await server.reconcile();
+  return { server, port: server.status.port ?? 0 };
 }
