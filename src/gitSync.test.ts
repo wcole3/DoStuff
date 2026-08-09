@@ -63,8 +63,8 @@ class FakeStore {
   appendLog(line: string): void {
     this.logs.push(line);
   }
-  attachmentsDir(): vscode.Uri | null {
-    return this.attachRoot ? vscode.Uri.file(this.attachRoot) : null;
+  attachmentsPath(): string | null {
+    return this.attachRoot;
   }
   private attachmentPath(issueId: string, attachmentId: string): string | null {
     if (!this.attachRoot) return null;
@@ -87,9 +87,8 @@ class FakeStore {
     if (!p) throw new Error(`Attachment file not found for ${issueId}/${attachmentId}`);
     return fs.readFileSync(p);
   }
-  async findAttachmentUri(issueId: string, attachmentId: string): Promise<vscode.Uri | null> {
-    const p = this.attachmentPath(issueId, attachmentId);
-    return p ? vscode.Uri.file(p) : null;
+  async findAttachmentPath(issueId: string, attachmentId: string): Promise<string | null> {
+    return this.attachmentPath(issueId, attachmentId);
   }
   getSyncTombstones() {
     return {
@@ -780,6 +779,90 @@ describe("GitSyncController: hardening & race regressions", () => {
       expect(rejections).toHaveLength(0);
     } finally {
       process.off("unhandledRejection", onRejection);
+    }
+  });
+});
+
+// ----- phase-3 headless integration ------------------------------------------
+// The controller against the REAL vscode-free storage core — the exact pairing
+// dist/server.cjs runs. FakeStore proves the merge cycle; this proves the
+// core store's applySync/tombstone/stamping surface satisfies the controller
+// end-to-end through actual git and actual sqlite exports on node:fs.
+
+describe("GitSyncController + IssueStoreCore (headless pairing)", () => {
+  test("two core-backed clones converge through the ref, including a delete", async () => {
+    const { IssueStoreCore } = await import("./storageCore");
+    const wasm = fs.readFileSync(
+      path.join(import.meta.dir, "..", "node_modules", "sql.js", "dist", "sql-wasm.wasm"),
+    );
+    const bare = mkRepo("origin.git", true);
+
+    const cores: Array<InstanceType<typeof IssueStoreCore>> = [];
+    const controllers: GitSyncController[] = [];
+    const mkCoreClone = async (name: string) => {
+      const dir = mkRepo(name);
+      git(dir, "remote", "add", "origin", bare);
+      const store = new IssueStoreCore({
+        storageDir: () => path.join(dir, ".vscode", "dostuff"),
+        wasmBinary: async () => wasm,
+      });
+      await store.init();
+      const controller = new GitSyncController(store, () => dir, {
+        remote: "origin",
+        ref: REF,
+        intervalMinutes: 0,
+        activeLaneCap: 6,
+        debounceMs: 5,
+        tipPollMs: 3_600_000,
+        pushFollowUpMs: 3_600_000,
+        startupSync: false,
+        notify: () => {},
+      });
+      controller.start();
+      cores.push(store);
+      controllers.push(controller);
+      return { dir, store, controller };
+    };
+
+    try {
+      const a = await mkCoreClone("coreA");
+      const b = await mkCoreClone("coreB");
+
+      await a.store.upsert(
+        makeIssue({ guid: "g-core", number: 1, id: "DS-001", createdAt: T(1), title: "born headless" }),
+        { preserveTimestamps: true },
+      );
+      await a.controller.syncNow("manual");
+      await b.controller.syncNow("manual");
+      expect(b.store.get("DS-001")?.title).toBe("born headless");
+
+      // Edit in B, converge back to A.
+      const inB = b.store.get("DS-001")!;
+      await b.store.upsert({ ...inB, title: "edited in B" });
+      await b.controller.syncNow("manual");
+      await a.controller.syncNow("manual");
+      expect(a.store.get("DS-001")?.title).toBe("edited in B");
+
+      // Delete in A propagates and stays deleted (tombstone via the core's
+      // sync_tombstones table, not the FakeStore shim).
+      await a.store.remove("DS-001");
+      await a.controller.syncNow("manual");
+      await b.controller.syncNow("manual");
+      await b.controller.syncNow("manual");
+      expect(b.store.get("DS-001")).toBeUndefined();
+      expect(a.store.get("DS-001")).toBeUndefined();
+
+      // And the state survives a reopen from disk in clone B.
+      const reopened = new IssueStoreCore({
+        storageDir: () => path.join(b.dir, ".vscode", "dostuff"),
+        wasmBinary: async () => wasm,
+      });
+      await reopened.init();
+      expect(reopened.get("DS-001")).toBeUndefined();
+      reopened.dispose();
+    } finally {
+      for (const c of controllers) c.dispose();
+      for (const s of cores) s.dispose();
     }
   });
 });

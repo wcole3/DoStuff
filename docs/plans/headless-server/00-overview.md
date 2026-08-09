@@ -1,6 +1,10 @@
 # Headless Server — Plan 00: Overview & Decision Record
 
-> Status: **draft** (written 2026-08-01 against the v2.0.0 branch, after the agent-skill work landed: `skills/dostuff-tickets/`, `src/mcpLimits.ts`, `src/agentSkill.test.ts`). Line numbers reference that tree; re-verify before implementing.
+> Status: **implemented** (2026-08-01, v2.0.0 branch — all phases 0–5 landed the same day this plan was written). Line numbers reference the pre-implementation tree. Deviations from the plan as written:
+> - **File IO got a seam after all** (`StorageFs` in `storageCore.ts`, default `node:fs`): the plan said "node:fs directly, no adapter interface", but the extension adapter maps it onto `vscode.workspace.fs` instead — it keeps the extension's historical IO semantics byte-for-byte (incl. remote workspaces) and preserved all 41 virtual-FS storage tests unchanged. Headless uses the node:fs default; the byte-identity test spans both.
+> - Handler injection is a per-call `ToolHost` argument (defaulting to a pure `DEFAULT_TOOL_HOST`), not a constructor-only config — direct handler calls in tests stay one-liners.
+> - The phase-4 CAS also added `updatedAt` to `publicView`/`statusView`/write responses (the token has to come from somewhere).
+> - `clampSyncInterval` moved `extension.ts` → `gitSync.ts` so both hosts share the clamp.
 
 ## Problem statement
 

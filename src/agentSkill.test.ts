@@ -157,6 +157,27 @@ describe("agent skill: static shape", async () => {
     expect(skillMd).toMatch(/mcp__dostuff__/); // coexistence rule with a registered server
   });
 
+  test("documents the expectedUpdatedAt CAS guard on the replace-shaped writes", () => {
+    // Concurrency L3: parallel subagents must know the opt-in stale-write
+    // rejection exists, or the one-writer-per-ticket rule is their only tool.
+    expect(skillMd).toContain("expectedUpdatedAt");
+    expect(toolsMd).toContain("expectedUpdatedAt");
+    expect(toolsMd).toMatch(/updatedAt.*from your last read/);
+  });
+
+  test("plugin manifest version tracks the extension version", () => {
+    // The plugin marketplace channel only picks up skill changes when the
+    // plugin version bumps; pin it to package.json so a release can't ship a
+    // stale plugin. The extension-copy channel uses the same version for its
+    // auto-update marker (skillInstall.ts).
+    const root = nodePath.resolve(import.meta.dir, "..");
+    const pkg = JSON.parse(fs.readFileSync(nodePath.join(root, "package.json"), "utf8"));
+    const plugin = JSON.parse(
+      fs.readFileSync(nodePath.join(root, ".claude-plugin", "plugin.json"), "utf8"),
+    );
+    expect(plugin.version).toBe(pkg.version);
+  });
+
   test("does not hardcode the active lane cap", async () => {
     // The cap tracks the dostuff.activeLaneCap setting; the skill must describe
     // it, never state a number that would drift.

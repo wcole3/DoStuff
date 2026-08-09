@@ -9,11 +9,11 @@
 // module (02-merge-spec); all store writes through `applySync` /
 // `preserveTimestamps` semantics (01-schema-groundwork).
 
-import * as vscode from "vscode";
 import * as fsp from "node:fs/promises";
 import * as nodePath from "node:path";
-import { normalize } from "./storage";
-import type { IssueStore } from "./storage";
+import { Emitter, type Disposable } from "./events";
+import { normalize } from "./storageCore";
+import type { IssueStoreCore } from "./storageCore";
 import { findRepoRoot, GitError, GitRepo, type GitRepoOptions, type TreeEntry } from "./gitPlumbing";
 import {
   canonicalJson,
@@ -29,8 +29,20 @@ import {
   type Tombstone,
   type WireTicket,
 } from "./syncMerge";
-import type { ElementTombstoneRow, SyncTombstones } from "./storage";
+import type { ElementTombstoneRow, SyncTombstones } from "./storageCore";
 import { ACTIVE_LANES, type Issue, type Status } from "./types";
+
+/**
+ * Clamp `dostuff.sync.intervalMinutes` to sane bounds: `<= 0` (or garbage)
+ * means manual-only network sync; anything positive lands in [1, 120].
+ * package.json's declared min/max only constrain the settings UI. Lives here
+ * (not extension.ts) so the headless host applies the same clamp.
+ */
+export function clampSyncInterval(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 5;
+  if (n <= 0) return 0;
+  return Math.min(120, Math.max(1, n));
+}
 
 export const FORMAT_VERSION = 1;
 
@@ -62,21 +74,22 @@ interface ApplyResult {
 }
 
 /**
- * The slice of `IssueStore` the controller needs. Narrow on purpose so tests
+ * The slice of the store the controller needs. Narrow on purpose so tests
  * can drive two controllers against lightweight in-memory stores while the
- * real `IssueStore` satisfies it structurally.
+ * real `IssueStoreCore` (and its extension subclass) satisfies it
+ * structurally.
  */
 export type SyncStoreLike = Pick<
-  IssueStore,
+  IssueStoreCore,
   | "list"
   | "get"
   | "getSyncTombstones"
   | "applySync"
   | "onChange"
   | "appendLog"
-  | "attachmentsDir"
+  | "attachmentsPath"
   | "readAttachment"
-  | "findAttachmentUri"
+  | "findAttachmentPath"
 >;
 
 export interface GitSyncOptions {
@@ -94,7 +107,8 @@ export interface GitSyncOptions {
   pushFollowUpMs?: number; // one coalesced push after a local commit (default 30000)
   tipPollMs?: number; // same-machine tip poll (default 15000)
   git?: GitRepoOptions; // timeout overrides for tests
-  /** Notification sink — defaults to vscode.window toasts; tests inject. */
+  /** Notification sink — the extension passes vscode toasts; defaults to the
+   *  store log so the controller stays host-agnostic. */
   notify?: (kind: "info" | "warn", message: string) => void;
   /** Run a network sync on start() (default true). Tests disable to drive
    *  every cycle deterministically via syncNow. */
@@ -118,10 +132,10 @@ function insideRoot(rootPath: string, target: string): boolean {
   );
 }
 
-export class GitSyncController implements vscode.Disposable {
+export class GitSyncController {
   private repo: GitRepo | null = null;
   private opChain: Promise<void> = Promise.resolve();
-  private disposables: vscode.Disposable[] = [];
+  private disposables: Disposable[] = [];
   private timers: ReturnType<typeof setTimeout>[] = [];
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pushFollowUpTimer: ReturnType<typeof setTimeout> | null = null;
@@ -131,7 +145,7 @@ export class GitSyncController implements vscode.Disposable {
   private started = false;
 
   private _status: SyncStatus = { state: "disabled" };
-  private readonly statusEmitter = new vscode.EventEmitter<SyncStatus>();
+  private readonly statusEmitter = new Emitter<SyncStatus>();
   readonly onStatusChange = this.statusEmitter.event;
 
   constructor(
@@ -248,8 +262,7 @@ export class GitSyncController implements vscode.Disposable {
       this.opts.notify(kind, message);
       return;
     }
-    if (kind === "warn") void vscode.window.showWarningMessage(message);
-    else void vscode.window.showInformationMessage(message);
+    this.store.appendLog(`Sync ${kind}: ${message}`);
   }
 
   // ─── state building / reading ───────────────────────────────────────────
@@ -689,10 +702,10 @@ export class GitSyncController implements vscode.Disposable {
 
   /** One guarded restore pass; shared by the changed and no-change apply paths. */
   private async tryRestoreAttachments(state: SyncState, tip: string | null | undefined): Promise<void> {
-    const attRoot = this.store.attachmentsDir();
+    const attRoot = this.store.attachmentsPath();
     if (!tip || !attRoot || this.opts.syncAttachments === false) return;
     try {
-      await this.restoreAttachments(state, tip, attRoot.fsPath);
+      await this.restoreAttachments(state, tip, attRoot);
     } catch (e) {
       this.store.appendLog(
         `Sync: attachment restore failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -776,12 +789,12 @@ export class GitSyncController implements vscode.Disposable {
     // Attachment dir renames before any restore (and before removal of old
     // rows). Node fs, not vscode fs — attachment bytes always live on the
     // extension host's disk (same posture as gitPlumbing's blob streaming).
-    const attRoot = this.store.attachmentsDir();
+    const attRoot = this.store.attachmentsPath();
     if (attRoot) {
       for (const r of renames) {
-        const from = nodePath.join(attRoot.fsPath, r.oldId);
-        const to = nodePath.join(attRoot.fsPath, r.newId);
-        if (!insideRoot(attRoot.fsPath, from) || !insideRoot(attRoot.fsPath, to)) {
+        const from = nodePath.join(attRoot, r.oldId);
+        const to = nodePath.join(attRoot, r.newId);
+        if (!insideRoot(attRoot, from) || !insideRoot(attRoot, to)) {
           this.store.appendLog(`Sync: refused attachment dir rename for unsafe id ${r.oldId}`);
           continue;
         }
@@ -850,7 +863,7 @@ export class GitSyncController implements vscode.Disposable {
         if (deleted.has(att.id)) continue;
         const oid = oids.get(`attachments/${wire.guid}/${att.id}`);
         if (!oid) continue; // bytes were never synced (cap/skip) — leave missing
-        if (await this.store.findAttachmentUri(wire.id, att.id)) continue; // already present
+        if (await this.store.findAttachmentPath(wire.id, att.id)) continue; // already present
         // `att.name` is remote-controlled — the extension must never smuggle
         // a separator into the destination path.
         const dir = nodePath.join(attRootPath, wire.id);

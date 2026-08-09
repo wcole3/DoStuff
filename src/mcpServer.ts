@@ -52,11 +52,14 @@ import * as http from "http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import { newTaskId } from "./ids";
-import * as vscode from "vscode";
 import { z } from "zod";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import type { IssueStore } from "./storage";
+// The server needs only the vscode-free core surface (get/list/upsert/
+// appendLog/nextNumber/readAttachment), so it types against `IssueStoreCore`
+// — the extension's `IssueStore` subclass is assignable, and the headless
+// entry point can pass a bare core store.
+import type { IssueStoreCore as IssueStore } from "./storageCore";
 import {
   normalizeWorkspacePath,
   registerEntry,
@@ -80,10 +83,40 @@ import {
   type RecordEntry,
   type Status,
   type TicketCommit,
+  validateLinks,
 } from "./types";
 import { formatIssueId } from "./syncMerge";
-import { validateLinks } from "./extension";
 import { COMMIT_SHA_PATTERN, FIELD_LIMITS } from "./mcpLimits";
+import {
+  DEFAULT_RECORD_LIMIT,
+  DEFAULT_TOOL_HOST,
+  MAX_RECORD_LIMIT,
+  coercePreferredPort,
+  defaultMcpConfig,
+  makeToolHost,
+  silentLogger,
+  type Logger,
+  type McpConfigProvider,
+  type ToolHost,
+  type WorkspaceIdentity,
+} from "./mcpHost";
+
+// The host seam (config/logger/workspace interfaces + coercers) lives in
+// `mcpHost.ts` so the extension and the headless CLI can both build one
+// without importing the MCP SDK. Re-exported here for existing consumers.
+export {
+  DEFAULT_RECORD_LIMIT,
+  DEFAULT_TOOL_HOST,
+  MAX_RECORD_LIMIT,
+  coercePreferredPort,
+  makeToolHost,
+  readPreferredPort,
+  type Logger,
+  type McpConfig,
+  type McpConfigProvider,
+  type ToolHost,
+  type WorkspaceIdentity,
+} from "./mcpHost";
 
 // The default workflow prompt lives in its own small module so the extension
 // host can import it without dragging the full MCP SDK + zod into its bundle.
@@ -127,14 +160,6 @@ function assertAgentMutable(issue: Issue, action: string): ToolResult | null {
 
 // ----- Input schemas (raw zod shapes per SDK v1.x) ---------------------------
 
-// Declared here rather than beside `readMcpViewOptions` because the schemas
-// below reference MAX_RECORD_LIMIT at module-evaluation time.
-// Newest record entries served by default. The log is append-only and
-// union-merged by sync, so it only grows; three entries carry the thread far
-// enough to resume after a context loss, and `recordLimit` is the escape hatch.
-export const DEFAULT_RECORD_LIMIT = 3;
-export const MAX_RECORD_LIMIT = FIELD_LIMITS.recordLimitMax;
-
 export const DEFAULT_LIST_LIMIT = 100;
 // At ~148 ch/row, 250 rows is ~37,000 ch (~9k tokens) — just under the 10k
 // mark where Claude Code warns about MCP output size. The documented maximum
@@ -172,6 +197,17 @@ const DESCRIPTION_GUIDANCE =
 // the human, not in the ticket.
 const RECORD_ENTRY_GUIDANCE =
   "One line, ~15 words: facts and outcomes only. No narration, no restating the ticket.";
+
+// Opt-in compare-and-swap for the two REPLACE-shaped writes. The delta tools
+// (progress toggles, appended records/commits, status moves) interleave
+// safely; these two overwrite whole fields, so two agents that each read
+// then write back erase each other's edit. Supplying the `updatedAt` from
+// your read turns that silent lost-update into an explicit rejection that
+// carries the fresh state. Optional and additive — old callers unchanged.
+const CAS_GUIDANCE =
+  "Optional concurrency guard: the ticket's updatedAt from your last read. " +
+  "If the ticket changed since, the write is rejected with the fresh state " +
+  "so you can re-apply your edit.";
 
 const NEW_TICKET_INPUT = {
   title: z.string().min(1).max(FIELD_LIMITS.title),
@@ -244,6 +280,7 @@ const DRAFT_INPUT = {
       }),
     )
     .optional(),
+  expectedUpdatedAt: z.string().optional().describe(CAS_GUIDANCE),
 };
 
 // Edit a ticket's description. Allowed on any non-terminal ticket (Thinking,
@@ -252,6 +289,7 @@ const DESCRIPTION_INPUT = {
   id: z.string().regex(/^DS-\d+$/),
   description: z.string().max(FIELD_LIMITS.description).describe(DESCRIPTION_GUIDANCE),
   note: z.string().max(FIELD_LIMITS.note).optional().describe(RECORD_ENTRY_GUIDANCE),
+  expectedUpdatedAt: z.string().optional().describe(CAS_GUIDANCE),
 };
 
 // Shared input for the two terminal-request tools (request_ticket_close /
@@ -440,6 +478,10 @@ export function publicView(
     type: issue.type,
     priority: issue.priority,
     status: issue.status,
+    // The CAS token for the replace-shaped writes: pass this back as
+    // `expectedUpdatedAt` on update_ticket_draft / update_ticket_description
+    // to reject the write if the ticket changed since this read.
+    updatedAt: issue.updatedAt,
     description: issue.description,
     verifyCriteria,
     ...(criteriaTruncated ? { verifyCriteriaTruncated: true } : {}),
@@ -497,48 +539,13 @@ export function statusView(issue: Issue) {
     number: issue.number,
     title: issue.title,
     status: issue.status,
+    updatedAt: issue.updatedAt,
     pendingClose: issue.pendingClose,
     tasks: {
       total: issue.tasks.length,
       done: issue.tasks.filter((t) => t.done).length,
     },
   };
-}
-
-/**
- * Resolve read-shaping options from config. Mirrors `readWorkflowPrompt` — the
- * config lookup lives here, at the call site, never inside the pure
- * projections (which keep unlimited defaults so their meaning can't shift).
- * Falls back to the default on any non-integer or negative value.
- */
-export function readMcpViewOptions(): { recordLimit: number } {
-  const cfg = vscode.workspace.getConfiguration("dostuff");
-  const raw = cfg.get<number>("mcp.recordLimit", DEFAULT_RECORD_LIMIT);
-  if (!Number.isInteger(raw) || (raw as number) < 0) {
-    return { recordLimit: DEFAULT_RECORD_LIMIT };
-  }
-  return { recordLimit: Math.min(raw as number, MAX_RECORD_LIMIT) };
-}
-
-export function readWorkflowPrompt(): string {
-  const cfg = vscode.workspace.getConfiguration("dostuff");
-  const custom = cfg.get<string>("mcp.instructions");
-  if (custom && custom.trim()) return custom;
-  const cap = cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP);
-  return buildDefaultWorkflowPrompt(cap);
-}
-
-/**
- * Resolve the preferred MCP port from the workspace config. Returns 0 (let the
- * OS pick) when the setting is missing, out of range, or non-integer. Ports
- * 1–1023 are coerced to 0 to avoid surprises with privileged ports.
- */
-export function readPreferredPort(cfg: vscode.WorkspaceConfiguration): number {
-  const raw = cfg.get<number>("mcp.port", 0);
-  if (!Number.isInteger(raw)) return 0;
-  if (raw === 0) return 0;
-  if (raw < 1024 || raw > 65535) return 0;
-  return raw;
 }
 
 function isLocalhost(addr: string): boolean {
@@ -551,16 +558,12 @@ function isLocalhost(addr: string): boolean {
   );
 }
 
-export function getWorkspaceContext(): { name: string; rootPath: string } | null {
-  const folders = vscode.workspace.workspaceFolders;
-  if (!folders?.length) return null;
-  return {
-    name: vscode.workspace.name ?? folders[0].name,
-    rootPath: folders[0].uri.fsPath,
-  };
-}
-
 // ----- Pure tool handlers (exported for tests) -------------------------------
+//
+// Every handler takes an optional `ToolHost` (workspace stamp, record window,
+// lane cap) and defaults to `DEFAULT_TOOL_HOST` — no workspace, built-in
+// limits — so direct calls in tests need no host plumbing. The HTTP server
+// passes a live host built from its config provider + workspaceId callback.
 
 export type GetTicketInput = {
   query: string;
@@ -597,8 +600,14 @@ export type UpdateDraftInput = {
   tags?: string[];
   links?: Array<{ targetId: string; kind: LinkKind }>;
   tasks?: Array<{ text: string; done?: boolean }>;
+  expectedUpdatedAt?: string;
 };
-export type UpdateDescriptionInput = { id: string; description: string; note?: string };
+export type UpdateDescriptionInput = {
+  id: string;
+  description: string;
+  note?: string;
+  expectedUpdatedAt?: string;
+};
 export type RequestCloseInput = { id: string; note?: string };
 
 /**
@@ -616,6 +625,7 @@ export type RequestCloseInput = { id: string; note?: string };
 export async function runGetTicket(
   store: IssueStore,
   args: GetTicketInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = GetTicketSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for get_ticket: ${parsed.error.message}`);
@@ -682,14 +692,14 @@ export async function runGetTicket(
   // description does. The collection resource already made this trade.
   if (args.view === "status") {
     return ToolResultOk(
-      JSON.stringify({ workspace: getWorkspaceContext(), ticket: statusView(match) }),
+      JSON.stringify({ workspace: host.workspace(), ticket: statusView(match) }),
     );
   }
 
-  const recordLimit = args.recordLimit ?? readMcpViewOptions().recordLimit;
+  const recordLimit = args.recordLimit ?? host.recordLimit();
   return ToolResultOk(
     JSON.stringify({
-      workspace: getWorkspaceContext(),
+      workspace: host.workspace(),
       workflow: WORKFLOW_POINTER,
       ticket: publicView(match, all, { recordLimit, include: args.include ?? [] }),
     }),
@@ -708,6 +718,7 @@ export async function runGetTicket(
 export async function runListIssues(
   store: IssueStore,
   args: ListIssuesInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = ListIssuesSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for list_issues: ${parsed.error.message}`);
@@ -730,7 +741,7 @@ export async function runListIssues(
   return ToolResultOk(
     JSON.stringify(
       {
-        workspace: getWorkspaceContext(),
+        workspace: host.workspace(),
         workflow: WORKFLOW_POINTER,
         count,
         returned: page.length,
@@ -766,6 +777,7 @@ export async function runListIssues(
 export async function runCreateTicket(
   store: IssueStore,
   args: CreateTicketInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = NewTicketSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for create_ticket: ${parsed.error.message}`);
@@ -825,7 +837,7 @@ export async function runCreateTicket(
   return ToolResultOk(
     JSON.stringify(
       {
-        workspace: getWorkspaceContext(),
+        workspace: host.workspace(),
         id: issue.id,
         number: issue.number,
         status: issue.status,
@@ -855,6 +867,7 @@ export async function runCreateTicket(
 export async function runUpdateTicketStatus(
   store: IssueStore,
   args: UpdateStatusInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   // Target must be a writable active lane. Check this BEFORE strict-parsing
   // because the inner zod schema would also reject Thinking/Complete — we
@@ -884,7 +897,7 @@ export async function runUpdateTicketStatus(
     return ToolResultOk(`Ticket ${issue.id} is already in ${issue.status}; no change.`);
   }
 
-  const cap = vscode.workspace.getConfiguration("dostuff").get<number>("activeLaneCap", ACTIVE_LANE_CAP);
+  const cap = host.activeLaneCap();
   const laneCheck = canMoveToActiveLane(store.list(), args.status, issue.id, cap);
   if (laneCheck !== true) return ToolResultErr(laneCheck);
 
@@ -909,7 +922,7 @@ export async function runUpdateTicketStatus(
   };
   await store.upsert(next);
   return ToolResultOk(
-    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id, status: next.status, from: issue.status }, null, 2),
+    JSON.stringify({ workspace: host.workspace(), id: next.id, status: next.status, from: issue.status }, null, 2),
   );
 }
 
@@ -930,6 +943,7 @@ export async function runUpdateTicketStatus(
 export async function runUpdateTicketProgress(
   store: IssueStore,
   args: UpdateProgressInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = ProgressSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_progress: ${parsed.error.message}`);
@@ -983,7 +997,7 @@ export async function runUpdateTicketProgress(
   return ToolResultOk(
     JSON.stringify(
       {
-        workspace: getWorkspaceContext(),
+        workspace: host.workspace(),
         id: next.id,
         tasksChanged: next.tasks
           .filter((t) => changedIds.has(t.id))
@@ -1018,6 +1032,7 @@ export async function runUpdateTicketProgress(
 export async function runUpdateTicketDraft(
   store: IssueStore,
   args: UpdateDraftInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = DraftSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_draft: ${parsed.error.message}`);
@@ -1030,6 +1045,23 @@ export async function runUpdateTicketDraft(
       `Ticket ${issue.id} is in "${issue.status}", not Thinking. ` +
         `Tags, links, and tasks can only be edited via MCP while a ticket is an untriaged draft. ` +
         `Use update_ticket_progress to toggle task done-state on active tickets, or the UI to edit scope.`,
+    );
+  }
+  // Opt-in CAS: this tool REPLACES tags/links/tasks, so a concurrent writer's
+  // edit would be silently erased. A stale token turns that into an explicit
+  // rejection carrying the fresh lists, so the caller re-applies its edit
+  // without a second read.
+  if (validated.expectedUpdatedAt !== undefined && validated.expectedUpdatedAt !== issue.updatedAt) {
+    return ToolResultErr(
+      `Stale expectedUpdatedAt for ${issue.id}: the ticket changed at ${issue.updatedAt}. ` +
+        `Re-apply your edit to the current state, then retry with the new updatedAt.\n` +
+        JSON.stringify({
+          id: issue.id,
+          updatedAt: issue.updatedAt,
+          tags: issue.tags,
+          links: issue.links.map((l) => ({ targetId: l.targetId, kind: l.kind })),
+          tasks: issue.tasks.map((t) => ({ id: t.id, text: t.text, done: t.done })),
+        }),
     );
   }
 
@@ -1062,8 +1094,10 @@ export async function runUpdateTicketDraft(
   return ToolResultOk(
     JSON.stringify(
       {
-        workspace: getWorkspaceContext(),
+        workspace: host.workspace(),
         id: next.id,
+        // Post-write stamp (upsert re-stamps) — the token for a chained CAS write.
+        updatedAt: store.get(next.id)?.updatedAt,
         tags: next.tags,
         links: next.links,
         tasks: next.tasks.map((t) => ({ id: t.id, text: t.text, done: t.done })),
@@ -1087,6 +1121,7 @@ export async function runUpdateTicketDraft(
 export async function runUpdateTicketDescription(
   store: IssueStore,
   args: UpdateDescriptionInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = DescriptionSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for update_ticket_description: ${parsed.error.message}`);
@@ -1097,6 +1132,20 @@ export async function runUpdateTicketDescription(
 
   const descriptionGate = assertAgentMutable(issue, "edit its description");
   if (descriptionGate) return descriptionGate;
+
+  // Opt-in CAS — see runUpdateTicketDraft. The embedded description is what
+  // the caller needs to merge its edit into before retrying.
+  if (args.expectedUpdatedAt !== undefined && args.expectedUpdatedAt !== issue.updatedAt) {
+    return ToolResultErr(
+      `Stale expectedUpdatedAt for ${issue.id}: the ticket changed at ${issue.updatedAt}. ` +
+        `Re-apply your edit to the current description, then retry with the new updatedAt.\n` +
+        JSON.stringify({
+          id: issue.id,
+          updatedAt: issue.updatedAt,
+          description: issue.description,
+        }),
+    );
+  }
 
   const now = new Date().toISOString();
   const next: Issue = {
@@ -1113,7 +1162,11 @@ export async function runUpdateTicketDescription(
   };
   await store.upsert(next);
   return ToolResultOk(
-    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id }, null, 2),
+    JSON.stringify(
+      { workspace: host.workspace(), id: next.id, updatedAt: store.get(next.id)?.updatedAt },
+      null,
+      2,
+    ),
   );
 }
 
@@ -1136,6 +1189,7 @@ async function runRequestTerminal(
   issue: Issue,
   target: "Closed" | "Complete",
   note: string | undefined,
+  host: ToolHost,
 ): Promise<ToolResult> {
   const label = target === "Complete" ? "Completion" : "Close";
   const message =
@@ -1146,7 +1200,7 @@ async function runRequestTerminal(
   if (existingTarget === target) {
     return ToolResultOk(
       JSON.stringify(
-        { workspace: getWorkspaceContext(), id: issue.id, pendingClose: true, target, message: `Already pending. ${message}` },
+        { workspace: host.workspace(), id: issue.id, pendingClose: true, target, message: `Already pending. ${message}` },
         null,
         2,
       ),
@@ -1165,7 +1219,7 @@ async function runRequestTerminal(
   };
   await store.upsert(next);
   return ToolResultOk(
-    JSON.stringify({ workspace: getWorkspaceContext(), id: next.id, pendingClose: true, target, message }, null, 2),
+    JSON.stringify({ workspace: host.workspace(), id: next.id, pendingClose: true, target, message }, null, 2),
   );
 }
 
@@ -1183,6 +1237,7 @@ async function runRequestTerminal(
 export async function runRequestTicketClose(
   store: IssueStore,
   args: RequestCloseInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = CloseRequestSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for request_ticket_close: ${parsed.error.message}`);
@@ -1193,7 +1248,7 @@ export async function runRequestTicketClose(
 
   const closeGate = assertAgentMutable(issue, "request a close; there is nothing left to close");
   if (closeGate) return closeGate;
-  return runRequestTerminal(store, issue, "Closed", args.note);
+  return runRequestTerminal(store, issue, "Closed", args.note, host);
 }
 
 /**
@@ -1208,6 +1263,7 @@ export async function runRequestTicketClose(
 export async function runRequestTicketComplete(
   store: IssueStore,
   args: RequestCloseInput,
+  host: ToolHost = DEFAULT_TOOL_HOST,
 ): Promise<ToolResult> {
   const parsed = CloseRequestSchema.safeParse(args);
   if (!parsed.success) return ToolResultErr(`Invalid arguments for request_ticket_complete: ${parsed.error.message}`);
@@ -1225,21 +1281,29 @@ export async function runRequestTicketComplete(
         `(For a ticket that is no longer needed, use request_ticket_close instead.)`,
     );
   }
-  return runRequestTerminal(store, issue, "Complete", args.note);
+  return runRequestTerminal(store, issue, "Complete", args.note, host);
 }
 
 // ----- Server lifecycle ------------------------------------------------------
 
-export interface WorkspaceIdentity {
-  path: string;
-  name: string;
+/** Host wiring for `DoStuffMcpServer`. Every field has a vscode-free default. */
+export interface McpServerHostOptions {
+  /** Live config source; defaults to `defaultMcpConfig` (enabled, ephemeral port). */
+  config?: McpConfigProvider;
+  /** Log sink; defaults to silent (tests). The extension passes an OutputChannel. */
+  logger?: Logger;
+  /** Surfaced when the HTTP server fails to start (the extension shows a toast). */
+  onStartError?: (message: string) => void;
 }
 
-export class DoStuffMcpServer implements vscode.Disposable {
+export class DoStuffMcpServer {
   private httpServer: http.Server | null = null;
   private currentPort: number | null = null;
   private startedFor: string | null = null;
-  private readonly output: vscode.OutputChannel;
+  private readonly config: McpConfigProvider;
+  private readonly logger: Logger;
+  private readonly onStartError?: (message: string) => void;
+  private readonly host: ToolHost;
   // Single-flight mutex: chain every reconcile() onto one promise so
   // concurrent config changes can't race start() against stop() and leak
   // a partially-initialized server.
@@ -1248,8 +1312,12 @@ export class DoStuffMcpServer implements vscode.Disposable {
   constructor(
     private readonly store: IssueStore,
     private readonly workspaceId: () => WorkspaceIdentity | null = () => null,
+    options: McpServerHostOptions = {},
   ) {
-    this.output = vscode.window.createOutputChannel("DoStuff MCP");
+    this.config = options.config ?? defaultMcpConfig;
+    this.logger = options.logger ?? silentLogger;
+    this.onStartError = options.onStartError;
+    this.host = makeToolHost(this.config, () => this.workspaceId());
   }
 
   /** Status snapshot for outside readers (e.g. status bar item). */
@@ -1267,19 +1335,18 @@ export class DoStuffMcpServer implements vscode.Disposable {
       .then(() => this.doReconcile())
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
-        this.output.appendLine(`reconcile error: ${msg}`);
+        this.logger.error(`reconcile error: ${msg}`);
       });
     return this.reconcilePromise;
   }
 
   private async doReconcile(): Promise<void> {
-    const cfg = vscode.workspace.getConfiguration("dostuff");
-    const enabled = cfg.get<boolean>("mcp.enabled", true);
+    const cfg = this.config();
 
-    if (!enabled) {
+    if (!cfg.enabled) {
       if (this.httpServer) {
         await this.stop();
-        this.output.appendLine(`Disabled -- server stopped.`);
+        this.logger.info(`Disabled -- server stopped.`);
       }
       return;
     }
@@ -1288,14 +1355,14 @@ export class DoStuffMcpServer implements vscode.Disposable {
     if (!ws) {
       if (this.httpServer) {
         await this.stop();
-        this.output.appendLine(`No workspace folder -- server stopped.`);
+        this.logger.info(`No workspace folder -- server stopped.`);
       } else {
-        this.output.appendLine(`No workspace folder -- MCP not started.`);
+        this.logger.info(`No workspace folder -- MCP not started.`);
       }
       return;
     }
 
-    const preferredPort = readPreferredPort(cfg);
+    const preferredPort = coercePreferredPort(cfg.preferredPort);
     const normalizedPath = normalizeWorkspacePath(ws.path);
     const desiredIdentity = `${normalizedPath}::${preferredPort}`;
     if (this.httpServer && this.startedFor === desiredIdentity) {
@@ -1304,19 +1371,19 @@ export class DoStuffMcpServer implements vscode.Disposable {
 
     if (this.httpServer) {
       await this.stop();
-      this.output.appendLine(`Identity changed -- restarting.`);
+      this.logger.info(`Identity changed -- restarting.`);
     }
 
     try {
       await this.start(ws, preferredPort);
       this.startedFor = desiredIdentity;
-      this.output.appendLine(
+      this.logger.info(
         `Listening on http://127.0.0.1:${this.currentPort}/mcp for ${ws.path}`,
       );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      this.output.appendLine(`Failed to start: ${msg}`);
-      vscode.window.showErrorMessage(`DoStuff MCP server failed to start: ${msg}`);
+      this.logger.error(`Failed to start: ${msg}`);
+      this.onStartError?.(msg);
     }
   }
 
@@ -1349,7 +1416,7 @@ export class DoStuffMcpServer implements vscode.Disposable {
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       if (preferredPort !== 0 && code === "EADDRINUSE") {
-        this.output.appendLine(
+        this.logger.warn(
           `Pinned port ${preferredPort} is in use -- falling back to an ephemeral port.`,
         );
         await tryBind(0);
@@ -1373,7 +1440,7 @@ export class DoStuffMcpServer implements vscode.Disposable {
         startedAt: new Date().toISOString(),
       });
     } catch (e) {
-      this.output.appendLine(
+      this.logger.error(
         `Registry write failed: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
@@ -1454,19 +1521,19 @@ export class DoStuffMcpServer implements vscode.Disposable {
         // responses only carry the one-line WORKFLOW_POINTER. Per-request
         // server construction means the live lane cap and any
         // `dostuff.mcp.instructions` override are picked up without restart.
-        instructions: readWorkflowPrompt(),
+        instructions: this.host.workflowPrompt(),
       },
     );
-    registerMcpResources(mcp, this.store);
-    registerMcpPrompts(mcp);
-    registerMcpTools(mcp, this.store);
+    registerMcpResources(mcp, this.store, this.host);
+    registerMcpPrompts(mcp, this.host);
+    registerMcpTools(mcp, this.store, this.host);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 
     try {
       await mcp.connect(transport);
       await transport.handleRequest(req, res);
     } catch (e) {
-      this.output.appendLine(`Transport error: ${e instanceof Error ? e.message : String(e)}`);
+      this.logger.error(`Transport error: ${e instanceof Error ? e.message : String(e)}`);
       if (!res.headersSent) {
         res.statusCode = 500;
         res.end(`MCP error: ${e instanceof Error ? e.message : String(e)}`);
@@ -1475,14 +1542,14 @@ export class DoStuffMcpServer implements vscode.Disposable {
       try {
         await transport.close();
       } catch (e) {
-        this.output.appendLine(
+        this.logger.error(
           `transport.close error: ${e instanceof Error ? e.message : String(e)}`,
         );
       }
       try {
         await mcp.close();
       } catch (e) {
-        this.output.appendLine(`mcp.close error: ${e instanceof Error ? e.message : String(e)}`);
+        this.logger.error(`mcp.close error: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }
@@ -1497,7 +1564,7 @@ export class DoStuffMcpServer implements vscode.Disposable {
     try {
       unregisterEntry(process.pid);
     } catch (e) {
-      this.output.appendLine(
+      this.logger.error(
         `Registry unregister failed: ${e instanceof Error ? e.message : String(e)}`,
       );
     }
@@ -1506,9 +1573,9 @@ export class DoStuffMcpServer implements vscode.Disposable {
   dispose(): void {
     void this.stop().catch((e) => {
       const msg = e instanceof Error ? e.message : String(e);
-      this.output.appendLine(`dispose error: ${msg}`);
+      this.logger.error(`dispose error: ${msg}`);
     });
-    this.output.dispose();
+    this.logger.dispose?.();
   }
 
 }
@@ -1518,7 +1585,11 @@ export class DoStuffMcpServer implements vscode.Disposable {
  * per-request server in `DoStuffMcpServer.start()` and tests can both build
  * an identically-configured MCP surface.
  */
-export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
+export function registerMcpResources(
+  mcp: McpServer,
+  store: IssueStore,
+  host: ToolHost = DEFAULT_TOOL_HOST,
+): void {
   mcp.registerResource(
     "tickets",
     "dostuff://tickets",
@@ -1545,7 +1616,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
             // Compact on purpose — these rows are uniform and shallow, so the
             // indentation bought readability that nothing was consuming.
             text: JSON.stringify({
-              workspace: getWorkspaceContext(),
+              workspace: host.workspace(),
               workflow: WORKFLOW_POINTER,
               count: tickets.length,
               detailUriTemplate: "dostuff://tickets/{id}",
@@ -1592,7 +1663,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
             text: JSON.stringify({
               workflow: WORKFLOW_POINTER,
               ticket: publicView(issue, all, {
-                recordLimit: readMcpViewOptions().recordLimit,
+                recordLimit: host.recordLimit(),
                 include: [],
               }),
             }),
@@ -1615,7 +1686,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
         {
           uri: uri.href,
           mimeType: "text/markdown",
-          text: readWorkflowPrompt(),
+          text: host.workflowPrompt(),
         },
       ],
     }),
@@ -1675,7 +1746,7 @@ export function registerMcpResources(mcp: McpServer, store: IssueStore): void {
  * Register all prompt(s) on an `McpServer`. Exposed so the per-request
  * server in `DoStuffMcpServer.start()` and tests can mirror the same setup.
  */
-export function registerMcpPrompts(mcp: McpServer): void {
+export function registerMcpPrompts(mcp: McpServer, host: ToolHost = DEFAULT_TOOL_HOST): void {
   mcp.registerPrompt(
     "workflow",
     {
@@ -1686,19 +1757,63 @@ export function registerMcpPrompts(mcp: McpServer): void {
       messages: [
         {
           role: "user",
-          content: { type: "text", text: readWorkflowPrompt() },
+          content: { type: "text", text: host.workflowPrompt() },
         },
       ],
     }),
   );
 }
 
+// ----- Write serialization (L2) ----------------------------------------------
+//
+// Skill callers are plain `curl` from Bash: parallel subagents fan out
+// concurrent HTTP mutations with none of the client-side serialization an
+// MCP-registered client applies to non-readOnlyHint tools. The handlers'
+// safety today rests on an accidental invariant — no `await` between the
+// `store.get()` read and the `store.upsert()` write — that one innocent
+// `await` would silently break. This queue makes it structural: every
+// mutating tool dispatch for a given store is serialized; reads stay
+// concurrent. Writes are a few ms, so the serialization is free at this
+// scale. Keyed per store (WeakMap) because the per-request McpServer means
+// `registerMcpTools` runs on every HTTP request.
+
+class WriteQueue {
+  private tail: Promise<unknown> = Promise.resolve();
+
+  run<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.tail.then(task);
+    // The queue must survive a rejected task; callers still see the rejection.
+    this.tail = next.catch(() => undefined);
+    return next;
+  }
+}
+
+const WRITE_QUEUES = new WeakMap<IssueStore, WriteQueue>();
+
+/** Per-store mutation queue. Exposed for the headless entry point. */
+export function storeWriteQueue(store: IssueStore): <T>(task: () => Promise<T>) => Promise<T> {
+  let queue = WRITE_QUEUES.get(store);
+  if (!queue) {
+    queue = new WriteQueue();
+    WRITE_QUEUES.set(store, queue);
+  }
+  const q = queue;
+  return (task) => q.run(task);
+}
+
 /**
- * Register the four ticket tools on an `McpServer`. Exposed so tests can
- * exercise the same SDK-validated tool path against an in-memory transport
- * pair without standing up the HTTP server.
+ * Register the ticket tools on an `McpServer`. Exposed so tests can exercise
+ * the same SDK-validated tool path against an in-memory transport pair
+ * without standing up the HTTP server. Mutating tools are serialized through
+ * the per-store write queue; reads (`get_ticket`, `list_issues`) run
+ * concurrently.
  */
-export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
+export function registerMcpTools(
+  mcp: McpServer,
+  store: IssueStore,
+  host: ToolHost = DEFAULT_TOOL_HOST,
+): void {
+  const serialized = storeWriteQueue(store);
   mcp.registerTool(
     "get_ticket",
     {
@@ -1718,7 +1833,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       // reference instead of the ticket. Ceiling is 500,000.
       _meta: { "anthropic/maxResultSizeChars": 200_000 },
     },
-    async (args) => runGetTicket(store, args as GetTicketInput),
+    async (args) => runGetTicket(store, args as GetTicketInput, host),
   );
 
   mcp.registerTool(
@@ -1734,7 +1849,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
       inputSchema: LIST_ISSUES_INPUT,
       annotations: { readOnlyHint: true },
     },
-    async (args) => runListIssues(store, args as ListIssuesInput),
+    async (args) => runListIssues(store, args as ListIssuesInput, host),
   );
 
   mcp.registerTool(
@@ -1750,12 +1865,10 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "with a warning; links cannot be edited afterwards via the MCP server.",
       inputSchema: NEW_TICKET_INPUT,
     },
-    async (args) => runCreateTicket(store, args as CreateTicketInput),
+    async (args) => serialized(() => runCreateTicket(store, args as CreateTicketInput, host)),
   );
 
-  const liveCap = vscode.workspace
-    .getConfiguration("dostuff")
-    .get<number>("activeLaneCap", ACTIVE_LANE_CAP);
+  const liveCap = host.activeLaneCap();
   mcp.registerTool(
     "update_ticket_status",
     {
@@ -1767,7 +1880,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         `Each active lane is capped at ${liveCap} tickets; a move that would exceed the cap is rejected. Thinking is uncapped.`,
       inputSchema: STATUS_INPUT,
     },
-    async (args) => runUpdateTicketStatus(store, args as UpdateStatusInput),
+    async (args) => serialized(() => runUpdateTicketStatus(store, args as UpdateStatusInput, host)),
   );
 
   mcp.registerTool(
@@ -1785,7 +1898,8 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "To reshape a draft's tags/links/task-list, use update_ticket_draft (Thinking only).",
       inputSchema: PROGRESS_INPUT,
     },
-    async (args) => runUpdateTicketProgress(store, args as UpdateProgressInput),
+    async (args) =>
+      serialized(() => runUpdateTicketProgress(store, args as UpdateProgressInput, host)),
   );
 
   mcp.registerTool(
@@ -1800,7 +1914,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "Link kinds: blocks, child-of, relates-to (unknown targets are dropped).",
       inputSchema: DRAFT_INPUT,
     },
-    async (args) => runUpdateTicketDraft(store, args as UpdateDraftInput),
+    async (args) => serialized(() => runUpdateTicketDraft(store, args as UpdateDraftInput, host)),
   );
 
   mcp.registerTool(
@@ -1812,7 +1926,8 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "changes (plus a record entry) — title, priority, type, and verifyCriteria stay locked.",
       inputSchema: DESCRIPTION_INPUT,
     },
-    async (args) => runUpdateTicketDescription(store, args as UpdateDescriptionInput),
+    async (args) =>
+      serialized(() => runUpdateTicketDescription(store, args as UpdateDescriptionInput, host)),
   );
 
   mcp.registerTool(
@@ -1828,7 +1943,7 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "ticket left the board. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
-    async (args) => runRequestTicketClose(store, args as RequestCloseInput),
+    async (args) => serialized(() => runRequestTicketClose(store, args as RequestCloseInput, host)),
   );
 
   mcp.registerTool(
@@ -1844,7 +1959,8 @@ export function registerMcpTools(mcp: McpServer, store: IssueStore): void {
         "instead. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
-    async (args) => runRequestTicketComplete(store, args as RequestCloseInput),
+    async (args) =>
+      serialized(() => runRequestTicketComplete(store, args as RequestCloseInput, host)),
   );
 }
 

@@ -24,6 +24,28 @@ export const extensionConfig: BuildOptions = {
   legalComments: "none",
 };
 
+// Headless server bundle. Deliberately NO `external: ["vscode"]` — this build
+// is the vscode-free guard for the core: if anything in serverMain's import
+// graph (storageCore, mcpServer, mcpHost, syncMerge, …) picks up a `vscode`
+// import, esbuild fails loudly right here instead of at headless runtime.
+export const serverConfig: BuildOptions = {
+  entryPoints: ["./src/serverMain.ts"],
+  bundle: true,
+  platform: "node",
+  target: "node18",
+  outfile: "./dist/server.cjs",
+  format: "cjs",
+  loader: {
+    ".ts": "ts",
+    ".js": "js",
+  },
+  logLevel: "info",
+  sourcemap: true,
+  minify: true,
+  treeShaking: true,
+  legalComments: "none",
+};
+
 export const webviewConfig: BuildOptions = {
   entryPoints: ["./src/webview/index.tsx", "./src/webview/styles.css"],
   bundle: true,

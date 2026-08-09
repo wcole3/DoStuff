@@ -28,7 +28,6 @@ import {
   runRequestTicketClose,
   runRequestTicketComplete,
   registerMcpTools,
-  getWorkspaceContext,
   publicView,
   summaryView,
   statusView,
@@ -45,6 +44,7 @@ import {
   type ToolResult,
 } from "./mcpServer";
 import { ACTIVE_LANE_CAP, type Issue, type Priority, type IssueType, type Status } from "./types";
+import { vsCodeWorkspaceId } from "./mcpHostVscode";
 import {
   bootServer,
   makeIssueFactory,
@@ -378,6 +378,9 @@ describe("statusView", () => {
       "status",
       "tasks",
       "title",
+      // The CAS token for expectedUpdatedAt — cheap here, and the status
+      // poll is exactly where an agent about to write would look.
+      "updatedAt",
     ]);
     expect(view.tasks).toEqual({ total: 2, done: 1 });
   });
@@ -999,29 +1002,42 @@ describe("workspace context and workflow in tool responses", () => {
     vscode.workspace.name = undefined;
   });
 
-  test("getWorkspaceContext returns null when no workspaceFolders", () => {
+  test("vsCodeWorkspaceId returns null when no workspaceFolders", () => {
     vscode.workspace.workspaceFolders = undefined;
-    expect(getWorkspaceContext()).toBeNull();
+    expect(vsCodeWorkspaceId()).toBeNull();
   });
 
-  test("getWorkspaceContext returns name+rootPath when workspaceFolders set", () => {
+  test("vsCodeWorkspaceId returns folder path + name when workspaceFolders set", () => {
     vscode.workspace.workspaceFolders = [
       { name: "MyProject", uri: vscode.Uri.file("/home/user/MyProject"), index: 0 },
     ];
-    vscode.workspace.name = "MyProject";
-    const ctx = getWorkspaceContext();
-    expect(ctx).not.toBeNull();
-    expect(ctx!.name).toBe("MyProject");
-    expect(ctx!.rootPath).toBe("/home/user/MyProject");
+    const ws = vsCodeWorkspaceId();
+    expect(ws).not.toBeNull();
+    expect(ws!.name).toBe("MyProject");
+    expect(ws!.path).toBe("/home/user/MyProject");
   });
 
-  test("getWorkspaceContext falls back to folder name when workspace.name is undefined", () => {
+  test("vsCodeWorkspaceId honors the dostuff.mcp.workspaceOverride pin", () => {
     vscode.workspace.workspaceFolders = [
       { name: "FolderName", uri: vscode.Uri.file("/x"), index: 0 },
     ];
-    vscode.workspace.name = undefined;
-    const ctx = getWorkspaceContext();
-    expect(ctx!.name).toBe("FolderName");
+    const origGetConfiguration = vscode.workspace.getConfiguration;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (vscode.workspace as any).getConfiguration = () => ({
+      get: <T,>(key: string, defaultValue?: T): T | undefined =>
+        key === "mcp.workspaceOverride" ? ("/pinned/elsewhere" as T) : defaultValue,
+      update: () => Promise.resolve(),
+      inspect: () => undefined,
+      has: () => false,
+    });
+    try {
+      const ws = vsCodeWorkspaceId();
+      expect(ws!.path).toBe("/pinned/elsewhere");
+      expect(ws!.name).toBe("elsewhere");
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (vscode.workspace as any).getConfiguration = origGetConfiguration;
+    }
   });
 
   test("tool responses include workspace field (null when no workspace open)", async () => {
@@ -2154,6 +2170,92 @@ describe("update_ticket_description", () => {
   });
 });
 
+// ----- expectedUpdatedAt CAS (concurrency L3) --------------------------------
+// The two replace-shaped writes accept an opt-in compare-and-swap token so
+// parallel subagents editing one ticket get an explicit stale rejection
+// (carrying the fresh state) instead of a silent lost update.
+
+describe("expectedUpdatedAt CAS on the replace-shaped writes", () => {
+  test("draft: matching token succeeds and the response carries the new updatedAt", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking", tags: ["old"] })]);
+    const token = store.get("DS-001")!.updatedAt;
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      tags: ["new"],
+      expectedUpdatedAt: token,
+    });
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(res.content[0].text) as { updatedAt?: string };
+    expect(body.updatedAt).toBe(store.get("DS-001")!.updatedAt);
+    expect(store.get("DS-001")!.tags).toEqual(["new"]);
+  });
+
+  test("draft: stale token rejects, embeds the fresh lists, and writes nothing", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Thinking",
+        tags: ["current"],
+        tasks: [{ id: "t1", text: "keep me", done: false }],
+      }),
+    ]);
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      tags: ["mine"],
+      expectedUpdatedAt: "2000-01-01T00:00:00.000Z",
+    });
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("Stale expectedUpdatedAt");
+    const embedded = JSON.parse(text.slice(text.indexOf("\n") + 1)) as {
+      updatedAt: string;
+      tags: string[];
+      tasks: Array<{ text: string }>;
+    };
+    expect(embedded.updatedAt).toBe(store.get("DS-001")!.updatedAt);
+    expect(embedded.tags).toEqual(["current"]);
+    expect(embedded.tasks[0].text).toBe("keep me");
+    expect(store.get("DS-001")!.tags).toEqual(["current"]);
+  });
+
+  test("description: stale token rejects with the fresh description; matching succeeds; omitted skips the check", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", description: "their edit" }),
+    ]);
+
+    const stale = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "my edit",
+      expectedUpdatedAt: "2000-01-01T00:00:00.000Z",
+    });
+    expect(stale.isError).toBe(true);
+    const text = stale.content[0].text;
+    expect(text).toContain("Stale expectedUpdatedAt");
+    const embedded = JSON.parse(text.slice(text.indexOf("\n") + 1)) as { description: string };
+    expect(embedded.description).toBe("their edit");
+    expect(store.get("DS-001")!.description).toBe("their edit");
+
+    const ok = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "merged edit",
+      expectedUpdatedAt: store.get("DS-001")!.updatedAt,
+    });
+    expect(ok.isError).toBeFalsy();
+    expect(store.get("DS-001")!.description).toBe("merged edit");
+    expect((JSON.parse(ok.content[0].text) as { updatedAt?: string }).updatedAt).toBe(
+      store.get("DS-001")!.updatedAt,
+    );
+
+    // No token → pre-CAS behavior: last writer wins, no rejection.
+    const unguarded = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "unguarded overwrite",
+    });
+    expect(unguarded.isError).toBeFalsy();
+    expect(store.get("DS-001")!.description).toBe("unguarded overwrite");
+  });
+});
+
 describe("request_ticket_close", () => {
   for (const status of ["Thinking", "Planned", "Working", "Verification"] as const) {
     test(`flags pendingClose on a ${status} ticket without changing status`, async () => {
@@ -2901,6 +3003,43 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     const json = sseMatch ? JSON.parse(sseMatch[1]) : JSON.parse(res.body);
     return json as { result?: unknown; error?: { message: string } };
   }
+
+  test("write queue: N parallel update_ticket_progress calls all land (skill-path fan-out)", async () => {
+    // Skill callers are bare curl — parallel subagents produce genuinely
+    // concurrent HTTP mutations with no client-side serialization. Open the
+    // read-modify-write window explicitly: a delay inside upsert *after* the
+    // handler's store.get() means that without the per-store write queue,
+    // later handlers read stale state and erase earlier record entries
+    // (last writer wins). With the queue, every entry must land.
+    const store = await makeStore([makeIssue({ id: "DS-001", number: 1, status: "Working" })]);
+    const origUpsert = store.upsert.bind(store);
+    store.upsert = async (issue: Issue, opts?: { preserveTimestamps?: boolean }) => {
+      await new Promise((r) => setTimeout(r, 2));
+      return origUpsert(issue, opts);
+    };
+    ({ server, port } = await bootServer(store));
+
+    const N = 8;
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        mcpJsonRpc(port, "tools/call", {
+          name: "update_ticket_progress",
+          arguments: { id: "DS-001", recordEntry: `parallel entry ${i}` },
+        }),
+      ),
+    );
+    for (const r of results) {
+      expect(r.error).toBeUndefined();
+      expect((r.result as { isError?: boolean }).isError ?? false).toBe(false);
+    }
+
+    const ticket = store.get("DS-001")!;
+    expect(ticket.record).toHaveLength(N);
+    const texts = ticket.record.map((e) => e.text);
+    for (let i = 0; i < N; i++) {
+      expect(texts).toContain(`parallel entry ${i}`);
+    }
+  });
 
   test("resource dostuff://tickets returns Thinking + active-lane tickets (Complete/Closed hidden)", async () => {
     const store = await makeStore([

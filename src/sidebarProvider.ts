@@ -18,7 +18,7 @@ import {
   type TicketLink,
   type WebviewToHost,
 } from "./types";
-import { validateLinks } from "./extension";
+import { validateLinks } from "./types";
 
 /** The `createIssue` message's `partial` payload (webview → host). */
 export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>["partial"];

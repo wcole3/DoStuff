@@ -174,8 +174,8 @@ export const DS_ID_RE = /^DS-\d+$/;
  * `coerceTags` / `coerceAttachments`: forgiving (returns `[]` on bad shapes),
  * dedupes by `(targetId, kind)` pair, drops self-links.
  *
- * Unknown-target validation is NOT done here (no store access). That belongs
- * to host-side `validateLinks` in `extension.ts` so we keep this module pure.
+ * Unknown-target validation is NOT done here (no store access) — that is
+ * `validateLinks` below, which takes the caller's known-id set.
  */
 export function coerceLinks(input: unknown, currentIssueId?: string): TicketLink[] {
   if (!Array.isArray(input)) return [];
@@ -194,6 +194,36 @@ export function coerceLinks(input: unknown, currentIssueId?: string): TicketLink
     out.push({ targetId: rawTarget, kind: r.kind });
   }
   return out;
+}
+
+/**
+ * Drop links whose `targetId` isn't in `knownIds` (issues that don't exist) or
+ * that equal `currentIssueId` (self-link). The caller is responsible for
+ * coercing the array shape via `coerceLinks` first; this step is the
+ * cross-issue validity check that needs the caller's id set.
+ *
+ * Returns `{ kept, dropped }` so the caller can decide whether to log; both
+ * arrays preserve the original order.
+ */
+export function validateLinks(
+  links: TicketLink[],
+  currentIssueId: string,
+  knownIds: ReadonlySet<string>,
+): { kept: TicketLink[]; dropped: TicketLink[] } {
+  const kept: TicketLink[] = [];
+  const dropped: TicketLink[] = [];
+  for (const l of links) {
+    if (l.targetId === currentIssueId) {
+      dropped.push(l);
+      continue;
+    }
+    if (!knownIds.has(l.targetId)) {
+      dropped.push(l);
+      continue;
+    }
+    kept.push(l);
+  }
+  return { kept, dropped };
 }
 
 export interface Issue {

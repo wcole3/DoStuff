@@ -5,7 +5,10 @@ import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { backfillSyncFields, isIsoTimestamp, isSafePathSegment, sanitizeExt } from "./syncMerge";
-import { GitSyncController } from "./gitSync";
+import { clampSyncInterval, GitSyncController } from "./gitSync";
+
+// Moved to gitSync.ts with the headless split; re-exported for old importers.
+export { clampSyncInterval } from "./gitSync";
 import { createCommitDetailsFetcher } from "./commitDetails";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
@@ -26,12 +29,17 @@ import {
   isPriority,
   isStatus,
   isType,
+  validateLinks,
   type Attachment,
   type Issue,
   type Status,
   type StatusEvent,
-  type TicketLink,
 } from "./types";
+import { outputChannelLogger, readVsCodeMcpConfig, vsCodeWorkspaceId } from "./mcpHostVscode";
+
+// `validateLinks` lived here before the headless-server split; re-exported so
+// old import sites keep working (it is pure and now lives in types.ts).
+export { validateLinks } from "./types";
 
 
 export type UpdateBy = "user" | "agent";
@@ -78,36 +86,6 @@ export function inferMimeType(filename: string): string {
  * already-done ticket), `resolvedAt` is cleared. This is intentional — humans
  * can correct mistakes; the MCP layer enforces a stricter contract for agents.
  */
-/**
- * Drop links whose `targetId` isn't in `knownIds` (issues that don't exist) or
- * that equal `currentIssueId` (self-link). The caller is responsible for
- * coercing the array shape via `coerceLinks` first; this step is the
- * cross-issue validity check that needs store access.
- *
- * Returns `{ kept, dropped }` so the caller can decide whether to log; both
- * arrays preserve the original order.
- */
-export function validateLinks(
-  links: TicketLink[],
-  currentIssueId: string,
-  knownIds: ReadonlySet<string>,
-): { kept: TicketLink[]; dropped: TicketLink[] } {
-  const kept: TicketLink[] = [];
-  const dropped: TicketLink[] = [];
-  for (const l of links) {
-    if (l.targetId === currentIssueId) {
-      dropped.push(l);
-      continue;
-    }
-    if (!knownIds.has(l.targetId)) {
-      dropped.push(l);
-      continue;
-    }
-    kept.push(l);
-  }
-  return { kept, dropped };
-}
-
 export function mergeIssueUpdate(
   prior: Issue,
   incoming: Partial<Issue>,
@@ -316,17 +294,6 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
     issue.links = kept;
   }
   return { valid, skipped };
-}
-
-/**
- * Clamp `dostuff.sync.intervalMinutes` to sane bounds: `<= 0` (or garbage)
- * means manual-only network sync; anything positive lands in [1, 120].
- * package.json's declared min/max only constrain the settings UI.
- */
-export function clampSyncInterval(value: unknown): number {
-  const n = typeof value === "number" && Number.isFinite(value) ? value : 5;
-  if (n <= 0) return 0;
-  return Math.min(120, Math.max(1, n));
 }
 
 /** Lanes that exceed `cap` in the given set. Empty if all within cap. */
@@ -919,18 +886,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   // ─── MCP server ───────────────────────────────────────────────────────
   // Workspace identity feeds the user-global registry so external agents can
-  // discover which ephemeral port serves which workspace. The override setting
-  // lets the user pin an explicit path when the auto-pick is wrong.
-  const workspaceId = () => {
-    const override = vscode.workspace
-      .getConfiguration("dostuff")
-      .get<string>("mcp.workspaceOverride", "")
-      .trim();
-    if (override) return { path: override, name: path.basename(override) || override };
-    const root = vscode.workspace.workspaceFolders?.[0];
-    if (!root) return null;
-    return { path: root.uri.fsPath, name: root.name };
-  };
+  // discover which ephemeral port serves which workspace (vsCodeWorkspaceId
+  // honors the dostuff.mcp.workspaceOverride pin). Config/logging go through
+  // the vscode host adapters so the server core stays vscode-free.
   // Lazy-construct the MCP server so the heavy SDK + zod module isn't
   // parsed during activate(). First call to reconcileMcp() awaits the
   // dynamic import; subsequent calls reuse the cached instance.
@@ -940,7 +898,13 @@ export function activate(context: vscode.ExtensionContext) {
     if (mcp) return Promise.resolve(mcp);
     if (!mcpLoadPromise) {
       mcpLoadPromise = import("./mcpServer").then((m) => {
-        const instance = new m.DoStuffMcpServer(store, workspaceId);
+        const instance = new m.DoStuffMcpServer(store, vsCodeWorkspaceId, {
+          config: readVsCodeMcpConfig,
+          logger: outputChannelLogger("DoStuff MCP"),
+          onStartError: (msg) => {
+            void vscode.window.showErrorMessage(`DoStuff MCP server failed to start: ${msg}`);
+          },
+        });
         mcp = instance;
         context.subscriptions.push(instance);
         return instance;
@@ -1051,10 +1015,10 @@ export function activate(context: vscode.ExtensionContext) {
         if (pick !== "Replace") return;
       }
       try {
-        const { copied } = installAgentSkill(src, dest);
+        const { copied } = installAgentSkill(src, dest, extensionVersion());
         vscode.window.showInformationMessage(
           `DoStuff: installed the Claude Code agent skill (${copied.length} files) to ${dest}. ` +
-            "New Claude Code sessions pick it up automatically.",
+            "New Claude Code sessions pick it up automatically; it stays current across extension updates.",
         );
       } catch (e) {
         const msg = e instanceof SkillInstallError ? e.message : e instanceof Error ? e.message : String(e);
@@ -1062,6 +1026,40 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
   );
+
+  const extensionVersion = (): string =>
+    (context.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
+
+  // Keep a previously installed skill current with this build. Only touches
+  // installs the command created (marker file present) and only when the copy
+  // is byte-identical to what was installed — local edits get a prompt, never
+  // a silent overwrite. Fire-and-forget: must not delay activation.
+  void (async () => {
+    try {
+      const os = await import("node:os");
+      const { maybeUpdateAgentSkill, installAgentSkill } = await import("./skillInstall");
+      const src = context.asAbsolutePath(path.join("skills", "dostuff-tickets"));
+      const dest = path.join(os.homedir(), ".claude", "skills", "dostuff-tickets");
+      const result = maybeUpdateAgentSkill(src, dest, extensionVersion());
+      if (result.action === "updated") {
+        vscode.window.showInformationMessage(
+          `DoStuff: agent skill updated ${result.from} → ${result.to} (new Claude Code sessions pick it up).`,
+        );
+      } else if (result.action === "modified") {
+        const pick = await vscode.window.showWarningMessage(
+          `DoStuff: the installed agent skill (${result.from}) has local edits; this build ships ${result.to}. Replace it?`,
+          "Replace",
+          "Keep mine",
+        );
+        if (pick === "Replace") {
+          installAgentSkill(src, dest, extensionVersion());
+          vscode.window.showInformationMessage(`DoStuff: agent skill updated to ${result.to}.`);
+        }
+      }
+    } catch {
+      // Best effort — never block or break activation over the skill copy.
+    }
+  })();
   // Fire-and-forget so the extension is marked active before the MCP SDK
   // dynamic import + port bind + registry write resolve (~50–200 ms).
   void reconcileMcp();
@@ -1125,6 +1123,12 @@ export function activate(context: vscode.ExtensionContext) {
         activeLaneCap: cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP),
         syncAttachments: cfg.get<boolean>("sync.syncAttachments", true),
         maxAttachmentSyncBytes: cfg.get<number>("sync.maxAttachmentSyncBytes", 5242880),
+        // The controller is host-agnostic (headless serves it too); toasts
+        // are this host's notification surface.
+        notify: (kind, message) => {
+          if (kind === "warn") void vscode.window.showWarningMessage(message);
+          else void vscode.window.showInformationMessage(message);
+        },
       },
     );
     sync = controller;

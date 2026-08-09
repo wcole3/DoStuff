@@ -8,8 +8,9 @@
 import * as vscode from "vscode";
 import { formatIssueId } from "./syncMerge";
 import { IssueStore } from "./storage";
+import { DEFAULT_RECORD_LIMIT, type McpConfig } from "./mcpHost";
 import type { DoStuffMcpServer } from "./mcpServer";
-import type { Issue, IssueType, Priority, Status } from "./types";
+import { ACTIVE_LANE_CAP, type Issue, type IssueType, type Priority, type Status } from "./types";
 
 /**
  * Returns a fresh counter-backed `makeIssue`. Each suite creates its own so
@@ -112,23 +113,30 @@ export async function makeTestStore(seed: Issue[] = []): Promise<IssueStore> {
   return store;
 }
 
-let __origGetConfig: typeof vscode.workspace.getConfiguration | null = null;
+// Config stub for the MCP host seam. `setMcpConfig` replaces the whole value
+// record (same wholesale semantics the old getConfiguration patch had);
+// `testMcpConfigProvider` reads it live, so a test can flip `mcp.enabled` or
+// `mcp.port` mid-flight and the next reconcile()/request sees it. Keys use the
+// `dostuff.*` setting spellings so call sites read like the real settings.
+let __mcpConfigValues: Record<string, unknown> = {};
 
 export function setMcpConfig(values: Record<string, unknown>): void {
-  if (!__origGetConfig) __origGetConfig = vscode.workspace.getConfiguration;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (vscode.workspace as any).getConfiguration = (_section?: string) => ({
-    get: <T,>(key: string, defaultValue?: T): T | undefined =>
-      (key in values ? (values[key] as T) : defaultValue),
-    update: () => Promise.resolve(),
-    inspect: () => undefined,
-    has: () => false,
-  });
+  __mcpConfigValues = { ...values };
 }
 
 export function restoreMcpConfig(): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  if (__origGetConfig) (vscode.workspace as any).getConfiguration = __origGetConfig;
+  __mcpConfigValues = {};
+}
+
+export function testMcpConfigProvider(): McpConfig {
+  const v = __mcpConfigValues;
+  return {
+    enabled: (v["mcp.enabled"] as boolean | undefined) ?? true,
+    preferredPort: (v["mcp.port"] as number | undefined) ?? 0,
+    instructions: v["mcp.instructions"] as string | undefined,
+    activeLaneCap: (v["activeLaneCap"] as number | undefined) ?? ACTIVE_LANE_CAP,
+    recordLimit: (v["mcp.recordLimit"] as number | undefined) ?? DEFAULT_RECORD_LIMIT,
+  };
 }
 
 // Each booted server gets a distinct synthetic workspace path so registry
@@ -155,7 +163,9 @@ export async function bootServer(
   if (opts.preferredPort !== undefined) cfg["mcp.port"] = opts.preferredPort;
   setMcpConfig(cfg);
   const { DoStuffMcpServer: ServerCtor } = await import("./mcpServer");
-  const server = new ServerCtor(store, opts.workspaceId ?? makeWorkspaceId());
+  const server = new ServerCtor(store, opts.workspaceId ?? makeWorkspaceId(), {
+    config: testMcpConfigProvider,
+  });
   await server.reconcile();
   return { server, port: server.status.port ?? 0 };
 }

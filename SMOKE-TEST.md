@@ -63,9 +63,18 @@ Setup: enable the server (**DoStuff: Toggle MCP Server**), pin or read the port,
 ## 5b. Agent skill (Claude Code without MCP registration)
 
 - [ ] **DoStuff: Install Claude Code Agent Skill** copies the skill to `~/.claude/skills/dostuff-tickets` (toast names the path); re-running prompts before replacing.
+- [ ] Auto-update: with the skill installed by the command, edit `.dostuff-skill.json` to a lower version and reload the window → toast "agent skill updated x → y", files refreshed. Repeat but also append a line to the installed SKILL.md → "Replace / Keep mine" prompt; "Keep mine" leaves the edit in place. A skill dir *without* the marker is never touched.
 - [ ] In a fresh Claude Code session with **no** dostuff MCP server registered, `/dostuff-tickets` loads the skill; asking to "list my tickets" runs `scripts/dostuff.sh` and returns the board.
 - [ ] On Windows (Git Bash), `dostuff.sh discover` resolves the right instance despite the registry's lowercased `C:\` paths; if it misses, `DOSTUFF_PORT` and the pinned-port fallback both work.
 - [ ] With the MCP server *also* registered, the agent prefers the `mcp__dostuff__*` tools over curl (coexistence rule in SKILL.md).
+
+## 5c. Headless server
+
+- [ ] With **no** VSCode window on the workspace: `node dist/server.cjs serve --workspace <repo>` prints `{"port": N, ...}`; `dostuff.sh discover` from the skill resolves it; `create_ticket` → ticket lands in `.vscode/dostuff/dostuff.db`; open the workspace in VSCode afterwards → the ticket is on the board.
+- [ ] `--print-config` in a workspace with `dostuff.activeLaneCap` set in `.vscode/settings.json` (with comments/trailing commas) shows the value with provenance `settings.json`.
+- [ ] With a VSCode window already serving the workspace: `serve` exits 3 naming the pid/port; `--takeover` starts anyway.
+- [ ] `Ctrl-C` the server → registry entry removed (`node dist/server.cjs status`).
+- [ ] Sync: workspace with `dostuff.sync.enabled: true` in settings.json + a remote — headless `serve`, file a ticket via the skill, wait a cycle → `git for-each-ref 'refs/dostuff/*'` shows the state ref advanced; a VSCode window on a second clone converges.
 
 ## 6. Git ticket sync
 

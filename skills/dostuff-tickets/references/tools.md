@@ -22,12 +22,12 @@ hit the right instance.
 | param | type | notes |
 |---|---|---|
 | `query` | string, required | ticket number (`"42"`/`"#42"`), id (`"DS-042"`), or case-insensitive title substring |
-| `view` | `"full"` (default) \| `"status"` | `"status"` = poll view: only id/number/title/status/pendingClose/task counts |
+| `view` | `"full"` (default) \| `"status"` | `"status"` = poll view: only id/number/title/status/updatedAt/pendingClose/task counts |
 | `recordLimit` | int 0–500 | newest N record entries; `0` = whole log; default is server-configured (usually 3) |
 | `include` | array of `"commits"` \| `"verifyCriteria"` | restore sections the response names in `omitted` |
 
 Response (`view: "full"`): `{workspace, workflow, ticket}` where ticket has
-`id, number, title, type, priority, status, description, verifyCriteria`
+`id, number, title, type, priority, status, updatedAt, description, verifyCriteria`
 (sliced past 2,000 chars unless included; then `verifyCriteriaTruncated: true`),
 `tags, tasks[{id,text,done}], record[{at,author,source,text}]`
 (+ `recordCount`/`recordOmitted` when windowed), `attachments[]`,
@@ -101,10 +101,18 @@ through `update_ticket_description`. Non-terminal tickets only.
 | `tags` | string[] | each ≤64 chars; omit = unchanged, `[]` = clear |
 | `links` | `[{targetId, kind}]` | same omit/clear semantics |
 | `tasks` | `[{text, done?}]` | text 1–500 chars |
+| `expectedUpdatedAt` | string, optional | CAS guard: the `updatedAt` from your last read |
 
-Response: `{workspace, id, tags, links, tasks}` (post-update lists). Rejected
-once the ticket leaves Thinking — fall back to `update_ticket_progress` for
+Response: `{workspace, id, updatedAt, tags, links, tasks}` (post-update lists;
+`updatedAt` is the token for a follow-up guarded write). Rejected once the
+ticket leaves Thinking — fall back to `update_ticket_progress` for
 done-toggles and `update_ticket_description` for prose.
+
+This tool **replaces** whole lists, so concurrent writers can silently erase
+each other. Pass `expectedUpdatedAt` when another agent might touch the same
+ticket: a stale token is rejected with the fresh `{updatedAt, tags, links,
+tasks}` embedded in the error — re-apply your edit to that state and retry
+with the new token.
 
 ## update_ticket_description
 
@@ -113,9 +121,13 @@ done-toggles and `update_ticket_description` for prose.
 | `id` | `DS-\d+`, required | |
 | `description` | string, required | ≤10000 chars |
 | `note` | string | ≤500 chars record entry |
+| `expectedUpdatedAt` | string, optional | CAS guard: the `updatedAt` from your last read |
 
-Response: `{workspace, id}`. The only MCP path that changes prose.
-Non-terminal tickets only.
+Response: `{workspace, id, updatedAt}`. The only MCP path that changes prose.
+Non-terminal tickets only. Replace-shaped like `update_ticket_draft`: with
+`expectedUpdatedAt` set, a ticket that changed since your read rejects the
+write and embeds the fresh `{updatedAt, description}` so you can merge and
+retry instead of silently overwriting someone else's edit.
 
 ## request_ticket_close / request_ticket_complete
 

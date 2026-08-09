@@ -107,7 +107,11 @@ Resources (`resource` subcommand): `dostuff://tickets` (summary index),
   if two must touch one ticket, use only the delta tools
   (`update_ticket_progress` toggles by task id, records/commits append) —
   never `update_ticket_draft`, which replaces whole lists and silently drops
-  the other writer's edit. Reads are always safe to parallelize.
+  the other writer's edit. Reads are always safe to parallelize. When a
+  replace-shaped write (`update_ticket_draft` / `update_ticket_description`)
+  can't be avoided on a shared ticket, pass `expectedUpdatedAt` (the
+  `updatedAt` from your read) — a stale token rejects with the fresh state
+  instead of silently losing the other edit (see `references/tools.md`).
 - **Write terse** — every byte you write is re-read on each later ticket read.
   Record notes: one line, ~15 words, facts and outcomes; no narration, no
   restating the ticket. Descriptions: 1-2 sentences of what + why first
@@ -117,9 +121,20 @@ Resources (`resource` subcommand): `dostuff://tickets` (summary index),
 ## Errors
 
 - **Connection refused / no registry entry**: the extension isn't running, or
-  `dostuff.mcp.enabled` is false, or the entry is stale — re-run `discover`;
-  ask the user to open the workspace in VSCode and enable
-  `dostuff.mcp.enabled`.
+  `dostuff.mcp.enabled` is false, or the entry is stale — re-run `discover`.
+  Two fixes, either works: ask the user to open the workspace in VSCode with
+  `dostuff.mcp.enabled` on, **or start the bundled headless server** (no
+  VSCode needed — same DB, same API, same registry):
+
+  ```sh
+  node "$DOSTUFF_SERVER_JS" serve --workspace /path/to/repo
+  # $DOSTUFF_SERVER_JS unset? It ships in the extension install — pick the
+  # newest: ls -d ~/.vscode/extensions/*dostuff*/dist/server.cjs | tail -1
+  ```
+
+  Suggest the command and let the user (or an approved agent step) run it —
+  it stays in the foreground and refuses a workspace another live instance
+  already serves (exit 3; `--takeover` for zombies).
 - **HTTP 403**: use literal `127.0.0.1` as the host (the server rejects other
   Host/Origin values).
 - **`ERROR:` / `isError` responses**: the message states the violated rule
