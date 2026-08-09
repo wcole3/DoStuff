@@ -1,7 +1,9 @@
 // Sidebar provider — the WebviewView shown in the activity bar.
 
 import * as vscode from "vscode";
+import { randomUUID } from "node:crypto";
 import { IssueStore } from "./storage";
+import { formatIssueId } from "./syncMerge";
 import { getWebviewHtml } from "./webviewHtml";
 import {
   coerceLinks,
@@ -9,13 +11,14 @@ import {
   isLinkKind,
   isPriority,
   isType,
+  type CommitDetail,
   type Issue,
   type LinkKind,
   type Settings,
   type TicketLink,
   type WebviewToHost,
 } from "./types";
-import { validateLinks } from "./extension";
+import { validateLinks } from "./types";
 
 /** The `createIssue` message's `partial` payload (webview → host). */
 export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>["partial"];
@@ -27,6 +30,21 @@ export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>
  * reverts whatever optimistic UI state it had applied.
  */
 export type ApplyIssueUpdate = (issue: Issue) => Promise<void>;
+
+/**
+ * Host-supplied resolver for a ticket's commit anchors: reads the shas from
+ * the store itself (never from the webview) and derives subject + files from
+ * the workspace repo. See `createCommitDetailsFetcher` in commitDetails.ts.
+ * Defaulted to an empty result so tests without git keep working.
+ */
+export type FetchCommitDetails = (
+  issueId: string,
+) => Promise<{ pathPrefix: string; details: CommitDetail[] }>;
+
+export const NO_OP_COMMIT_DETAILS: FetchCommitDetails = async () => ({
+  pathPrefix: ".",
+  details: [],
+});
 
 /**
  * Host-side callbacks for cross-webview "drag from sidebar to board" flow.
@@ -103,16 +121,16 @@ function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
 
 /**
  * Build the `Issue` for a new ticket from the webview's `createIssue` partial.
- * New tickets always land in `Thinking` (only humans promote out of it). Tags
- * are coerced; inline forward links are coerced + validated against `knownIds`
- * (unknown targets and self-links are dropped and returned in `droppedLinks`
- * so the caller can log). Pure — no store access.
+ * New tickets always land in `Thinking` (humans or agents may promote them
+ * out later). Tags are coerced; inline forward links are coerced + validated
+ * against `knownIds` (unknown targets and self-links are dropped and returned
+ * in `droppedLinks` so the caller can log). Pure — no store access.
  */
 export function buildCreatedIssue(
   partial: CreateIssuePartial,
   opts: { number: number; now: string; knownIds: ReadonlySet<string> },
 ): { issue: Issue; droppedLinks: TicketLink[] } {
-  const id = `DS-${String(opts.number).padStart(3, "0")}`;
+  const id = formatIssueId(opts.number);
   const status: Issue["status"] = "Thinking";
   const { kept, dropped } = validateLinks(
     coerceLinks((partial as { links?: unknown }).links, id),
@@ -128,14 +146,21 @@ export function buildCreatedIssue(
     status,
     description: typeof partial.description === "string" ? partial.description : "",
     verifyCriteria: typeof partial.verifyCriteria === "string" ? partial.verifyCriteria : "",
-    tasks: Array.isArray(partial.tasks) ? partial.tasks : [],
+    tasks: (Array.isArray(partial.tasks) ? partial.tasks : []).map((t) => ({
+      ...t,
+      updatedAt: opts.now,
+    })),
     tags: coerceTags((partial as { tags?: unknown }).tags),
     attachments: [],
     links: kept,
     createdAt: opts.now,
     resolvedAt: null,
+    pendingClose: null,
     statusHistory: [{ status, at: opts.now, by: "user" }],
     record: [],
+    guid: randomUUID(),
+    updatedAt: opts.now,
+    commits: [],
   };
   return { issue, droppedLinks: dropped };
 }
@@ -225,6 +250,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
     private readonly externalDrag: ExternalDragSignals = { onStart: () => {} },
     private readonly openLink: (url: string) => void | Promise<void> = () => {},
     private readonly attachments: AttachmentHandlers = NO_OP_ATTACHMENTS,
+    private readonly fetchCommitDetails: FetchCommitDetails = NO_OP_COMMIT_DETAILS,
   ) {
     this.output = vscode.window.createOutputChannel("DoStuff Webview");
     this.disposables.push(this.output);
@@ -509,6 +535,34 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
       case "openGraph":
         vscode.commands.executeCommand("dostuff.openGraph");
         break;
+      case "fetchCommitDetails": {
+        const id = (msg as { issueId?: unknown }).issueId;
+        if (typeof id !== "string" || !ID_RE.test(id)) {
+          this.output.appendLine(`Rejected fetchCommitDetails: bad id (${JSON.stringify(id)})`);
+          break;
+        }
+        const result = await this.fetchCommitDetails(id);
+        this.view?.webview.postMessage({
+          type: "commitDetails",
+          issueId: id,
+          pathPrefix: result.pathPrefix,
+          details: result.details,
+        });
+        break;
+      }
+      case "resolveClose": {
+        const m = msg as { id?: unknown; verdict?: unknown };
+        if (
+          typeof m.id !== "string" ||
+          !ID_RE.test(m.id) ||
+          (m.verdict !== "approve" && m.verdict !== "deny")
+        ) {
+          this.output.appendLine(`Rejected resolveClose: bad payload (${JSON.stringify(msg)})`);
+          break;
+        }
+        vscode.commands.executeCommand("dostuff.resolveClose", { id: m.id, verdict: m.verdict });
+        break;
+      }
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;

@@ -5,35 +5,19 @@
 // in or out of "Complete".
 
 import { beforeEach, describe, expect, test } from "bun:test";
-import { mergeIssueUpdate, validateLinks, type UpdateBy } from "./extension";
+import {
+  clampSyncInterval,
+  mergeIssueUpdate,
+  resolveCloseRequest,
+  validateImportList,
+  validateLinks,
+  type UpdateBy,
+} from "./extension";
+import { deriveGuid } from "./syncMerge";
 import type { Issue, IssueType, Priority, Status, StatusEvent, TicketLink } from "./types";
+import { makeIssueFactory } from "./testSupport";
 
-let issueCounter = 0;
-function makeIssue(overrides: Partial<Issue> = {}): Issue {
-  issueCounter += 1;
-  const number = overrides.number ?? issueCounter;
-  const id = overrides.id ?? `DS-${String(number).padStart(3, "0")}`;
-  const at = overrides.createdAt ?? new Date(2025, 0, 1, 0, 0, number).toISOString();
-  return {
-    id,
-    number,
-    title: overrides.title ?? `Issue ${number}`,
-    type: overrides.type ?? ("Feature" as IssueType),
-    priority: overrides.priority ?? ("Regular" as Priority),
-    status: overrides.status ?? ("Planned" as Status),
-    description: overrides.description ?? "",
-    tasks: overrides.tasks ?? [],
-    tags: overrides.tags ?? [],
-    verifyCriteria: overrides.verifyCriteria ?? "",
-    createdAt: at,
-    resolvedAt: overrides.resolvedAt ?? null,
-    statusHistory:
-      overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
-    record: overrides.record ?? [],
-    attachments: overrides.attachments ?? [],
-    links: overrides.links ?? [],
-  };
-}
+const makeIssue = makeIssueFactory();
 
 function ok<T extends { next: Issue } | { error: string }>(r: T): Issue {
   if ("error" in r) throw new Error(`expected success, got error: ${r.error}`);
@@ -41,7 +25,7 @@ function ok<T extends { next: Issue } | { error: string }>(r: T): Issue {
 }
 
 beforeEach(() => {
-  issueCounter = 0;
+  makeIssue.reset();
 });
 
 describe("mergeIssueUpdate — field merging", () => {
@@ -263,6 +247,244 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
     expect(next.createdAt).toBe(prior.createdAt);
     expect(next.record).toBe(prior.record);
     expect(next.title).toBe("renamed");
+  });
+
+  test("incoming.pendingClose is ignored; prior.pendingClose survives a normal edit", () => {
+    const prior = makeIssue({
+      status: "Working",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "keep" },
+    });
+    const incoming: Partial<Issue> = {
+      title: "edit",
+      // A stale/hostile webview payload forging a clear must be ignored:
+      // pendingClose is preserved via `...prior`, never taken from `incoming`.
+      pendingClose: null,
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+
+    expect(next.pendingClose).toBe(prior.pendingClose);
+    expect(next.pendingClose).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z", note: "keep" });
+    expect(next.title).toBe("edit");
+  });
+
+  test("incoming.guid/updatedAt are ignored; prior values survive a normal edit", () => {
+    const prior = makeIssue({
+      status: "Working",
+      guid: "real-guid",
+      updatedAt: "2026-05-18T00:00:00.000Z",
+    });
+    const incoming: Partial<Issue> = {
+      title: "edit",
+      // Forged sync identity/ordering from a stale/hostile webview payload
+      // must be ignored — both come from `...prior` by construction (and
+      // `IssueStore.upsert` then restamps `updatedAt` server-side).
+      guid: "forged-guid",
+      updatedAt: "2099-01-01T00:00:00.000Z",
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+
+    expect(next.guid).toBe("real-guid");
+    expect(next.updatedAt).toBe("2026-05-18T00:00:00.000Z");
+    expect(next.title).toBe("edit");
+  });
+
+  test("incoming.commits is ignored; prior.commits survive a normal edit", () => {
+    const prior = makeIssue({
+      status: "Working",
+      commits: [{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }],
+    });
+    const incoming: Partial<Issue> = {
+      title: "edit",
+      // The webview must not be able to forge or clear commit anchors —
+      // only MCP update_ticket_progress appends them.
+      commits: [{ sha: "0000000", at: "2026-07-02T00:00:00.000Z" }],
+    };
+    const next = ok(mergeIssueUpdate(prior, incoming, "user"));
+
+    expect(next.commits).toBe(prior.commits);
+    expect(next.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
+    expect(next.title).toBe("edit");
+  });
+});
+
+describe("resolveCloseRequest", () => {
+  const NOW = () => "2026-06-01T00:00:00.000Z";
+
+  test("approve moves the ticket to Closed, clears the flag, appends user history + record", () => {
+    const prior = makeIssue({
+      status: "Working",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
+    });
+    const next = resolveCloseRequest(prior, "approve", NOW);
+    expect(next).not.toBeNull();
+    expect(next!.status).toBe("Closed");
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.statusHistory.at(-1)).toEqual({ status: "Closed", at: NOW(), by: "user" });
+    expect(next!.record.at(-1)).toMatchObject({ author: "user", text: "Close request approved" });
+    // Closed is "won't do" — never stamps acceptance.
+    expect(next!.resolvedAt).toBe(prior.resolvedAt);
+  });
+
+  test("approve with target 'Complete' moves to Complete, stamps resolvedAt, records acceptance", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      resolvedAt: null,
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = resolveCloseRequest(prior, "approve", NOW);
+    expect(next).not.toBeNull();
+    expect(next!.status).toBe("Complete");
+    expect(next!.resolvedAt).toBe(NOW());
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.statusHistory.at(-1)).toEqual({ status: "Complete", at: NOW(), by: "user" });
+    expect(next!.record.at(-1)).toMatchObject({ author: "user", text: "Completion request approved" });
+  });
+
+  test("deny of a completion request records the completion wording, status unchanged", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = resolveCloseRequest(prior, "deny", NOW);
+    expect(next!.status).toBe("Verification");
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.record.at(-1)).toMatchObject({ text: "Completion request denied" });
+  });
+
+  test("deny clears the flag, leaves status + history unchanged, appends a user record", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
+    });
+    const next = resolveCloseRequest(prior, "deny", NOW);
+    expect(next).not.toBeNull();
+    expect(next!.status).toBe("Verification");
+    expect(next!.pendingClose).toBeNull();
+    expect(next!.statusHistory).toBe(prior.statusHistory);
+    expect(next!.record.at(-1)).toMatchObject({ author: "user" });
+  });
+
+  test("returns null when there is nothing pending to resolve", () => {
+    const prior = makeIssue({ status: "Working", pendingClose: null });
+    expect(resolveCloseRequest(prior, "approve", NOW)).toBeNull();
+    expect(resolveCloseRequest(prior, "deny", NOW)).toBeNull();
+  });
+});
+
+describe("validateImportList — pendingClose", () => {
+  test("defaults a missing pendingClose to null and coerces a malformed one", () => {
+    const { valid } = validateImportList([
+      { id: "DS-001", title: "a", createdAt: "2025-01-01T00:00:00.000Z" },
+      {
+        id: "DS-002",
+        title: "b",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "n" },
+      },
+      {
+        id: "DS-003",
+        title: "c",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        pendingClose: { by: "user", at: "bad" },
+      },
+    ]);
+    const byId = new Map(valid.map((i) => [i.id, i]));
+    expect(byId.get("DS-001")?.pendingClose).toBeNull();
+    expect(byId.get("DS-002")?.pendingClose).toEqual({
+      by: "agent",
+      at: "2026-05-18T00:00:00.000Z",
+      note: "n",
+    });
+    expect(byId.get("DS-003")?.pendingClose).toBeNull();
+  });
+});
+
+describe("validateImportList — commits", () => {
+  test("round-trips valid commits, drops garbage, defaults missing to []", () => {
+    const { valid } = validateImportList([
+      { id: "DS-001", title: "no commits", createdAt: "2025-01-01T00:00:00.000Z" },
+      {
+        id: "DS-002",
+        title: "with commits",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        commits: [
+          { sha: "ABCDEF0", at: "2026-07-01T00:00:00.000Z" }, // lowercased
+          { sha: "nothex", at: "2026-07-01T00:00:00.000Z" }, // dropped
+          { sha: "abcdef1", at: "garbage" }, // dropped
+        ],
+      },
+      { id: "DS-003", title: "garbage shape", createdAt: "2025-01-01T00:00:00.000Z", commits: "nope" },
+    ]);
+    const byId = new Map(valid.map((i) => [i.id, i]));
+    expect(byId.get("DS-001")?.commits).toEqual([]);
+    expect(byId.get("DS-002")?.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
+    expect(byId.get("DS-003")?.commits).toEqual([]);
+  });
+});
+
+describe("validateImportList — sync fields (guid / updatedAt / tasks[].updatedAt)", () => {
+  test("keeps well-formed provided values and derives missing ones", () => {
+    const { valid } = validateImportList([
+      {
+        id: "DS-001",
+        title: "provided",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        guid: "kept-guid",
+        updatedAt: "2025-06-01T00:00:00.000Z",
+        tasks: [{ id: "t1", text: "kept", done: false, updatedAt: "2025-05-01T00:00:00.000Z" }],
+      },
+      {
+        id: "DS-002",
+        title: "missing",
+        createdAt: "2025-02-01T00:00:00.000Z",
+        tasks: [{ id: "t2", text: "bare", done: true, updatedAt: "garbage" }],
+      },
+    ]);
+    const byId = new Map(valid.map((i) => [i.id, i]));
+    expect(byId.get("DS-001")?.guid).toBe("kept-guid");
+    expect(byId.get("DS-001")?.updatedAt).toBe("2025-06-01T00:00:00.000Z");
+    expect(byId.get("DS-001")?.tasks[0]?.updatedAt).toBe("2025-05-01T00:00:00.000Z");
+    expect(byId.get("DS-002")?.guid).toBe(deriveGuid("DS-002", "2025-02-01T00:00:00.000Z"));
+    expect(byId.get("DS-002")?.updatedAt).toBe("2025-02-01T00:00:00.000Z");
+    expect(byId.get("DS-002")?.tasks[0]).toEqual({ id: "t2", text: "bare", done: true });
+  });
+
+  test("path-hardening: hostile guid is re-derived; unsafe attachment/task ids are dropped", () => {
+    const { valid } = validateImportList([
+      {
+        id: "DS-001",
+        title: "hostile import",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        // Guids name attachment dirs in the sync ref tree; a path-shaped one
+        // must not survive an import.
+        guid: "../../escape",
+        attachments: [
+          { id: "att-ok", name: "a.png", mimeType: "image/png", sizeBytes: 1, addedAt: "2025-01-01T00:00:00.000Z" },
+          { id: "../evil", name: "b.png", mimeType: "image/png", sizeBytes: 1, addedAt: "2025-01-01T00:00:00.000Z" },
+        ],
+        tasks: [
+          { id: "t-ok", text: "kept", done: false },
+          { id: "../../up", text: "dropped", done: false },
+          { id: 42, text: "not-a-string-id", done: false },
+        ],
+      },
+    ]);
+    expect(valid).toHaveLength(1);
+    expect(valid[0]!.guid).toBe(deriveGuid("DS-001", "2025-01-01T00:00:00.000Z"));
+    expect(valid[0]!.attachments.map((a) => a.id)).toEqual(["att-ok"]);
+    expect(valid[0]!.tasks.map((t) => t.id)).toEqual(["t-ok"]);
+  });
+});
+
+describe("clampSyncInterval", () => {
+  test("declared min/max are enforced in code, not just the settings UI", () => {
+    expect(clampSyncInterval(5)).toBe(5);
+    expect(clampSyncInterval(0)).toBe(0); // manual-only stays manual-only
+    expect(clampSyncInterval(-3)).toBe(0);
+    expect(clampSyncInterval(0.001)).toBe(1); // no 60ms network sync storms
+    expect(clampSyncInterval(9999)).toBe(120);
+    expect(clampSyncInterval(Number.NaN)).toBe(5);
+    expect(clampSyncInterval("7" as unknown)).toBe(5);
   });
 });
 

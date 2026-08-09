@@ -29,6 +29,12 @@ export interface Task {
   id: string;
   text: string;
   done: boolean;
+  /** ISO 8601 — when this task's `text`/`done` last changed. Server-stamped in
+   *  `IssueStore.upsert` by diffing against the prior ticket (webview/MCP input
+   *  is never honored). Optional so untouched payloads stay type-valid; when
+   *  missing, the sync wire boundary defaults it to the ticket's `createdAt`.
+   *  Additive — legacy tickets load without it. */
+  updatedAt?: string;
 }
 
 export interface StatusEvent {
@@ -73,6 +79,37 @@ export interface Attachment {
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
 
 /**
+ * A commit reported against a ticket while implementing it. Only the sha and
+ * the report time are stored — the subject line and touched files are derived
+ * lazily from the workspace repo at render time (see `commitDetails.ts`), so a
+ * sha that no longer resolves (rebase, different machine) degrades to
+ * "not found" without breaking the ticket.
+ */
+export interface TicketCommit {
+  /** Lowercase hex, 7–40 chars, stored exactly as reported (after lowercasing). */
+  sha: string;
+  /** ISO 8601 — when the commit was reported via MCP. */
+  at: string;
+}
+
+/** Valid stored commit-sha shape. Inputs are lowercased before testing. */
+export const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/;
+
+/**
+ * Lazily-derived display data for one `TicketCommit`, resolved by the
+ * extension host against the workspace git repo. `found: false` means the sha
+ * doesn't resolve to a commit here (rebased away, not fetched, no repo).
+ */
+export interface CommitDetail {
+  sha: string;
+  found: boolean;
+  /** First line of the commit message; empty when not found. */
+  subject: string;
+  /** Repo-relative paths touched by the commit; empty when not found. */
+  files: string[];
+}
+
+/**
  * Stored relationship kinds from a source ticket to a target ticket. Only these
  * three "outbound" kinds persist; the matching inbound labels are derived for
  * display via `INVERSE_LINK_KIND` (see below). `relates-to` is symmetric and
@@ -101,15 +138,44 @@ export interface TicketLink {
   kind: LinkKind;
 }
 
-const DS_ID_RE = /^DS-\d+$/;
+/** Terminal state an agent's pending request resolves to on approval. */
+export const PENDING_CLOSE_TARGETS = ["Closed", "Complete"] as const;
+export type PendingCloseTarget = (typeof PENDING_CLOSE_TARGETS)[number];
+
+/**
+ * An agent's pending request to move a ticket to a terminal state, awaiting a
+ * human verdict. Two distinct flows share this flag, distinguished by
+ * `target`:
+ * - `"Closed"` (the default when absent — legacy rows keep their meaning):
+ *   the ticket is OBE / no longer needed. Set by MCP `request_ticket_close`.
+ * - `"Complete"`: the work is done and ready for acceptance. Set by MCP
+ *   `request_ticket_complete` (Verification only).
+ * Cleared when a human approves (status → `target`) or denies via the host
+ * `resolveClose` handler. Additive field — legacy tickets load with
+ * `pendingClose: null`.
+ */
+export interface PendingClose {
+  /** Who requested it. Agents set "agent"; kept as a union for a possible
+   *  future human-initiated request flow. */
+  by: "agent";
+  /** Optional rationale supplied by the requesting agent. */
+  note?: string;
+  /** ISO 8601 — when the request was filed. */
+  at: string;
+  /** Terminal state on approval. Absent = "Closed" (pre-target rows). */
+  target?: PendingCloseTarget;
+}
+
+/** Canonical DS-NNN ticket-id shape. Exported so validators don't re-inline it. */
+export const DS_ID_RE = /^DS-\d+$/;
 
 /**
  * Validate + dedupe a raw `links` value into a clean `TicketLink[]`. Mirrors
  * `coerceTags` / `coerceAttachments`: forgiving (returns `[]` on bad shapes),
  * dedupes by `(targetId, kind)` pair, drops self-links.
  *
- * Unknown-target validation is NOT done here (no store access). That belongs
- * to host-side `validateLinks` in `extension.ts` so we keep this module pure.
+ * Unknown-target validation is NOT done here (no store access) — that is
+ * `validateLinks` below, which takes the caller's known-id set.
  */
 export function coerceLinks(input: unknown, currentIssueId?: string): TicketLink[] {
   if (!Array.isArray(input)) return [];
@@ -128,6 +194,36 @@ export function coerceLinks(input: unknown, currentIssueId?: string): TicketLink
     out.push({ targetId: rawTarget, kind: r.kind });
   }
   return out;
+}
+
+/**
+ * Drop links whose `targetId` isn't in `knownIds` (issues that don't exist) or
+ * that equal `currentIssueId` (self-link). The caller is responsible for
+ * coercing the array shape via `coerceLinks` first; this step is the
+ * cross-issue validity check that needs the caller's id set.
+ *
+ * Returns `{ kept, dropped }` so the caller can decide whether to log; both
+ * arrays preserve the original order.
+ */
+export function validateLinks(
+  links: TicketLink[],
+  currentIssueId: string,
+  knownIds: ReadonlySet<string>,
+): { kept: TicketLink[]; dropped: TicketLink[] } {
+  const kept: TicketLink[] = [];
+  const dropped: TicketLink[] = [];
+  for (const l of links) {
+    if (l.targetId === currentIssueId) {
+      dropped.push(l);
+      continue;
+    }
+    if (!knownIds.has(l.targetId)) {
+      dropped.push(l);
+      continue;
+    }
+    kept.push(l);
+  }
+  return { kept, dropped };
 }
 
 export interface Issue {
@@ -160,10 +256,32 @@ export interface Issue {
    *  view is derived by scanning all issues and inverting the kind via
    *  `INVERSE_LINK_KIND`. There is no dual-write. */
   links: TicketLink[];
+  /** Non-null when an agent has requested closure via MCP and a human has not
+   *  yet approved or denied it. Cleared on either verdict; approval also sets
+   *  status to `Closed`. Additive — legacy tickets default to null. */
+  pendingClose: PendingClose | null;
+  /** Canonical cross-writer identity for git-native sync. Server-derived:
+   *  minted `randomUUID()` at creation, backfilled deterministically via
+   *  `deriveGuid(id, createdAt)` for legacy data (`normalize()` /
+   *  `hydrateFromDb`). Webview/MCP input is never honored. Additive. */
+  guid: string;
+  /** ISO 8601 — last mutation. Server-stamped in `IssueStore.upsert`; sync
+   *  apply preserves remote values (`preserveTimestamps`). Legacy data
+   *  defaults to `createdAt`. Additive. */
+  updatedAt: string;
+  /** Append-only list of commits reported while implementing this ticket.
+   *  Server-derived: appended only by MCP `update_ticket_progress` (webview
+   *  input is never honored — `mergeIssueUpdate` carries it from prior).
+   *  Deduped by sha, sorted by (at, sha); sync merges by union (never LWW).
+   *  Additive — legacy tickets load with []. */
+  commits: TicketCommit[];
 }
 
-/** Statuses an MCP-connected agent is allowed to set via update_ticket_status. */
-export const AGENT_WRITABLE_STATUSES: Status[] = ["Planned", "Working", "Verification"];
+/** Statuses an MCP-connected agent is allowed to set via update_ticket_status.
+ *  All non-terminal states: agents may promote a Thinking draft into an active
+ *  lane, shuffle the active lanes, or demote a ticket back to Thinking.
+ *  Complete and Closed remain human-only in both directions. */
+export const AGENT_WRITABLE_STATUSES: Status[] = ["Thinking", "Planned", "Working", "Verification"];
 
 /** Statuses an MCP-connected agent is allowed to read (get_ticket, resources)
  *  and annotate (update_ticket_progress). Excludes Complete and Closed. */
@@ -193,13 +311,20 @@ export type HostToWebview =
   // ticket's IssueDetail. Originates from a graph node click; the host
   // routes it back to sidebar (open the detail overlay) and board (scroll
   // to the lane + open the detail).
-  | { type: "revealTicket"; id: string };
+  | { type: "revealTicket"; id: string }
+  // Host's reply to `fetchCommitDetails`: lazily-derived subject + files for
+  // each of the ticket's stored commit shas. `pathPrefix` is the posix
+  // relative path from the workspace root to the repo root ("." when equal)
+  // so the webview can compose openLink-able file paths.
+  | { type: "commitDetails"; issueId: string; pathPrefix: string; details: CommitDetail[] };
 
 export type WebviewToHost =
   | { type: "ready" }
   | {
       type: "createIssue";
-      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links"> & {
+      // `guid`/`updatedAt`/`commits` are server-derived like `pendingClose` —
+      // the webview never supplies them (see `buildCreatedIssue` / `IssueStore.upsert`).
+      partial: Omit<Issue, "id" | "number" | "createdAt" | "statusHistory" | "tasks" | "resolvedAt" | "record" | "attachments" | "links" | "pendingClose" | "guid" | "updatedAt" | "commits"> & {
         tasks?: Task[];
         // Inline attachments staged in the new-issue modal. The host loops
         // these through the regular appendAttachment chokepoint after upserting
@@ -254,7 +379,17 @@ export type WebviewToHost =
   | { type: "revealTicket"; id: string }
   // Sidebar/board toolbar button — routes through the registered
   // `dostuff.openGraph` command on the host.
-  | { type: "openGraph" };
+  | { type: "openGraph" }
+  // Human verdict on an agent's pending close request (see `PendingClose`).
+  // Routed through the registered `dostuff.resolveClose` command → the host
+  // `resolveClose` handler, which applies `Closed` (approve) or clears the
+  // request (deny).
+  | { type: "resolveClose"; id: string; verdict: "approve" | "deny" }
+  // Ask the host to derive commit subjects + touched files for the ticket's
+  // stored shas. The webview never supplies shas — the host reads them from
+  // the store — so no sha crosses the webview trust boundary. Reply:
+  // `commitDetails`.
+  | { type: "fetchCommitDetails"; issueId: string };
 
 export interface Settings {
   storagePath: string;
@@ -343,6 +478,67 @@ export function coerceAttachments(input: unknown): Attachment[] {
     byId.set(id, { id, name, mimeType, sizeBytes, addedAt });
   }
   return Array.from(byId.values());
+}
+
+/**
+ * Total order for `TicketCommit` lists: ascending (at, sha). Shared by
+ * `coerceCommits`, the MCP append, and the sync union merge so identical
+ * logical states serialize byte-identically on every replica (stable
+ * canonical-JSON hashes for the LWW tiebreak).
+ */
+export function compareCommits(a: TicketCommit, b: TicketCommit): number {
+  if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+  return a.sha < b.sha ? -1 : a.sha > b.sha ? 1 : 0;
+}
+
+/**
+ * Validate + dedupe a raw `commits` value into a clean `TicketCommit[]`.
+ * Mirrors the other coercers: forgiving (returns `[]` on bad shapes), never
+ * throws. Shas are lowercased and must be 7–40 hex chars; duplicate shas keep
+ * the earliest `at` (matching the sync union merge). Output sorted (at, sha).
+ */
+export function coerceCommits(input: unknown): TicketCommit[] {
+  if (!Array.isArray(input)) return [];
+  const bySha = new Map<string, TicketCommit>();
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const r = raw as Record<string, unknown>;
+    const sha = typeof r.sha === "string" ? r.sha.toLowerCase() : "";
+    if (!COMMIT_SHA_RE.test(sha)) continue;
+    if (typeof r.at !== "string" || !ISO_RE.test(r.at)) continue;
+    const prev = bySha.get(sha);
+    if (!prev || r.at < prev.at) bySha.set(sha, { sha, at: r.at });
+  }
+  return Array.from(bySha.values()).sort(compareCommits);
+}
+
+/**
+ * Validate a raw `pendingClose` value into a clean `PendingClose | null`.
+ * Mirrors the other coercers: forgiving (returns `null` on any bad or missing
+ * shape) and never throws, so a legacy ticket lacking the field loads as null.
+ */
+export function coercePendingClose(input: unknown): PendingClose | null {
+  if (!input || typeof input !== "object") return null;
+  const r = input as Record<string, unknown>;
+  if (r.by !== "agent") return null;
+  if (typeof r.at !== "string" || !ISO_RE.test(r.at)) return null;
+  const out: PendingClose = { by: "agent", at: r.at };
+  if (typeof r.note === "string") out.note = r.note;
+  // Unrecognized target values are dropped, not failed: the request degrades
+  // to the legacy meaning (Closed) instead of vanishing.
+  if ((PENDING_CLOSE_TARGETS as readonly unknown[]).includes(r.target)) {
+    out.target = r.target as PendingCloseTarget;
+  }
+  return out;
+}
+
+/**
+ * The lane a pending close/complete request resolves to. An absent `target`
+ * is the legacy wire shape and means `Closed` (OBE) — this is the one place
+ * that rule lives; readers must not re-apply the default themselves.
+ */
+export function effectiveCloseTarget(pc: PendingClose): PendingCloseTarget {
+  return pc.target ?? "Closed";
 }
 
 export function canMoveToActiveLane(

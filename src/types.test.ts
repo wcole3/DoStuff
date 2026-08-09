@@ -5,7 +5,10 @@ import {
   INVERSE_LINK_KIND,
   LINK_KINDS,
   coerceAttachments,
+  coerceCommits,
   coerceLinks,
+  coercePendingClose,
+  compareCommits,
   isLinkKind,
   type Attachment,
 } from "./types";
@@ -210,5 +213,138 @@ describe("isLinkKind", () => {
     expect(isLinkKind(undefined)).toBe(false);
     expect(isLinkKind(null)).toBe(false);
     expect(isLinkKind(42)).toBe(false);
+  });
+});
+
+describe("coercePendingClose", () => {
+  const ISO = "2026-05-18T00:00:00.000Z";
+
+  test("accepts a well-formed request with a note", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, note: "ship it" })).toEqual({
+      by: "agent",
+      at: ISO,
+      note: "ship it",
+    });
+  });
+
+  test("accepts a request without a note (note omitted, not null)", () => {
+    const out = coercePendingClose({ by: "agent", at: ISO });
+    expect(out).toEqual({ by: "agent", at: ISO });
+    expect(out && "note" in out).toBe(false);
+  });
+
+  test("returns null for null / undefined / non-object input", () => {
+    expect(coercePendingClose(null)).toBeNull();
+    expect(coercePendingClose(undefined)).toBeNull();
+    expect(coercePendingClose("nope")).toBeNull();
+    expect(coercePendingClose(42)).toBeNull();
+  });
+
+  test('returns null when `by` is not "agent"', () => {
+    expect(coercePendingClose({ by: "user", at: ISO })).toBeNull();
+  });
+
+  test("returns null when `at` is missing or not ISO 8601", () => {
+    expect(coercePendingClose({ by: "agent" })).toBeNull();
+    expect(coercePendingClose({ by: "agent", at: "yesterday" })).toBeNull();
+    expect(coercePendingClose({ by: "agent", at: 123 })).toBeNull();
+  });
+
+  test("drops a non-string note but keeps the request", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, note: 5 })).toEqual({ by: "agent", at: ISO });
+  });
+
+  test("keeps a valid target (both flavors)", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, target: "Closed" })).toEqual({
+      by: "agent",
+      at: ISO,
+      target: "Closed",
+    });
+    expect(coercePendingClose({ by: "agent", at: ISO, target: "Complete" })).toEqual({
+      by: "agent",
+      at: ISO,
+      target: "Complete",
+    });
+  });
+
+  test("drops an invalid target but keeps the request (degrades to legacy Closed meaning)", () => {
+    const out = coercePendingClose({ by: "agent", at: ISO, target: "Banana" });
+    expect(out).toEqual({ by: "agent", at: ISO });
+    expect(out && "target" in out).toBe(false);
+  });
+
+  test("ignores extra keys", () => {
+    expect(coercePendingClose({ by: "agent", at: ISO, extra: "x" })).toEqual({ by: "agent", at: ISO });
+  });
+});
+
+describe("coerceCommits", () => {
+  const AT = "2026-07-01T00:00:00.000Z";
+  const AT2 = "2026-07-02T00:00:00.000Z";
+  const SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0";
+
+  test("accepts well-formed entries", () => {
+    expect(coerceCommits([{ sha: SHA, at: AT }])).toEqual([{ sha: SHA, at: AT }]);
+    expect(coerceCommits([{ sha: "a1b2c3d", at: AT }])).toEqual([{ sha: "a1b2c3d", at: AT }]);
+  });
+
+  test("returns [] for non-array input", () => {
+    expect(coerceCommits(undefined)).toEqual([]);
+    expect(coerceCommits(null)).toEqual([]);
+    expect(coerceCommits("deadbeef")).toEqual([]);
+    expect(coerceCommits({ sha: SHA, at: AT })).toEqual([]);
+  });
+
+  test("drops malformed shas: too short, too long, non-hex, option-shaped", () => {
+    expect(
+      coerceCommits([
+        { sha: "abc123", at: AT }, // 6 chars
+        { sha: SHA + "0", at: AT }, // 41 chars
+        { sha: "zzzzzzz", at: AT }, // non-hex
+        { sha: "--format", at: AT }, // option injection shape
+        { sha: 42, at: AT },
+        null,
+        "deadbeef",
+      ]),
+    ).toEqual([]);
+  });
+
+  test("drops entries with missing or non-ISO at", () => {
+    expect(
+      coerceCommits([
+        { sha: SHA },
+        { sha: SHA, at: "yesterday" },
+        { sha: SHA, at: 12345 },
+      ]),
+    ).toEqual([]);
+  });
+
+  test("lowercases uppercase shas", () => {
+    expect(coerceCommits([{ sha: SHA.toUpperCase(), at: AT }])).toEqual([{ sha: SHA, at: AT }]);
+  });
+
+  test("dedupes by sha keeping the earliest at, regardless of input order", () => {
+    const expected = [{ sha: SHA, at: AT }];
+    expect(coerceCommits([{ sha: SHA, at: AT }, { sha: SHA, at: AT2 }])).toEqual(expected);
+    expect(coerceCommits([{ sha: SHA, at: AT2 }, { sha: SHA, at: AT }])).toEqual(expected);
+    // Mixed-case duplicates collapse too.
+    expect(coerceCommits([{ sha: SHA.toUpperCase(), at: AT2 }, { sha: SHA, at: AT }])).toEqual(expected);
+  });
+
+  test("sorts output by (at, sha)", () => {
+    const a = { sha: "bbbbbbb", at: AT };
+    const b = { sha: "aaaaaaa", at: AT2 };
+    const c = { sha: "aaaaaab", at: AT };
+    expect(coerceCommits([b, a, c])).toEqual([c, a, b]);
+  });
+
+  test("compareCommits is a total order on (at, sha)", () => {
+    const x = { sha: "aaaaaaa", at: AT };
+    const y = { sha: "bbbbbbb", at: AT };
+    const z = { sha: "aaaaaaa", at: AT2 };
+    expect(compareCommits(x, y)).toBeLessThan(0);
+    expect(compareCommits(y, x)).toBeGreaterThan(0);
+    expect(compareCommits(x, z)).toBeLessThan(0);
+    expect(compareCommits(x, { ...x })).toBe(0);
   });
 });

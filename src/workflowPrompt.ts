@@ -6,47 +6,69 @@
 
 import { ACTIVE_LANE_CAP } from "./types";
 
-// we want to be very terse in this prompt to keep context small
+/**
+ * Byte ceiling for the workflow prompt and for each registered tool
+ * description. Claude Code truncates both at 2KB; this sits below that so the
+ * `activeLaneCap` interpolation and ordinary edits have room before anything
+ * is silently cut. Asserted in `mcpServer.test.ts`.
+ */
+export const PROMPT_BYTE_BUDGET = 1800;
+
+// Served once per connection as MCP initialize `instructions` (plus the
+// dostuff://instructions/workflow resource and the `workflow` MCP prompt).
+//
+// HARD BUDGET — see PROMPT_BYTE_BUDGET. Claude Code truncates server
+// instructions at 2KB and drops the remainder with no error. An earlier draft
+// of this prompt ran to 2,830 bytes, which cut the OBE close flow and the
+// field-immutability contract off the end: the two rules least safe to lose.
+// Keep additions inside the budget, or move the detail into a tool's own
+// `description` (each of those gets its own 2KB).
+//
+// Ordering is deliberate. Claude Code defers MCP tool schemas by default and
+// discovers them via tool search, so these instructions are what decides
+// whether an agent reaches for DoStuff at all. Lead with what the server is,
+// then carry only the rules no single tool description can: cross-tool
+// sequencing, the human-approval boundary, immutability, and the write-terse
+// rule (every byte an agent writes is re-read on every later ticket read, by
+// this agent and the next one).
 export function buildDefaultWorkflowPrompt(cap: number = ACTIVE_LANE_CAP): string {
   return `\
-You are an engineering agent working through the DoStuff issue queue.
+DoStuff is this workspace's engineering ticket queue. Use these tools to find,
+start, update, and file work.
 
-Workflow contract:
-  1. Tickets are addressed by number (e.g. "42") or id ("DS-042").
-     Use \`get_ticket\` to fetch one by number, id, or a substring of its title
-     i.e. "get ticket 42 and begin work" or "start on the OAuth ticket".
-  2. Tickets have descriptions and verify criteria written by the human. Read before
-     starting.  Some tickets have subtasks to help you plan.
-  3. Read \`dostuff://tickets\` to discover work. It lists Thinking + active-lane
-     tickets (Complete and Closed are hidden). Thinking tickets are drafts the
-     human hasn't triaged yet -- do not start work on them, and only a human can
-     promote one to Planned. You *may* read and annotate them via
-     \`update_ticket_progress\`: use this to record relationships ("blocks DS-042",
-     "follow-up of DS-019") on a ticket you just filed with \`create_ticket\`, or
-     to leave context for the human before they triage.
-  4. When you start a ticket, call \`update_ticket_status\` to move it to "Working".
-     When you believe it's ready for verification, move it to "Verification".
-  5. You cannot mark a ticket "Complete". A human reviews Verification tickets and
-     decides. If your verification fails, move it back to "Working".
-  6. Active lanes (Planned, Working, Verification) are capped at ${cap} tickets each.
-     Moves that would exceed the cap are rejected.
-  7. As you make progress, call \`update_ticket_progress\` to tick tasks off and
-     append a short note to the ticket's record. Be terse and factual.
-  8. If you discover follow-up work, call \`create_ticket\` to file it. New
-     tickets land in "Thinking" for the human to triage. Optionally supply
-     \`links: [{ targetId, kind }]\` to record first-class relationships at
-     creation time (kinds: blocks, child-of, relates-to).
-  9. While a ticket is still in "Thinking" (an untriaged draft), call
-     \`update_ticket_draft\` to reshape its tags, links, and/or task list --
-     useful for fleshing out a ticket you just filed before a human triages
-     it. Once it's triaged to an active lane, that scope locks -- you can then
-     only toggle task done-state via \`update_ticket_progress\`.
+You may NOT change a ticket's title, priority, type, or verify criteria over
+MCP, and only a human can set Complete or Closed. Wrong? Say so, or file a new
+ticket.
 
-You may NOT modify a ticket's title, description, priority, type, or verify
-criteria via the MCP server, and tags/links/tasks become read-only once a
-ticket leaves "Thinking". If something is wrong with those, file a new
-ticket instead.`;
+Write terse — every byte is re-read on each later ticket read. Fragments fine,
+grammar not important. Record notes: one line, ~15 words, facts and outcomes.
+No narration, no restating the ticket, no summarizing what you read or plan.
+Descriptions: 1-2 sentences of what + why, detail below; boards show only that
+opening.
+
+Find work: \`list_issues\` or \`dostuff://tickets\`, then \`get_ticket\` by number
+("42"), id ("DS-042"), or title substring. Read description + verify criteria
+first.
+
+\`update_ticket_status\` moves among Thinking, Planned, Working, Verification
+(active lanes cap ${cap} each; Thinking uncapped). Working when you start. As you
+go, \`update_ticket_progress\` ticks tasks, appends one note, records each commit
+sha. Done → Verification, then \`request_ticket_complete\`. Verify fails → back
+to Working.
+
+OBE — superseded or won't be done → \`request_ticket_close\` instead. Both
+requests need human approval, neither changes status: poll \`get_ticket\` with
+\`view: "status"\`. Close = dropped work, complete = finished work.
+
+Follow-ups → \`create_ticket\` (lands in Thinking). Reshape a draft's tags,
+links, tasks with \`update_ticket_draft\` — Thinking only. Reads return newest
+record entries only — \`recordLimit: 0\` for full history.`;
 }
+
+// One-line stand-in embedded in per-call tool/resource responses instead of
+// the full prompt (which is served via initialize instructions).
+export const WORKFLOW_POINTER =
+  "Workflow rules: see this server's initialize instructions, or read resource dostuff://instructions/workflow.";
 
 // Convenience snapshot at the schema-default cap. Used by tests and by
 // any caller that just wants the canonical default text. Live callers

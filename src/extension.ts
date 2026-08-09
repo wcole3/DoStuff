@@ -4,6 +4,12 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
+import { backfillSyncFields, isIsoTimestamp, isSafePathSegment, sanitizeExt } from "./syncMerge";
+import { clampSyncInterval, GitSyncController } from "./gitSync";
+
+// Moved to gitSync.ts with the headless split; re-exported for old importers.
+export { clampSyncInterval } from "./gitSync";
+import { createCommitDetailsFetcher } from "./commitDetails";
 import { SidebarProvider } from "./sidebarProvider";
 import { BoardPanel } from "./boardProvider";
 import { GraphPanel } from "./graphProvider";
@@ -11,20 +17,29 @@ import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
 import {
   ACTIVE_LANE_CAP,
+  DS_ID_RE,
   MAX_ATTACHMENT_BYTES,
   canMoveToActiveLane,
   coerceAttachments,
+  coerceCommits,
   coerceLinks,
+  coercePendingClose,
   coerceTags,
+  effectiveCloseTarget,
   isPriority,
   isStatus,
   isType,
+  validateLinks,
   type Attachment,
   type Issue,
   type Status,
   type StatusEvent,
-  type TicketLink,
 } from "./types";
+import { outputChannelLogger, readVsCodeMcpConfig, vsCodeWorkspaceId } from "./mcpHostVscode";
+
+// `validateLinks` lived here before the headless-server split; re-exported so
+// old import sites keep working (it is pure and now lives in types.ts).
+export { validateLinks } from "./types";
 
 
 export type UpdateBy = "user" | "agent";
@@ -59,9 +74,11 @@ export function inferMimeType(filename: string): string {
  * Pure merge of a webview-submitted partial update onto a persisted issue.
  *
  * Server-derived fields (`id`, `number`, `createdAt`, `record`, `statusHistory`,
- * `resolvedAt`) are NEVER copied from `incoming` — they are reconstructed from
- * `prior` plus this function's own bookkeeping. The webview can lie about any
- * of those and we'll ignore it.
+ * `resolvedAt`, `pendingClose`, `guid`, `updatedAt`, `commits`) are NEVER copied
+ * from `incoming` — they are reconstructed from `prior` plus this function's own
+ * bookkeeping (`updatedAt` and per-task `tasks[].updatedAt` are then re-stamped
+ * by `IssueStore.upsert`, which discards any smuggled task stamps by diffing
+ * against `prior`). The webview can lie about any of those and we'll ignore it.
  *
  * Returns `{next}` on success or `{error}` if validation fails.
  *
@@ -69,36 +86,6 @@ export function inferMimeType(filename: string): string {
  * already-done ticket), `resolvedAt` is cleared. This is intentional — humans
  * can correct mistakes; the MCP layer enforces a stricter contract for agents.
  */
-/**
- * Drop links whose `targetId` isn't in `knownIds` (issues that don't exist) or
- * that equal `currentIssueId` (self-link). The caller is responsible for
- * coercing the array shape via `coerceLinks` first; this step is the
- * cross-issue validity check that needs store access.
- *
- * Returns `{ kept, dropped }` so the caller can decide whether to log; both
- * arrays preserve the original order.
- */
-export function validateLinks(
-  links: TicketLink[],
-  currentIssueId: string,
-  knownIds: ReadonlySet<string>,
-): { kept: TicketLink[]; dropped: TicketLink[] } {
-  const kept: TicketLink[] = [];
-  const dropped: TicketLink[] = [];
-  for (const l of links) {
-    if (l.targetId === currentIssueId) {
-      dropped.push(l);
-      continue;
-    }
-    if (!knownIds.has(l.targetId)) {
-      dropped.push(l);
-      continue;
-    }
-    kept.push(l);
-  }
-  return { kept, dropped };
-}
-
 export function mergeIssueUpdate(
   prior: Issue,
   incoming: Partial<Issue>,
@@ -180,6 +167,46 @@ export function mergeIssueUpdate(
   return { next };
 }
 
+/**
+ * Pure core of the host `resolveClose` handler (exported for tests). Given a
+ * ticket with a pending agent request, returns the next Issue for the human's
+ * verdict — approve moves it to the request's `target` (`"Closed"` when
+ * absent — the legacy OBE flow; `"Complete"` for the acceptance flow) and
+ * clears the flag; deny clears the flag and leaves status unchanged. Returns
+ * `null` when there is nothing pending to resolve.
+ *
+ * `record`/`statusHistory` are appended here (author "user"), which is exactly
+ * why this can't route through {@link mergeIssueUpdate} — those fields are
+ * server-derived and never taken from an incoming payload. `resolvedAt` is
+ * stamped only on the Complete path: it tracks acceptance, and Closed is
+ * "won't do".
+ */
+export function resolveCloseRequest(
+  prior: Issue,
+  verdict: "approve" | "deny",
+  now: () => string = () => new Date().toISOString(),
+): Issue | null {
+  if (!prior.pendingClose) return null;
+  const ts = now();
+  const target: Status = effectiveCloseTarget(prior.pendingClose);
+  const label = target === "Complete" ? "Completion" : "Close";
+  if (verdict === "approve") {
+    return {
+      ...prior,
+      status: target,
+      ...(target === "Complete" ? { resolvedAt: ts } : {}),
+      pendingClose: null,
+      statusHistory: [...prior.statusHistory, { status: target, at: ts, by: "user" }],
+      record: [...prior.record, { at: ts, author: "user", text: `${label} request approved` }],
+    };
+  }
+  return {
+    ...prior,
+    pendingClose: null,
+    record: [...prior.record, { at: ts, author: "user", text: `${label} request denied` }],
+  };
+}
+
 /** Required-field shape check on an imported issue. Coerces missing enum values to defaults. */
 export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: number } {
   const valid: Issue[] = [];
@@ -190,7 +217,7 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       continue;
     }
     const e = entry as Record<string, unknown>;
-    if (typeof e.id !== "string" || !/^DS-\d+$/.test(e.id)) {
+    if (typeof e.id !== "string" || !DS_ID_RE.test(e.id)) {
       skipped += 1;
       continue;
     }
@@ -214,9 +241,30 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
       status,
       description: typeof e.description === "string" ? e.description : "",
       verifyCriteria: typeof e.verifyCriteria === "string" ? e.verifyCriteria : "",
-      tasks: Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [],
+      // Task ids become sync identities (and were historically written into
+      // wire trees), so entries without a safe-segment string id are dropped;
+      // keep well-formed per-task `updatedAt` (round-trips exported stamps),
+      // strip garbage values so nothing invalid enters the store.
+      tasks: (Array.isArray(e.tasks) ? (e.tasks as Issue["tasks"]) : [])
+        .filter(
+          (t) =>
+            t &&
+            typeof t === "object" &&
+            typeof t.id === "string" &&
+            isSafePathSegment(t.id) &&
+            typeof t.text === "string",
+        )
+        .map((t) => {
+          if ("updatedAt" in t && !isIsoTimestamp(t.updatedAt)) {
+            const { updatedAt: _bad, ...rest } = t;
+            return rest;
+          }
+          return t;
+        }),
       tags: coerceTags(e.tags),
-      attachments: coerceAttachments(e.attachments),
+      // Attachment ids name files on disk and blobs in the sync tree — same
+      // safe-segment bar as the sync wire coercer.
+      attachments: coerceAttachments(e.attachments).filter((a) => isSafePathSegment(a.id)),
       // Cross-issue validation happens in the caller (after the full set is
       // assembled) so we can drop links whose targets aren't in the import.
       links: coerceLinks(e.links, e.id),
@@ -226,6 +274,14 @@ export function validateImportList(raw: unknown[]): { valid: Issue[]; skipped: n
         ? (e.statusHistory as Issue["statusHistory"])
         : [{ status, at: e.createdAt, by: "user" }],
       record: Array.isArray(e.record) ? (e.record as Issue["record"]) : [],
+      pendingClose: coercePendingClose(e.pendingClose),
+      // Round-trips exported commit anchors; garbage entries are dropped.
+      commits: coerceCommits(e.commits),
+      // Sync fields: keep well-formed provided values (export→import round
+      // trip), derive per the normalize() rules when missing. requireSafeGuid:
+      // guids name attachment dirs in the sync ref tree, and outbound state
+      // is never re-coerced.
+      ...backfillSyncFields(e.id, e.createdAt, e.guid, e.updatedAt, { requireSafeGuid: true }),
     };
     valid.push(issue);
   }
@@ -265,8 +321,9 @@ export function activate(context: vscode.ExtensionContext) {
    *
    *   1. Reconstructing the persisted issue from a small allow-list of mutable
    *      fields (see {@link mergeIssueUpdate}). Server-derived fields like
-   *      `statusHistory`, `resolvedAt`, `id`, `number`, `createdAt`, `record`
-   *      are never trusted from the webview payload.
+   *      `statusHistory`, `resolvedAt`, `id`, `number`, `createdAt`, `record`,
+   *      `pendingClose` are never trusted from the webview payload (an agent
+   *      close request is set via MCP and cleared only by {@link resolveClose}).
    *   2. Enforcing the active-lane cap (Planned/Working/Verification ≤ 6).
    *   3. Note: the UI is allowed to move a ticket out of "Complete" (humans can
    *      correct mis-clicks). The MCP layer enforces a stricter contract.
@@ -274,12 +331,21 @@ export function activate(context: vscode.ExtensionContext) {
    * On rejection we re-broadcast the current truth so the optimistic webview
    * state reverts.
    */
+  /**
+   * Re-broadcast current state to every open webview — used after a rejected
+   * update so stale optimistic UI (drag previews, banners) snaps back.
+   */
+  const broadcastAll = (): void => {
+    sidebar.broadcast();
+    BoardPanel.broadcast(store.list());
+    GraphPanel.broadcast(store.list());
+  };
+
   const applyIssueUpdate = async (incoming: Issue): Promise<void> => {
     const prior = store.get(incoming.id);
     if (!prior) {
       vscode.window.showWarningMessage(`DoStuff: No ticket with id ${incoming.id}.`);
-      sidebar.broadcast();
-      BoardPanel.broadcast(store.list());
+      broadcastAll();
       return;
     }
 
@@ -290,9 +356,7 @@ export function activate(context: vscode.ExtensionContext) {
     const merged = mergeIssueUpdate(prior, incoming, "user", undefined, knownIds);
     if ("error" in merged) {
       vscode.window.showWarningMessage(`DoStuff: ${merged.error}`);
-      sidebar.broadcast();
-      BoardPanel.broadcast(store.list());
-      GraphPanel.broadcast(store.list());
+      broadcastAll();
       return;
     }
     const next = merged.next;
@@ -302,13 +366,29 @@ export function activate(context: vscode.ExtensionContext) {
       const check = canMoveToActiveLane(store.list(), next.status, next.id, cap);
       if (check !== true) {
         vscode.window.showWarningMessage(`DoStuff: ${check}`);
-        sidebar.broadcast();
-        BoardPanel.broadcast(store.list());
-        GraphPanel.broadcast(store.list());
+        broadcastAll();
         return;
       }
     }
 
+    await store.upsert(next);
+  };
+
+  /**
+   * Apply a human's verdict on an agent's pending close request. Approve moves
+   * the ticket to `Closed` and clears the flag; deny clears the flag. Built
+   * directly (not via `applyIssueUpdate`) because it appends a `record` entry,
+   * which the merge chokepoint deliberately never accepts from a payload.
+   * On a no-op (nothing pending — e.g. already resolved in another window) we
+   * re-broadcast so any stale "awaiting close" banner in an open webview clears.
+   */
+  const resolveClose = async (id: string, verdict: "approve" | "deny"): Promise<void> => {
+    const prior = store.get(id);
+    const next = prior ? resolveCloseRequest(prior, verdict) : null;
+    if (!next) {
+      broadcastAll();
+      return;
+    }
     await store.upsert(next);
   };
 
@@ -345,7 +425,9 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     const attachmentId = randomUUID().replace(/-/g, "");
-    const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+    // `name` arrives over the webview message channel — sanitize before it
+    // contributes to an on-disk filename.
+    const ext = sanitizeExt(name);
     try {
       const written = await store.writeAttachment(issueId, attachmentId, ext, bytes);
       if (!written) {
@@ -565,7 +647,7 @@ export function activate(context: vscode.ExtensionContext) {
       // Open the board if the user starts a drag with no board panel
       // visible — without it there'd be nowhere for the lanes to light up.
       if (!BoardPanel.isOpen()) {
-        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
+        BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers, fetchCommitDetails);
       }
       BoardPanel.signalExternalDrag(issueId);
     },
@@ -617,7 +699,22 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.showWarningMessage(`DoStuff: link scheme "${scheme}" is not supported.`);
   };
 
-  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink, attachmentHandlers);
+  // Lazy commit-detail derivation for ticket commit anchors. Shas come from
+  // the store — never the webview — then resolve against the workspace repo
+  // on demand. Independent of dostuff.sync.enabled (reads the user's real
+  // repo, not the hidden state ref); degrades to "not found" without git.
+  const commitDetailsFetcher = createCommitDetailsFetcher(
+    () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+  );
+  const fetchCommitDetails = async (issueId: string) => {
+    const issue = store.get(issueId);
+    if (!issue || issue.commits.length === 0) {
+      return { pathPrefix: ".", details: [] };
+    }
+    return commitDetailsFetcher(issue.commits.map((c) => c.sha));
+  };
+
+  const sidebar = new SidebarProvider(context.extensionUri, store, applyIssueUpdate, externalDrag, openLink, attachmentHandlers, fetchCommitDetails);
 
   context.subscriptions.push(
     sidebar,
@@ -626,7 +723,7 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("dostuff.openBoard", () => {
-      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers);
+      BoardPanel.showOrCreate(context.extensionUri, store, applyIssueUpdate, openLink, attachmentHandlers, fetchCommitDetails);
     }),
 
     vscode.commands.registerCommand("dostuff.openGraph", () => {
@@ -637,9 +734,19 @@ export function activate(context: vscode.ExtensionContext) {
     // link-chip click (sidebar/board IssueDetail) or a graph node click; fans
     // the request out to every open webview so whichever is focused responds.
     vscode.commands.registerCommand("dostuff.revealTicket", (id: unknown) => {
-      if (typeof id !== "string" || !/^DS-\d+$/.test(id)) return;
+      if (typeof id !== "string" || !DS_ID_RE.test(id)) return;
       sidebar.revealTicket(id);
       BoardPanel.revealTicket(id);
+    }),
+
+    // Human verdict on an agent's pending close request. Forwarded from the
+    // sidebar/board webview `resolveClose` message via executeCommand.
+    vscode.commands.registerCommand("dostuff.resolveClose", (arg: unknown) => {
+      if (!arg || typeof arg !== "object") return;
+      const { id, verdict } = arg as { id?: unknown; verdict?: unknown };
+      if (typeof id !== "string" || !DS_ID_RE.test(id)) return;
+      if (verdict !== "approve" && verdict !== "deny") return;
+      void resolveClose(id, verdict);
     }),
 
     vscode.commands.registerCommand("dostuff.newIssue", () => {
@@ -652,8 +759,15 @@ export function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand("dostuff.clearAll", async () => {
+      // With sync on, replaceAll([]) records tombstones for every ticket and
+      // the deletion propagates to every replica on next sync — say so.
+      const syncOn = vscode.workspace
+        .getConfiguration("dostuff")
+        .get<boolean>("sync.enabled", false);
       const answer = await vscode.window.showWarningMessage(
-        "Delete all issues? This cannot be undone.",
+        syncOn
+          ? "Delete all issues? This cannot be undone. This will also delete these tickets for everyone syncing this repo."
+          : "Delete all issues? This cannot be undone.",
         { modal: true },
         "Clear All",
       );
@@ -772,18 +886,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   // ─── MCP server ───────────────────────────────────────────────────────
   // Workspace identity feeds the user-global registry so external agents can
-  // discover which ephemeral port serves which workspace. The override setting
-  // lets the user pin an explicit path when the auto-pick is wrong.
-  const workspaceId = () => {
-    const override = vscode.workspace
-      .getConfiguration("dostuff")
-      .get<string>("mcp.workspaceOverride", "")
-      .trim();
-    if (override) return { path: override, name: path.basename(override) || override };
-    const root = vscode.workspace.workspaceFolders?.[0];
-    if (!root) return null;
-    return { path: root.uri.fsPath, name: root.name };
-  };
+  // discover which ephemeral port serves which workspace (vsCodeWorkspaceId
+  // honors the dostuff.mcp.workspaceOverride pin). Config/logging go through
+  // the vscode host adapters so the server core stays vscode-free.
   // Lazy-construct the MCP server so the heavy SDK + zod module isn't
   // parsed during activate(). First call to reconcileMcp() awaits the
   // dynamic import; subsequent calls reuse the cached instance.
@@ -793,7 +898,13 @@ export function activate(context: vscode.ExtensionContext) {
     if (mcp) return Promise.resolve(mcp);
     if (!mcpLoadPromise) {
       mcpLoadPromise = import("./mcpServer").then((m) => {
-        const instance = new m.DoStuffMcpServer(store, workspaceId);
+        const instance = new m.DoStuffMcpServer(store, vsCodeWorkspaceId, {
+          config: readVsCodeMcpConfig,
+          logger: outputChannelLogger("DoStuff MCP"),
+          onStartError: (msg) => {
+            void vscode.window.showErrorMessage(`DoStuff MCP server failed to start: ${msg}`);
+          },
+        });
         mcp = instance;
         context.subscriptions.push(instance);
         return instance;
@@ -889,10 +1000,177 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showErrorMessage(`DoStuff: could not pin port (${msg}).`);
       }
     }),
+    vscode.commands.registerCommand("dostuff.installAgentSkill", async () => {
+      const os = await import("node:os");
+      const { installAgentSkill, SkillInstallError } = await import("./skillInstall");
+      const src = context.asAbsolutePath(path.join("skills", "dostuff-tickets"));
+      const dest = path.join(os.homedir(), ".claude", "skills", "dostuff-tickets");
+      const fsNode = await import("node:fs");
+      if (fsNode.existsSync(dest)) {
+        const pick = await vscode.window.showWarningMessage(
+          `Replace the existing Claude Code skill at ${dest}?`,
+          { modal: true },
+          "Replace",
+        );
+        if (pick !== "Replace") return;
+      }
+      try {
+        const { copied } = installAgentSkill(src, dest, extensionVersion());
+        vscode.window.showInformationMessage(
+          `DoStuff: installed the Claude Code agent skill (${copied.length} files) to ${dest}. ` +
+            "New Claude Code sessions pick it up automatically; it stays current across extension updates.",
+        );
+      } catch (e) {
+        const msg = e instanceof SkillInstallError ? e.message : e instanceof Error ? e.message : String(e);
+        vscode.window.showErrorMessage(`DoStuff: skill install failed — ${msg}`);
+      }
+    }),
   );
+
+  const extensionVersion = (): string =>
+    (context.extension?.packageJSON as { version?: string } | undefined)?.version ?? "0.0.0";
+
+  // Keep a previously installed skill current with this build. Only touches
+  // installs the command created (marker file present) and only when the copy
+  // is byte-identical to what was installed — local edits get a prompt, never
+  // a silent overwrite. Fire-and-forget: must not delay activation.
+  void (async () => {
+    try {
+      const os = await import("node:os");
+      const { maybeUpdateAgentSkill, installAgentSkill } = await import("./skillInstall");
+      const src = context.asAbsolutePath(path.join("skills", "dostuff-tickets"));
+      const dest = path.join(os.homedir(), ".claude", "skills", "dostuff-tickets");
+      const result = maybeUpdateAgentSkill(src, dest, extensionVersion());
+      if (result.action === "updated") {
+        vscode.window.showInformationMessage(
+          `DoStuff: agent skill updated ${result.from} → ${result.to} (new Claude Code sessions pick it up).`,
+        );
+      } else if (result.action === "modified") {
+        const pick = await vscode.window.showWarningMessage(
+          `DoStuff: the installed agent skill (${result.from}) has local edits; this build ships ${result.to}. Replace it?`,
+          "Replace",
+          "Keep mine",
+        );
+        if (pick === "Replace") {
+          installAgentSkill(src, dest, extensionVersion());
+          vscode.window.showInformationMessage(`DoStuff: agent skill updated to ${result.to}.`);
+        }
+      }
+    } catch {
+      // Best effort — never block or break activation over the skill copy.
+    }
+  })();
   // Fire-and-forget so the extension is marked active before the MCP SDK
   // dynamic import + port bind + registry write resolve (~50–200 ms).
   void reconcileMcp();
+
+  // ─── Git ticket sync ──────────────────────────────────────────────────
+  // Mirrors the MCP block: a reconcile function reads config and starts or
+  // stops the controller; hooked to config + workspace-folder changes. No
+  // lazy import needed — gitSync has no heavy deps (04-controller-wiring §3).
+  let sync: GitSyncController | null = null;
+
+  const syncStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+  syncStatusItem.command = "dostuff.sync.now";
+  const refreshSyncStatus = (status?: import("./gitSync").SyncStatus) => {
+    const cfg = vscode.workspace.getConfiguration("dostuff");
+    if (!cfg.get<boolean>("sync.enabled", false)) {
+      syncStatusItem.hide();
+      return;
+    }
+    const s = status ?? sync?.status ?? { state: "disabled" as const };
+    const icon =
+      s.state === "syncing"
+        ? "$(sync~spin)"
+        : s.state === "pendingPush" || s.state === "error"
+          ? "$(warning)"
+          : "$(sync)";
+    syncStatusItem.text = `${icon} DoStuff Sync`;
+    syncStatusItem.tooltip = [
+      `DoStuff git sync: ${s.state}`,
+      s.detail ?? "",
+      s.lastSyncAt ? `Last sync: ${s.lastSyncAt}` : "",
+      "Click to sync now.",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    syncStatusItem.show();
+  };
+
+  const reconcileSync = () => {
+    const cfg = vscode.workspace.getConfiguration("dostuff");
+    const enabled = cfg.get<boolean>("sync.enabled", false);
+    // Always rebuild on reconcile — settings are few and cheap, and a fresh
+    // controller picks up remote/ref/interval changes without diff logic.
+    if (sync) {
+      sync.dispose();
+      sync = null;
+    }
+    if (!enabled) {
+      refreshSyncStatus();
+      return;
+    }
+    const controller = new GitSyncController(
+      store,
+      () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+      {
+        remote: cfg.get<string>("sync.remote", "origin"),
+        ref: cfg.get<string>("sync.ref", "refs/dostuff/state"),
+        // package.json's min/max are UI hints only — clamp here so a raw
+        // settings.json value can't schedule a network sync every few ms.
+        // <= 0 stays 0 (manual network sync only).
+        intervalMinutes: clampSyncInterval(cfg.get<number>("sync.intervalMinutes", 5)),
+        activeLaneCap: cfg.get<number>("activeLaneCap", ACTIVE_LANE_CAP),
+        syncAttachments: cfg.get<boolean>("sync.syncAttachments", true),
+        maxAttachmentSyncBytes: cfg.get<number>("sync.maxAttachmentSyncBytes", 5242880),
+        // The controller is host-agnostic (headless serves it too); toasts
+        // are this host's notification surface.
+        notify: (kind, message) => {
+          if (kind === "warn") void vscode.window.showWarningMessage(message);
+          else void vscode.window.showInformationMessage(message);
+        },
+      },
+    );
+    sync = controller;
+    context.subscriptions.push(controller.onStatusChange((s) => refreshSyncStatus(s)));
+    controller.start();
+    refreshSyncStatus();
+  };
+
+  context.subscriptions.push(
+    syncStatusItem,
+    { dispose: () => sync?.dispose() },
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("dostuff.sync") || e.affectsConfiguration("dostuff.activeLaneCap")) {
+        reconcileSync();
+      }
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => reconcileSync()),
+    vscode.commands.registerCommand("dostuff.sync.now", async () => {
+      if (!sync) {
+        vscode.window.showWarningMessage(
+          "DoStuff git sync is disabled — enable `dostuff.sync.enabled` first.",
+        );
+        return;
+      }
+      const result = await sync.syncNow("manual");
+      const parts = [
+        `${result.applied} applied`,
+        result.pushed ? "pushed" : "nothing to push",
+        ...(result.renames.length ? [`${result.renames.length} renumbered`] : []),
+      ];
+      vscode.window.showInformationMessage(`DoStuff sync: ${parts.join(", ")}.`);
+    }),
+    vscode.commands.registerCommand("dostuff.sync.toggle", async () => {
+      const cfg = vscode.workspace.getConfiguration("dostuff");
+      const enabled = cfg.get<boolean>("sync.enabled", false);
+      await cfg.update("sync.enabled", !enabled, vscode.ConfigurationTarget.Workspace);
+      vscode.window.showInformationMessage(
+        `DoStuff git ticket sync ${!enabled ? "enabled" : "disabled"} for this workspace.`,
+      );
+    }),
+  );
+  reconcileSync();
 }
 
 export function deactivate() {}

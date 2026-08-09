@@ -10,6 +10,7 @@
 !media/*.css
 !media/*.svg
 !media/*.png
+!skills/**
 !CHANGELOG.md
 !LICENSE.txt
 !README.md

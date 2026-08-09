@@ -24,14 +24,34 @@ import {
   runUpdateTicketStatus,
   runUpdateTicketProgress,
   runUpdateTicketDraft,
+  runUpdateTicketDescription,
+  runRequestTicketClose,
+  runRequestTicketComplete,
   registerMcpTools,
-  getWorkspaceContext,
+  publicView,
+  summaryView,
+  statusView,
+  excerpt,
+  DEFAULT_RECORD_LIMIT,
+  MAX_VERIFY_CRITERIA_CHARS,
   DoStuffMcpServer,
   DEFAULT_WORKFLOW_PROMPT,
+  WORKFLOW_POINTER,
+  buildDefaultWorkflowPrompt,
+  PROMPT_BYTE_BUDGET,
   type CreateTicketInput,
+  type GetTicketInput,
   type ToolResult,
 } from "./mcpServer";
 import { ACTIVE_LANE_CAP, type Issue, type Priority, type IssueType, type Status } from "./types";
+import { vsCodeWorkspaceId } from "./mcpHostVscode";
+import {
+  bootServer,
+  makeIssueFactory,
+  makeWorkspaceId,
+  restoreMcpConfig,
+  setMcpConfig,
+} from "./testSupport";
 
 // ----- Test helpers ----------------------------------------------------------
 
@@ -69,32 +89,7 @@ function makeContext(): vscode.ExtensionContext {
   } as unknown as vscode.ExtensionContext;
 }
 
-let issueCounter = 0;
-function makeIssue(overrides: Partial<Issue> = {}): Issue {
-  issueCounter += 1;
-  const number = overrides.number ?? issueCounter;
-  const id = overrides.id ?? `DS-${String(number).padStart(3, "0")}`;
-  const at = overrides.createdAt ?? new Date(2025, 0, 1, 0, 0, number).toISOString();
-  return {
-    id,
-    number,
-    title: overrides.title ?? `Issue ${number}`,
-    type: overrides.type ?? ("Feature" as IssueType),
-    priority: overrides.priority ?? ("Regular" as Priority),
-    status: overrides.status ?? ("Planned" as Status),
-    description: overrides.description ?? "",
-    tasks: overrides.tasks ?? [],
-    tags: overrides.tags ?? [],
-    verifyCriteria: overrides.verifyCriteria ?? "",
-    createdAt: at,
-    resolvedAt: overrides.resolvedAt ?? null,
-    statusHistory:
-      overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
-    record: overrides.record ?? [],
-    attachments: overrides.attachments ?? [],
-    links: overrides.links ?? [],
-  };
-}
+const makeIssue = makeIssueFactory();
 
 async function makeStore(seed: Issue[] = []): Promise<IssueStore> {
   const ctx = makeContext();
@@ -114,7 +109,281 @@ function payload(r: ToolResult): unknown {
 }
 
 beforeEach(() => {
-  issueCounter = 0;
+  makeIssue.reset();
+});
+
+// ----- read-shaping projections ---------------------------------------------
+
+function recordEntries(n: number, prefix = "entry") {
+  return Array.from({ length: n }, (_, i) => ({
+    at: `2025-06-01T00:${String(i).padStart(2, "0")}:00.000Z`,
+    author: "agent" as const,
+    text: `${prefix}-${i}`,
+  }));
+}
+
+describe("excerpt", () => {
+  test("returns '' for blank, whitespace, or non-string input", () => {
+    expect(excerpt("")).toBe("");
+    expect(excerpt("   \n\n  ")).toBe("");
+    expect(excerpt(undefined)).toBe("");
+    expect(excerpt(null)).toBe("");
+    expect(excerpt(42)).toBe("");
+  });
+
+  test("skips a leading markdown heading and excerpts the prose", () => {
+    expect(excerpt("## Problem\n\nThe sync loop clobbers edits.")).toBe(
+      "The sync loop clobbers edits.",
+    );
+  });
+
+  test("skips several leading headings and blank lines", () => {
+    expect(excerpt("\n\n# Title\n\n### Sub\n\nActual prose here.")).toBe(
+      "Actual prose here.",
+    );
+  });
+
+  test("returns '' when the description is only structure", () => {
+    expect(excerpt("## Problem\n\n### Detail")).toBe("");
+  });
+
+  test("stops at the first paragraph break and stays under max", () => {
+    const out = excerpt("First para.\n\nSecond para that should not appear.", 140);
+    expect(out).toBe("First para.");
+    expect(out.length).toBeLessThan(140);
+  });
+
+  test("collapses newlines and runs of whitespace inside one paragraph", () => {
+    expect(excerpt("wrapped line one\nline   two")).toBe("wrapped line one line two");
+  });
+
+  test("cuts on a word boundary and appends an ellipsis when longer than max", () => {
+    const out = excerpt("alpha bravo charlie delta echo", 14);
+    expect(out).toBe("alpha bravo…");
+    expect(out.endsWith("…")).toBe(true);
+    // Never emits a dangling partial word.
+    expect(out).not.toContain("char");
+  });
+
+  test("does not append an ellipsis when the text fits exactly", () => {
+    expect(excerpt("exactly", 7)).toBe("exactly");
+  });
+});
+
+describe("summaryView", () => {
+  test("omits the heavy fields entirely", () => {
+    const row = summaryView(
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Working",
+        description: "Some prose.",
+        verifyCriteria: "must pass",
+        record: recordEntries(5),
+      }),
+    ) as Record<string, unknown>;
+    for (const heavy of [
+      "description",
+      "record",
+      "verifyCriteria",
+      "attachments",
+      "links",
+      "inboundLinks",
+      "commits",
+      "pendingClose",
+    ]) {
+      expect(heavy in row).toBe(false);
+    }
+  });
+
+  test("renders tasks as a done/total string", () => {
+    const row = summaryView(
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        tasks: [
+          { id: "t1", text: "a", done: true },
+          { id: "t2", text: "b", done: false },
+          { id: "t3", text: "c", done: true },
+        ],
+      }),
+    );
+    expect(row.tasks).toBe("2/3");
+  });
+
+  test("omits the excerpt key when the description is blank", () => {
+    const row = summaryView(makeIssue({ id: "DS-001", number: 1, description: "" }));
+    expect("excerpt" in row).toBe(false);
+  });
+
+  test("carries an excerpt when the description has prose", () => {
+    const row = summaryView(
+      makeIssue({ id: "DS-001", number: 1, description: "## Why\n\nBecause it breaks." }),
+    ) as { excerpt?: string };
+    expect(row.excerpt).toBe("Because it breaks.");
+  });
+});
+
+describe("publicView demoted sections", () => {
+  const withCommits = (n: number) =>
+    makeIssue({
+      id: "DS-001",
+      number: 1,
+      commits: Array.from({ length: n }, (_, i) => ({
+        sha: String(i).padStart(40, "0"),
+        at: "2026-01-01T00:00:00.000Z",
+      })),
+    });
+
+  test("pure-function default keeps every section (call sites opt in to demotion)", () => {
+    const view = publicView(withCommits(3)) as Record<string, unknown>;
+    expect(view.commits).toHaveLength(3);
+    expect(view.commitCount).toBe(3);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("include: [] demotes commits to a count and names the omission", () => {
+    const view = publicView(withCommits(6), [], { include: [] }) as Record<string, unknown>;
+    expect("commits" in view).toBe(false);
+    expect(view.commitCount).toBe(6);
+    expect(view.omitted).toEqual(["commits"]);
+  });
+
+  test('include: ["commits"] restores the sha list', () => {
+    const view = publicView(withCommits(6), [], { include: ["commits"] }) as Record<
+      string,
+      unknown
+    >;
+    expect(view.commits).toHaveLength(6);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("a ticket with no commits reports no omission", () => {
+    // Demoted-but-empty is not an omission worth spending bytes on.
+    const view = publicView(withCommits(0), [], { include: [] }) as Record<string, unknown>;
+    expect(view.commitCount).toBe(0);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("verifyCriteria truncates past the ceiling, flags it, and include restores it", () => {
+    const long = "x".repeat(MAX_VERIFY_CRITERIA_CHARS + 500);
+    const issue = makeIssue({ id: "DS-001", number: 1, verifyCriteria: long });
+
+    const trimmed = publicView(issue, [], { include: [] }) as Record<string, unknown>;
+    expect((trimmed.verifyCriteria as string).length).toBe(MAX_VERIFY_CRITERIA_CHARS + 1); // + ellipsis
+    expect(trimmed.verifyCriteriaTruncated).toBe(true);
+    expect(trimmed.omitted).toEqual(["verifyCriteria"]);
+
+    const full = publicView(issue, [], { include: ["verifyCriteria"] }) as Record<string, unknown>;
+    expect(full.verifyCriteria).toBe(long);
+    expect("verifyCriteriaTruncated" in full).toBe(false);
+  });
+
+  test("short verifyCriteria is untouched and unflagged", () => {
+    const issue = makeIssue({ id: "DS-001", number: 1, verifyCriteria: "tests pass" });
+    const view = publicView(issue, [], { include: [] }) as Record<string, unknown>;
+    expect(view.verifyCriteria).toBe("tests pass");
+    expect("verifyCriteriaTruncated" in view).toBe(false);
+    expect("omitted" in view).toBe(false);
+  });
+
+  test("omitted lists every withheld section, spelled as include expects", () => {
+    const issue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      verifyCriteria: "y".repeat(MAX_VERIFY_CRITERIA_CHARS + 1),
+      commits: [{ sha: "a".repeat(40), at: "2026-01-01T00:00:00.000Z" }],
+    });
+    const view = publicView(issue, [], { include: [] }) as { omitted: string[] };
+    expect(view.omitted.sort()).toEqual(["commits", "verifyCriteria"]);
+  });
+});
+
+describe("publicView record windowing", () => {
+  test("defaults to the whole log when no limit is passed", () => {
+    const view = publicView(makeIssue({ id: "DS-001", number: 1, record: recordEntries(40) }));
+    expect(view.record).toHaveLength(40);
+    // No windowing keys on an unwindowed read — byte-identical to prior builds.
+    expect("recordCount" in view).toBe(false);
+    expect("recordOmitted" in view).toBe(false);
+  });
+
+  test("recordLimit: 0 is explicit 'no limit'", () => {
+    const view = publicView(
+      makeIssue({ id: "DS-001", number: 1, record: recordEntries(40) }),
+      [],
+      { recordLimit: 0 },
+    );
+    expect(view.record).toHaveLength(40);
+    expect("recordOmitted" in view).toBe(false);
+  });
+
+  test("keeps the NEWEST entries and reports what it dropped", () => {
+    const view = publicView(
+      makeIssue({ id: "DS-001", number: 1, record: recordEntries(40) }),
+      [],
+      { recordLimit: 10 },
+    ) as { record: Array<{ text: string }>; recordCount?: number; recordOmitted?: number };
+    expect(view.record).toHaveLength(10);
+    expect(view.record[0].text).toBe("entry-30");
+    expect(view.record[9].text).toBe("entry-39");
+    expect(view.recordCount).toBe(40);
+    expect(view.recordOmitted).toBe(30);
+  });
+
+  test("does not add windowing keys when the log is shorter than the limit", () => {
+    const view = publicView(
+      makeIssue({ id: "DS-001", number: 1, record: recordEntries(3) }),
+      [],
+      { recordLimit: 10 },
+    );
+    expect(view.record).toHaveLength(3);
+    expect("recordOmitted" in view).toBe(false);
+  });
+
+  test("windowing leaves every other field untouched", () => {
+    const issue = makeIssue({
+      id: "DS-001",
+      number: 1,
+      description: "keep me",
+      verifyCriteria: "keep me too",
+      record: recordEntries(40),
+    });
+    const view = publicView(issue, [], { recordLimit: 5 });
+    expect(view.description).toBe("keep me");
+    expect(view.verifyCriteria).toBe("keep me too");
+    expect("statusHistory" in view).toBe(false);
+  });
+});
+
+describe("statusView", () => {
+  test("carries only what the rule-7 approval poll needs", () => {
+    const view = statusView(
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        status: "Verification",
+        description: "long prose",
+        record: recordEntries(20),
+        tasks: [
+          { id: "t1", text: "a", done: true },
+          { id: "t2", text: "b", done: false },
+        ],
+      }),
+    ) as Record<string, unknown>;
+    expect(Object.keys(view).sort()).toEqual([
+      "id",
+      "number",
+      "pendingClose",
+      "status",
+      "tasks",
+      "title",
+      // The CAS token for expectedUpdatedAt — cheap here, and the status
+      // poll is exactly where an agent about to write would look.
+      "updatedAt",
+    ]);
+    expect(view.tasks).toEqual({ total: 2, done: 1 });
+  });
 });
 
 // ----- get_ticket ------------------------------------------------------------
@@ -362,9 +631,246 @@ describe("get_ticket", () => {
     // It went to substring search, did not find a '#' in "X", returns no-match
     expect(res.content[0].text).toContain("No ticket matches");
   });
+
+  test("serializes compactly — no pretty-print indentation", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "Compact", status: "Working" }),
+    ]);
+    for (const args of [{ query: "DS-001" }, { query: "DS-001", view: "status" as const }]) {
+      const text = (await runGetTicket(store, args)).content[0].text;
+      // Indentation on a nested ticket costs more bytes than the description.
+      expect(text).not.toContain("\n  ");
+      expect(() => JSON.parse(text)).not.toThrow();
+    }
+  });
+
+  test("demotes commits by default and restores them via include", async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Commits",
+        status: "Working",
+        commits: [
+          { sha: "a".repeat(40), at: "2026-01-01T00:00:00.000Z" },
+          { sha: "b".repeat(40), at: "2026-01-02T00:00:00.000Z" },
+        ],
+      }),
+    ]);
+
+    const lean = payload(await runGetTicket(store, { query: "DS-001" })) as {
+      ticket: Record<string, unknown>;
+    };
+    expect("commits" in lean.ticket).toBe(false);
+    expect(lean.ticket.commitCount).toBe(2);
+    expect(lean.ticket.omitted).toEqual(["commits"]);
+
+    const full = payload(
+      await runGetTicket(store, { query: "DS-001", include: ["commits"] }),
+    ) as { ticket: Record<string, unknown> };
+    expect(full.ticket.commits).toHaveLength(2);
+    expect("omitted" in full.ticket).toBe(false);
+  });
+
+  test("rejects an unknown include value", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "Bad include", status: "Working" }),
+    ]);
+    const res = await runGetTicket(store, {
+      query: "DS-001",
+      include: ["statusHistory"] as unknown as GetTicketInput["include"],
+    });
+    expect(res.isError).toBe(true);
+  });
+
+  test('view: "status" returns only the poll fields and drops the workflow pointer', async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Polling",
+        status: "Verification",
+        description: "a long description that must not be re-sent on every poll",
+        record: recordEntries(20),
+      }),
+    ]);
+    const res = await runGetTicket(store, { query: "DS-001", view: "status" });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as { ticket: Record<string, unknown>; workflow?: string };
+    expect(body.ticket.id).toBe("DS-001");
+    expect(body.ticket.status).toBe("Verification");
+    expect("description" in body.ticket).toBe(false);
+    expect("record" in body.ticket).toBe(false);
+    // The pointer is a quarter of this payload and the agent already has it.
+    expect("workflow" in body).toBe(false);
+    // Workspace stays — it disambiguates multi-board agents.
+    expect("workspace" in body).toBe(true);
+  });
+
+  test('view defaults to "full" when omitted', async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "Full", status: "Planned", description: "prose" }),
+    ]);
+    const body = payload(await runGetTicket(store, { query: "DS-001" })) as {
+      ticket: Record<string, unknown>;
+      workflow: string;
+    };
+    expect(body.ticket.description).toBe("prose");
+    expect(body.workflow).toBe(WORKFLOW_POINTER);
+  });
+
+  test("windows the record log to the configured default", async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Chatty",
+        status: "Working",
+        record: recordEntries(40),
+      }),
+    ]);
+    const body = payload(await runGetTicket(store, { query: "DS-001" })) as {
+      ticket: { record: Array<{ text: string }>; recordCount: number; recordOmitted: number };
+    };
+    // Pinned deliberately: the record log is the single largest key in a
+    // ticket read, and 3 is a judgment call about how much history an agent
+    // needs to resume after a context loss. Changing it should be a decision,
+    // not a drift.
+    expect(DEFAULT_RECORD_LIMIT).toBe(3);
+    expect(body.ticket.record).toHaveLength(DEFAULT_RECORD_LIMIT);
+    expect(body.ticket.record[DEFAULT_RECORD_LIMIT - 1].text).toBe("entry-39");
+    expect(body.ticket.recordCount).toBe(40);
+    expect(body.ticket.recordOmitted).toBe(40 - DEFAULT_RECORD_LIMIT);
+  });
+
+  test("recordLimit param overrides the default, and 0 returns the whole log", async () => {
+    const store = await makeStore([
+      makeIssue({
+        number: 1,
+        id: "DS-001",
+        title: "Chatty",
+        status: "Working",
+        record: recordEntries(40),
+      }),
+    ]);
+    const three = payload(
+      await runGetTicket(store, { query: "DS-001", recordLimit: 3 }),
+    ) as { ticket: { record: unknown[]; recordOmitted: number } };
+    expect(three.ticket.record).toHaveLength(3);
+    expect(three.ticket.recordOmitted).toBe(37);
+
+    const whole = payload(
+      await runGetTicket(store, { query: "DS-001", recordLimit: 0 }),
+    ) as { ticket: { record: unknown[] } };
+    expect(whole.ticket.record).toHaveLength(40);
+  });
+
+  test("rejects an out-of-range recordLimit and an unknown view", async () => {
+    const store = await makeStore([
+      makeIssue({ number: 1, id: "DS-001", title: "X", status: "Planned" }),
+    ]);
+    expect(
+      (await runGetTicket(store, { query: "DS-001", recordLimit: -1 } as never)).isError,
+    ).toBe(true);
+    expect(
+      (await runGetTicket(store, { query: "DS-001", recordLimit: 9_999 } as never)).isError,
+    ).toBe(true);
+    expect(
+      (await runGetTicket(store, { query: "DS-001", view: "brief" } as never)).isError,
+    ).toBe(true);
+  });
 });
 
 // ----- list_issues -----------------------------------------------------------
+
+describe("list_issues paging", () => {
+  const board = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      makeIssue({
+        id: `DS-${String(i + 1).padStart(3, "0")}`,
+        number: i + 1,
+        title: `T${i + 1}`,
+        status: "Planned",
+      }),
+    );
+
+  test("count stays TOTAL matching while returned reports the page", async () => {
+    const store = await makeStore(board(12));
+    const body = payload(await runListIssues(store, { limit: 5 })) as {
+      count: number;
+      returned: number;
+      nextOffset?: number;
+      issues: Array<{ number: number }>;
+    };
+    expect(body.count).toBe(12);
+    expect(body.returned).toBe(5);
+    expect(body.nextOffset).toBe(5);
+    expect(body.issues.map((i) => i.number)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("offset walks the deterministic number sort without gaps or repeats", async () => {
+    const store = await makeStore(board(12));
+    const seen: number[] = [];
+    let offset = 0;
+    for (;;) {
+      const body = payload(await runListIssues(store, { limit: 5, offset })) as {
+        nextOffset?: number;
+        issues: Array<{ number: number }>;
+      };
+      seen.push(...body.issues.map((i) => i.number));
+      if (body.nextOffset === undefined) break;
+      offset = body.nextOffset;
+    }
+    expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
+  test("omits nextOffset on the last page and when everything fits", async () => {
+    const store = await makeStore(board(12));
+    const last = payload(await runListIssues(store, { limit: 5, offset: 10 })) as {
+      returned: number;
+      nextOffset?: number;
+    };
+    expect(last.returned).toBe(2);
+    expect("nextOffset" in last).toBe(false);
+
+    const all = payload(await runListIssues(store, {})) as { nextOffset?: number };
+    expect("nextOffset" in all).toBe(false);
+  });
+
+  test("an offset past the end returns an empty page, not an error", async () => {
+    const store = await makeStore(board(3));
+    const body = payload(await runListIssues(store, { offset: 99 })) as {
+      count: number;
+      returned: number;
+      issues: unknown[];
+    };
+    expect(body.count).toBe(3);
+    expect(body.returned).toBe(0);
+    expect(body.issues).toEqual([]);
+  });
+
+  test("paging composes with filters — count is the filtered total", async () => {
+    const store = await makeStore([
+      ...board(6),
+      makeIssue({ id: "DS-007", number: 7, title: "W", status: "Working" }),
+    ]);
+    const body = payload(await runListIssues(store, { status: "Planned", limit: 2 })) as {
+      count: number;
+      returned: number;
+      issues: Array<{ status: string }>;
+    };
+    expect(body.count).toBe(6);
+    expect(body.returned).toBe(2);
+    expect(body.issues.every((i) => i.status === "Planned")).toBe(true);
+  });
+
+  test("rejects an out-of-range limit or a negative offset", async () => {
+    const store = await makeStore(board(3));
+    expect((await runListIssues(store, { limit: 0 })).isError).toBe(true);
+    expect((await runListIssues(store, { limit: 9_999 })).isError).toBe(true);
+    expect((await runListIssues(store, { offset: -1 })).isError).toBe(true);
+  });
+});
 
 describe("list_issues", () => {
   test("no filters returns all issues sorted by number ascending", async () => {
@@ -496,29 +1002,42 @@ describe("workspace context and workflow in tool responses", () => {
     vscode.workspace.name = undefined;
   });
 
-  test("getWorkspaceContext returns null when no workspaceFolders", () => {
+  test("vsCodeWorkspaceId returns null when no workspaceFolders", () => {
     vscode.workspace.workspaceFolders = undefined;
-    expect(getWorkspaceContext()).toBeNull();
+    expect(vsCodeWorkspaceId()).toBeNull();
   });
 
-  test("getWorkspaceContext returns name+rootPath when workspaceFolders set", () => {
+  test("vsCodeWorkspaceId returns folder path + name when workspaceFolders set", () => {
     vscode.workspace.workspaceFolders = [
       { name: "MyProject", uri: vscode.Uri.file("/home/user/MyProject"), index: 0 },
     ];
-    vscode.workspace.name = "MyProject";
-    const ctx = getWorkspaceContext();
-    expect(ctx).not.toBeNull();
-    expect(ctx!.name).toBe("MyProject");
-    expect(ctx!.rootPath).toBe("/home/user/MyProject");
+    const ws = vsCodeWorkspaceId();
+    expect(ws).not.toBeNull();
+    expect(ws!.name).toBe("MyProject");
+    expect(ws!.path).toBe("/home/user/MyProject");
   });
 
-  test("getWorkspaceContext falls back to folder name when workspace.name is undefined", () => {
+  test("vsCodeWorkspaceId honors the dostuff.mcp.workspaceOverride pin", () => {
     vscode.workspace.workspaceFolders = [
       { name: "FolderName", uri: vscode.Uri.file("/x"), index: 0 },
     ];
-    vscode.workspace.name = undefined;
-    const ctx = getWorkspaceContext();
-    expect(ctx!.name).toBe("FolderName");
+    const origGetConfiguration = vscode.workspace.getConfiguration;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (vscode.workspace as any).getConfiguration = () => ({
+      get: <T,>(key: string, defaultValue?: T): T | undefined =>
+        key === "mcp.workspaceOverride" ? ("/pinned/elsewhere" as T) : defaultValue,
+      update: () => Promise.resolve(),
+      inspect: () => undefined,
+      has: () => false,
+    });
+    try {
+      const ws = vsCodeWorkspaceId();
+      expect(ws!.path).toBe("/pinned/elsewhere");
+      expect(ws!.name).toBe("elsewhere");
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (vscode.workspace as any).getConfiguration = origGetConfiguration;
+    }
   });
 
   test("tool responses include workspace field (null when no workspace open)", async () => {
@@ -550,11 +1069,61 @@ describe("workspace context and workflow in tool responses", () => {
     expect(progressBody.workspace).toBeNull();
   });
 
-  test("list_issues includes workflow field equal to DEFAULT_WORKFLOW_PROMPT when instructions unset", async () => {
-    // mock getConfiguration returns defaultValue ("") for any key → readWorkflowPrompt falls through
+  test("list_issues embeds the one-line WORKFLOW_POINTER, not the full prompt", async () => {
     const store = await makeStore([]);
     const res = payload(await runListIssues(store, {})) as { workflow: string };
-    expect(res.workflow).toBe(DEFAULT_WORKFLOW_PROMPT);
+    expect(res.workflow).toBe(WORKFLOW_POINTER);
+    expect(res.workflow.length).toBeLessThan(200);
+    expect(res.workflow).not.toContain("update_ticket_status");
+  });
+
+  test("get_ticket embeds the one-line WORKFLOW_POINTER, not the full prompt", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", number: 1, title: "Pointer check", status: "Working" }),
+    ]);
+    const res = payload(await runGetTicket(store, { query: "DS-001" })) as { workflow: string };
+    expect(res.workflow).toBe(WORKFLOW_POINTER);
+    expect(res.workflow).not.toContain("update_ticket_status");
+  });
+});
+
+// ----- workflow prompt byte budget -------------------------------------------
+
+describe("workflow prompt byte budget", () => {
+  // Claude Code truncates server instructions and tool descriptions at 2KB,
+  // silently. A prompt that overruns loses its TAIL — which is where the
+  // close/complete flow and the field-immutability contract live. This suite
+  // is the regression guard; if it fails, cut prose rather than raising the
+  // budget.
+  for (const cap of [1, 6, 12, 50]) {
+    test(`fits PROMPT_BYTE_BUDGET at activeLaneCap=${cap}`, () => {
+      const bytes = Buffer.byteLength(buildDefaultWorkflowPrompt(cap), "utf8");
+      expect(bytes).toBeLessThanOrEqual(PROMPT_BYTE_BUDGET);
+    });
+  }
+
+  test("keeps the rules that used to fall past the truncation point", () => {
+    const prompt = buildDefaultWorkflowPrompt(6);
+    // Everything asserted here was being dropped when the prompt was 2,830
+    // bytes. Each is a safety contract an agent cannot infer from a single
+    // tool description.
+    expect(prompt).toContain("request_ticket_close");
+    expect(prompt).toContain("only a human can set Complete or Closed");
+    expect(prompt).toMatch(/NOT change a ticket's title, priority, type, or verify criteria/);
+    expect(prompt).toContain("recordLimit: 0");
+    // The tool-search trigger: with schemas deferred, this is what tells an
+    // agent the server is worth searching at all.
+    expect(prompt.slice(0, 160)).toMatch(/ticket queue/i);
+  });
+
+  test("carries the write-terse rule for agent-authored ticket content", () => {
+    const prompt = buildDefaultWorkflowPrompt(6);
+    // Agent prose is the dominant per-read cost of a long-lived ticket: every
+    // record note is replayed on every later read. This rule is what bounds it,
+    // and no single tool description can state it for all write paths.
+    expect(prompt).toMatch(/Write terse/);
+    expect(prompt).toMatch(/~15 words/);
+    expect(prompt).toMatch(/No narration/);
   });
 });
 
@@ -639,10 +1208,12 @@ describe("create_ticket", () => {
     });
   });
 
-  test("rapid-fire produces unique task ids across many creates (no UUID collisions)", async () => {
+  test("rapid-fire produces unique task ids across many creates (no collisions)", async () => {
     const store = await makeStore([]);
     // Fire 50 creates with NO awaits in between so they overlap. Each create
-    // produces two task ids; collect them all and assert uniqueness.
+    // produces two task ids; collect them all and assert uniqueness. This is
+    // the load-bearing property — task ids are the per-element LWW merge key
+    // in syncMerge, so a duplicate would silently merge two distinct tasks.
     const promises: Promise<ToolResult>[] = [];
     for (let i = 0; i < 50; i++) {
       promises.push(runCreateTicket(store, { title: `T${i}`, tasks: ["a", "b"] }));
@@ -655,9 +1226,12 @@ describe("create_ticket", () => {
     }
     expect(allTaskIds.length).toBe(100);
     expect(new Set(allTaskIds).size).toBe(100);
-    // Sanity: ids follow the t-<uuid> shape.
+    // Shape sanity only — ids are opaque and nothing validates their format.
+    // MCP now mints the same short form the webview always has (`newTaskId`),
+    // rather than `t-<uuid>`; legacy uuid ids keep resolving untouched.
     for (const id of allTaskIds) {
-      expect(id.startsWith("t-")).toBe(true);
+      expect(id.startsWith("t")).toBe(true);
+      expect(id.length).toBeLessThan(20);
     }
   });
 
@@ -794,11 +1368,37 @@ describe("update_ticket_status", () => {
     expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
-  test("Thinking -> Planned: rejected (human-only promotion)", async () => {
+  test("Thinking -> Planned: allowed (agent may promote a draft into the pipeline)", async () => {
     const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking" })]);
     const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Planned" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Planned");
+    expect(store.get("DS-001")!.statusHistory.at(-1)).toMatchObject({ status: "Planned", by: "agent" });
+  });
+
+  test("Thinking -> Working: allowed (promotion may target any active lane)", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking" })]);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Working" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Working");
+  });
+
+  test("Thinking -> Verification: allowed", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking" })]);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Verification" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Verification");
+  });
+
+  test("Thinking -> Planned: rejected when the Planned lane is already full", async () => {
+    const seed = [makeIssue({ id: "DS-001", status: "Thinking" })];
+    for (let i = 2; i <= 7; i++) {
+      seed.push(makeIssue({ id: `DS-${String(i).padStart(3, "0")}`, status: "Planned" }));
+    }
+    const store = await makeStore(seed);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Planned" });
     expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("Thinking");
+    expect(res.content[0].text).toContain("full");
     expect(store.get("DS-001")!.status).toBe("Thinking");
   });
 
@@ -828,17 +1428,38 @@ describe("update_ticket_status", () => {
     expect(store.get("DS-001")!.status).toBe("Planned");
   });
 
-  test("Planned -> Thinking: rejected with actionable message explaining the human-triage rule", async () => {
-    const store = await makeStore([makeIssue({ id: "DS-001", status: "Planned" })]);
-    // bypass schema by casting; handler must still reject
-    const res = await runUpdateTicketStatus(store, {
-      id: "DS-001",
-      status: "Thinking" as Status,
+  for (const source of ["Planned", "Working", "Verification"] as const) {
+    test(`${source} -> Thinking: allowed (agent may demote back to the drawer)`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status: source })]);
+      const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Thinking" });
+      expect(res.isError).toBeFalsy();
+      const u = store.get("DS-001")!;
+      expect(u.status).toBe("Thinking");
+      expect(u.statusHistory.at(-1)).toMatchObject({ status: "Thinking", by: "agent" });
     });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain("human triage queue");
-    expect(res.content[0].text).toContain("Planned, Working, Verification");
-    expect(store.get("DS-001")!.status).toBe("Planned");
+  }
+
+  test("Thinking is uncapped: demotion succeeds even with many Thinking tickets", async () => {
+    const seed = [makeIssue({ id: "DS-001", status: "Planned" })];
+    for (let i = 2; i <= 9; i++) {
+      seed.push(makeIssue({ id: `DS-${String(i).padStart(3, "0")}`, status: "Thinking" }));
+    }
+    const store = await makeStore(seed);
+    const res = await runUpdateTicketStatus(store, { id: "DS-001", status: "Thinking" });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.status).toBe("Thinking");
+  });
+
+  test("demoting to Thinking re-opens update_ticket_draft scope editing", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tags: [] })]);
+    // Locked while active…
+    const locked = await runUpdateTicketDraft(store, { id: "DS-001", tags: ["rescoped"] });
+    expect(locked.isError).toBe(true);
+    // …unlocked after an agent demotes it back to Thinking.
+    await runUpdateTicketStatus(store, { id: "DS-001", status: "Thinking" });
+    const unlocked = await runUpdateTicketDraft(store, { id: "DS-001", tags: ["rescoped"] });
+    expect(unlocked.isError).toBeFalsy();
+    expect(store.get("DS-001")!.tags).toEqual(["rescoped"]);
   });
 
   test("Planned -> Complete: rejected (only humans complete)", async () => {
@@ -984,6 +1605,79 @@ describe("update_ticket_status", () => {
 // ----- update_ticket_progress ------------------------------------------------
 
 describe("update_ticket_progress", () => {
+  test("echoes only the changed tasks, plus done/total counts", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: Array.from({ length: 12 }, (_, i) => ({
+          id: `t-${"0123456789abcdef".repeat(2)}-${i}`,
+          text: `step ${i}`,
+          done: i < 2,
+        })),
+      }),
+    ]);
+    const target = store.get("DS-001")!.tasks[5].id;
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      taskUpdates: [{ id: target, done: true }],
+    });
+    expect(res.isError).toBeFalsy();
+    const body = payload(res) as {
+      tasksChanged: Array<{ id: string; done: boolean }>;
+      tasks: { total: number; done: number };
+    };
+    expect(body.tasksChanged).toEqual([{ id: target, done: true }]);
+    expect(body.tasks).toEqual({ total: 12, done: 3 });
+    // The eleven untouched ids must not be echoed back at the caller.
+    expect(res.content[0].text).not.toContain(store.get("DS-001")!.tasks[0].id);
+  });
+
+  test("echoes an empty tasksChanged when only a record entry is appended", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: [{ id: "t1", text: "a", done: false }],
+      }),
+    ]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      recordEntry: "note only",
+    });
+    const body = payload(res) as {
+      tasksChanged: unknown[];
+      tasks: { total: number; done: number };
+      recordLength: number;
+    };
+    expect(body.tasksChanged).toEqual([]);
+    expect(body.tasks).toEqual({ total: 1, done: 0 });
+    expect(body.recordLength).toBe(1);
+  });
+
+  test("legacy t-<uuid> task ids still resolve after the id-format change", async () => {
+    // Storage tenet: task ids are persisted (issue_tasks.task_id) and are the
+    // per-element LWW merge key in syncMerge. Ids minted by earlier builds must
+    // keep working — only NEWLY minted ids change format.
+    const legacyId = "t-3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: [{ id: legacyId, text: "legacy task", done: false }],
+      }),
+    ]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      taskUpdates: [{ id: legacyId, done: true }],
+    });
+    expect(res.isError).toBeFalsy();
+    expect(store.get("DS-001")!.tasks[0].done).toBe(true);
+    expect(store.get("DS-001")!.tasks[0].id).toBe(legacyId);
+    const body = payload(res) as { tasksChanged: Array<{ id: string }> };
+    expect(body.tasksChanged[0].id).toBe(legacyId);
+  });
+
   test("toggles task.done; other ticket fields are untouched", async () => {
     const store = await makeStore([
       makeIssue({
@@ -1133,6 +1827,19 @@ describe("update_ticket_progress", () => {
     expect(updated.record).toHaveLength(0);
   });
 
+  test("over-long recordEntry is rejected by the 500-char cap", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", tasks: [], record: [] }),
+    ]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      taskUpdates: [],
+      recordEntry: "x".repeat(501),
+    });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.record).toHaveLength(0);
+  });
+
   test("not-found id returns isError (404-style)", async () => {
     const store = await makeStore([]);
     const res = await runUpdateTicketProgress(store, {
@@ -1181,6 +1888,80 @@ describe("update_ticket_progress", () => {
     expect(updated.type).toBe("Feature");
     expect(updated.verifyCriteria).toBe("Locked");
     expect(updated.record).toHaveLength(0);
+  });
+
+  const FULL_SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0";
+
+  test("commit param appends a lowercased anchor and reports commitCount", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tasks: [] })]);
+    const res = await runUpdateTicketProgress(store, {
+      id: "DS-001",
+      commit: FULL_SHA.toUpperCase(),
+      recordEntry: "wired the thing",
+    });
+    expect(res.isError).toBeFalsy();
+    const payload = JSON.parse(res.content[0].text);
+    expect(payload.commitCount).toBe(1);
+    const updated = store.get("DS-001")!;
+    expect(updated.commits).toHaveLength(1);
+    expect(updated.commits[0].sha).toBe(FULL_SHA);
+    expect(typeof updated.commits[0].at).toBe("string");
+  });
+
+  test("same sha reported twice → single entry keeping the original at", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tasks: [] })]);
+    await runUpdateTicketProgress(store, { id: "DS-001", commit: FULL_SHA });
+    const firstAt = store.get("DS-001")!.commits[0].at;
+    const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: FULL_SHA.toUpperCase() });
+    expect(res.isError).toBeFalsy();
+    const payload = JSON.parse(res.content[0].text);
+    expect(payload.commitCount).toBe(1);
+    expect(store.get("DS-001")!.commits).toEqual([{ sha: FULL_SHA, at: firstAt }]);
+  });
+
+  test("commit-only call leaves record and tasks unchanged", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        tasks: [{ id: "t1", text: "one", done: false }],
+        record: [{ at: "2025-01-01T00:00:00Z", author: "user", text: "existing" }],
+      }),
+    ]);
+    const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: "abcdef0" });
+    expect(res.isError).toBeFalsy();
+    const updated = store.get("DS-001")!;
+    expect(updated.record).toHaveLength(1);
+    expect(updated.tasks[0].done).toBe(false);
+    expect(updated.commits).toEqual([{ sha: "abcdef0", at: updated.commits[0].at }]);
+  });
+
+  test("schema rejects malformed commit shas without mutation", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", tasks: [] })]);
+    for (const bad of ["zzzzzzz", "abc123", FULL_SHA + "0", "--format", "HEAD"]) {
+      const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: bad });
+      expect(res.isError).toBe(true);
+    }
+    expect(store.get("DS-001")!.commits).toEqual([]);
+  });
+
+  test("commit param is rejected on terminal tickets", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Complete", tasks: [] })]);
+    const res = await runUpdateTicketProgress(store, { id: "DS-001", commit: FULL_SHA });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.commits).toEqual([]);
+  });
+
+  test("publicView exposes commits as {sha, at}", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        commits: [{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }],
+      }),
+    ]);
+    const view = publicView(store.get("DS-001")!, store.list());
+    expect(view.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
   });
 });
 
@@ -1297,6 +2078,293 @@ describe("update_ticket_draft", () => {
   });
 });
 
+describe("update_ticket_description", () => {
+  for (const status of ["Thinking", "Planned", "Working", "Verification"] as const) {
+    test(`edits the description on a ${status} ticket and appends one agent record`, async () => {
+      const store = await makeStore([
+        makeIssue({ id: "DS-001", status, description: "old", record: [] }),
+      ]);
+      const res = await runUpdateTicketDescription(store, { id: "DS-001", description: "new prose" });
+      expect(res.isError).toBeFalsy();
+      const u = store.get("DS-001")!;
+      expect(u.description).toBe("new prose");
+      expect(u.status).toBe(status);
+      expect(u.record).toHaveLength(1);
+      expect(u.record[0]).toMatchObject({ author: "agent" });
+    });
+  }
+
+  test("over-long description is rejected by the 10,000-char cap", async () => {
+    // Input-only cap: a longer description already on disk still loads and is
+    // served untouched — this only bounds what an agent can write.
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", description: "old", record: [] }),
+    ]);
+    const res = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "x".repeat(10_001),
+    });
+    expect(res.isError).toBe(true);
+    expect(store.get("DS-001")!.description).toBe("old");
+  });
+
+  test("leaves title/priority/type/verifyCriteria untouched", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Working",
+        title: "Original",
+        priority: "High",
+        type: "Bug",
+        verifyCriteria: "Original verify",
+        description: "old",
+      }),
+    ]);
+    await runUpdateTicketDescription(store, { id: "DS-001", description: "changed" });
+    const u = store.get("DS-001")!;
+    expect(u.title).toBe("Original");
+    expect(u.priority).toBe("High");
+    expect(u.type).toBe("Bug");
+    expect(u.verifyCriteria).toBe("Original verify");
+    expect(u.description).toBe("changed");
+  });
+
+  for (const status of ["Complete", "Closed"] as const) {
+    test(`rejects a ${status} ticket`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status, description: "keep" })]);
+      const res = await runUpdateTicketDescription(store, { id: "DS-001", description: "nope" });
+      expect(res.isError).toBe(true);
+      expect(store.get("DS-001")!.description).toBe("keep");
+    });
+  }
+
+  test("rejects an unknown id", async () => {
+    const store = await makeStore([]);
+    const res = await runUpdateTicketDescription(store, { id: "DS-999", description: "x" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("not found");
+  });
+
+  test("rejects an over-length description", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working" })]);
+    const res = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "x".repeat(20_001),
+    });
+    expect(res.isError).toBe(true);
+  });
+
+  test("strict-rejects a smuggled extra field (e.g. title)", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", title: "Original", description: "old" }),
+    ]);
+    const res = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "new",
+      title: "hacked",
+    } as unknown as { id: string; description: string });
+    expect(res.isError).toBe(true);
+    const u = store.get("DS-001")!;
+    expect(u.title).toBe("Original");
+    expect(u.description).toBe("old");
+  });
+});
+
+// ----- expectedUpdatedAt CAS (concurrency L3) --------------------------------
+// The two replace-shaped writes accept an opt-in compare-and-swap token so
+// parallel subagents editing one ticket get an explicit stale rejection
+// (carrying the fresh state) instead of a silent lost update.
+
+describe("expectedUpdatedAt CAS on the replace-shaped writes", () => {
+  test("draft: matching token succeeds and the response carries the new updatedAt", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Thinking", tags: ["old"] })]);
+    const token = store.get("DS-001")!.updatedAt;
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      tags: ["new"],
+      expectedUpdatedAt: token,
+    });
+    expect(res.isError).toBeFalsy();
+    const body = JSON.parse(res.content[0].text) as { updatedAt?: string };
+    expect(body.updatedAt).toBe(store.get("DS-001")!.updatedAt);
+    expect(store.get("DS-001")!.tags).toEqual(["new"]);
+  });
+
+  test("draft: stale token rejects, embeds the fresh lists, and writes nothing", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        status: "Thinking",
+        tags: ["current"],
+        tasks: [{ id: "t1", text: "keep me", done: false }],
+      }),
+    ]);
+    const res = await runUpdateTicketDraft(store, {
+      id: "DS-001",
+      tags: ["mine"],
+      expectedUpdatedAt: "2000-01-01T00:00:00.000Z",
+    });
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain("Stale expectedUpdatedAt");
+    const embedded = JSON.parse(text.slice(text.indexOf("\n") + 1)) as {
+      updatedAt: string;
+      tags: string[];
+      tasks: Array<{ text: string }>;
+    };
+    expect(embedded.updatedAt).toBe(store.get("DS-001")!.updatedAt);
+    expect(embedded.tags).toEqual(["current"]);
+    expect(embedded.tasks[0].text).toBe("keep me");
+    expect(store.get("DS-001")!.tags).toEqual(["current"]);
+  });
+
+  test("description: stale token rejects with the fresh description; matching succeeds; omitted skips the check", async () => {
+    const store = await makeStore([
+      makeIssue({ id: "DS-001", status: "Working", description: "their edit" }),
+    ]);
+
+    const stale = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "my edit",
+      expectedUpdatedAt: "2000-01-01T00:00:00.000Z",
+    });
+    expect(stale.isError).toBe(true);
+    const text = stale.content[0].text;
+    expect(text).toContain("Stale expectedUpdatedAt");
+    const embedded = JSON.parse(text.slice(text.indexOf("\n") + 1)) as { description: string };
+    expect(embedded.description).toBe("their edit");
+    expect(store.get("DS-001")!.description).toBe("their edit");
+
+    const ok = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "merged edit",
+      expectedUpdatedAt: store.get("DS-001")!.updatedAt,
+    });
+    expect(ok.isError).toBeFalsy();
+    expect(store.get("DS-001")!.description).toBe("merged edit");
+    expect((JSON.parse(ok.content[0].text) as { updatedAt?: string }).updatedAt).toBe(
+      store.get("DS-001")!.updatedAt,
+    );
+
+    // No token → pre-CAS behavior: last writer wins, no rejection.
+    const unguarded = await runUpdateTicketDescription(store, {
+      id: "DS-001",
+      description: "unguarded overwrite",
+    });
+    expect(unguarded.isError).toBeFalsy();
+    expect(store.get("DS-001")!.description).toBe("unguarded overwrite");
+  });
+});
+
+describe("request_ticket_close", () => {
+  for (const status of ["Thinking", "Planned", "Working", "Verification"] as const) {
+    test(`flags pendingClose on a ${status} ticket without changing status`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status, record: [] })]);
+      const res = await runRequestTicketClose(store, { id: "DS-001", note: "done here" });
+      expect(res.isError).toBeFalsy();
+      const u = store.get("DS-001")!;
+      expect(u.status).toBe(status);
+      expect(u.pendingClose).toMatchObject({ by: "agent", note: "done here" });
+      expect(u.record).toHaveLength(1);
+      expect(u.record[0]).toMatchObject({ author: "agent" });
+      expect(res.content[0].text).toContain("approve");
+      expect(res.content[0].text).toContain("get_ticket");
+    });
+  }
+
+  test("is idempotent: a second request adds no duplicate record and keeps the original", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", record: [] })]);
+    await runRequestTicketClose(store, { id: "DS-001" });
+    const afterFirst = store.get("DS-001")!;
+    expect(afterFirst.pendingClose).not.toBeNull();
+    expect(afterFirst.record).toHaveLength(1);
+
+    const res = await runRequestTicketClose(store, { id: "DS-001", note: "again" });
+    expect(res.isError).toBeFalsy();
+    const afterSecond = store.get("DS-001")!;
+    expect(afterSecond.record).toHaveLength(1);
+    expect(afterSecond.pendingClose).toMatchObject({ by: "agent" });
+    expect(afterSecond.pendingClose?.note).toBeUndefined();
+  });
+
+  for (const status of ["Complete", "Closed"] as const) {
+    test(`rejects a ${status} ticket`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status })]);
+      const res = await runRequestTicketClose(store, { id: "DS-001" });
+      expect(res.isError).toBe(true);
+      expect(store.get("DS-001")!.pendingClose).toBeNull();
+    });
+  }
+
+  test("rejects an unknown id", async () => {
+    const store = await makeStore([]);
+    const res = await runRequestTicketClose(store, { id: "DS-999" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("not found");
+  });
+
+  test("stamps target 'Closed' so history distinguishes OBE from finished work", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Working", record: [] })]);
+    await runRequestTicketClose(store, { id: "DS-001" });
+    expect(store.get("DS-001")!.pendingClose?.target).toBe("Closed");
+  });
+});
+
+describe("request_ticket_complete", () => {
+  test("flags pendingClose with target 'Complete' on a Verification ticket, status unchanged", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification", record: [] })]);
+    const res = await runRequestTicketComplete(store, { id: "DS-001", note: "criteria met" });
+    expect(res.isError).toBeFalsy();
+    const u = store.get("DS-001")!;
+    expect(u.status).toBe("Verification");
+    expect(u.pendingClose).toMatchObject({ by: "agent", target: "Complete", note: "criteria met" });
+    expect(u.record).toHaveLength(1);
+    expect(res.content[0].text).toContain("Complete");
+    expect(res.content[0].text).toContain("get_ticket");
+  });
+
+  for (const status of ["Thinking", "Planned", "Working"] as const) {
+    test(`rejects a ${status} ticket — Verification-only, error points at the workflow`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status })]);
+      const res = await runRequestTicketComplete(store, { id: "DS-001" });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain("Verification");
+      expect(res.content[0].text).toContain("update_ticket_status");
+      expect(store.get("DS-001")!.pendingClose).toBeNull();
+    });
+  }
+
+  for (const status of ["Complete", "Closed"] as const) {
+    test(`rejects a ${status} ticket (already terminal)`, async () => {
+      const store = await makeStore([makeIssue({ id: "DS-001", status })]);
+      const res = await runRequestTicketComplete(store, { id: "DS-001" });
+      expect(res.isError).toBe(true);
+    });
+  }
+
+  test("is idempotent per target: repeat completion request adds no record", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification", record: [] })]);
+    await runRequestTicketComplete(store, { id: "DS-001" });
+    const res = await runRequestTicketComplete(store, { id: "DS-001" });
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).toContain("Already pending");
+    expect(store.get("DS-001")!.record).toHaveLength(1);
+  });
+
+  test("a completion request replaces a pending close request (auditable switch)", async () => {
+    const store = await makeStore([makeIssue({ id: "DS-001", status: "Verification", record: [] })]);
+    await runRequestTicketClose(store, { id: "DS-001" });
+    expect(store.get("DS-001")!.pendingClose?.target).toBe("Closed");
+
+    const res = await runRequestTicketComplete(store, { id: "DS-001" });
+    expect(res.isError).toBeFalsy();
+    const u = store.get("DS-001")!;
+    expect(u.pendingClose?.target).toBe("Complete");
+    expect(u.record).toHaveLength(2);
+    expect(u.record[1]!.text).toContain("replacing the pending close request");
+  });
+});
+
 // ----- HTTP integration tests -----------------------------------------------
 
 describe("DoStuffMcpServer HTTP", () => {
@@ -1308,49 +2376,8 @@ describe("DoStuffMcpServer HTTP", () => {
   });
 });
 
-// Helpers for booting a real HTTP-backed MCP server in tests.
-const __origGetConfig = vscode.workspace.getConfiguration;
-function setMcpConfig(values: Record<string, unknown>): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (vscode.workspace as any).getConfiguration = (_section?: string) => ({
-    get: <T,>(key: string, defaultValue?: T): T | undefined =>
-      (key in values ? (values[key] as T) : defaultValue),
-    update: () => Promise.resolve(),
-    inspect: () => undefined,
-    has: () => false,
-  });
-}
-function restoreMcpConfig(): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (vscode.workspace as any).getConfiguration = __origGetConfig;
-}
-
-// Each booted server gets a distinct synthetic workspace path so registry
-// entries don't collide across tests.
-let __nextWs = 0;
-function makeWorkspaceId(): () => { path: string; name: string } {
-  __nextWs += 1;
-  const path = `/tmp/dostuff-test-ws-${process.pid}-${__nextWs}`;
-  return () => ({ path, name: `ws-${__nextWs}` });
-}
-
-async function bootServer(
-  store: IssueStore,
-  opts: {
-    enabled?: boolean;
-    instructions?: string;
-    workspaceId?: () => { path: string; name: string } | null;
-    preferredPort?: number;
-  } = {},
-): Promise<{ server: DoStuffMcpServer; port: number }> {
-  const cfg: Record<string, unknown> = { "mcp.enabled": opts.enabled ?? true };
-  if (opts.instructions !== undefined) cfg["mcp.instructions"] = opts.instructions;
-  if (opts.preferredPort !== undefined) cfg["mcp.port"] = opts.preferredPort;
-  setMcpConfig(cfg);
-  const server = new DoStuffMcpServer(store, opts.workspaceId ?? makeWorkspaceId());
-  await server.reconcile();
-  return { server, port: server.status.port ?? 0 };
-}
+// The HTTP boot harness (setMcpConfig / bootServer / makeWorkspaceId) lives in
+// testSupport.ts, shared with agentSkill.test.ts.
 
 async function rawRequest(
   port: number,
@@ -1872,6 +2899,9 @@ describe("DoStuffMcpServer HTTP (live)", () => {
       "create_ticket",
       "get_ticket",
       "list_issues",
+      "request_ticket_close",
+      "request_ticket_complete",
+      "update_ticket_description",
       "update_ticket_draft",
       "update_ticket_progress",
       "update_ticket_status",
@@ -1892,10 +2922,66 @@ describe("DoStuffMcpServer HTTP (live)", () => {
         "create_ticket",
         "get_ticket",
         "list_issues",
+        "request_ticket_close",
+        "request_ticket_complete",
+        "update_ticket_description",
         "update_ticket_draft",
         "update_ticket_progress",
         "update_ticket_status",
       ]);
+    }
+  });
+
+  test("MEASURE tools/list and initialize instructions (fixed per-session floor)", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+
+    const tools = await mcpJsonRpc(port, "tools/list", {});
+    const toolsBytes = JSON.stringify((tools.result as { tools: unknown[] }).tools).length;
+
+    const init = await mcpJsonRpc(port, "initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "measure", version: "0" },
+    });
+    const instructions =
+      (init.result as { instructions?: string }).instructions ?? "";
+
+    const perTool = (tools.result as { tools: Array<{ name: string }> }).tools
+      .map((t) => `    ${t.name.padEnd(26)} ${String(JSON.stringify(t).length).padStart(5)} ch`)
+      .sort()
+      .join("\n");
+    console.log(
+      `\nper-session fixed floor\n  tools/list          ${toolsBytes} ch` +
+        `\n  initialize instrs   ${instructions.length} ch` +
+        `\n  total               ${toolsBytes + instructions.length} ch\n${perTool}`,
+    );
+    // Guard rails, not exact assertions — the point is to notice unbounded
+    // growth, not to pin a number. Note tool schemas are DEFERRED by default in
+    // Claude Code (tool search), so tools/list is not a per-session context
+    // cost the way the instructions are.
+    expect(toolsBytes).toBeLessThan(12_000);
+    expect(Buffer.byteLength(instructions, "utf8")).toBeLessThanOrEqual(
+      PROMPT_BYTE_BUDGET,
+    );
+  });
+
+  test("every tool description fits the 2KB Claude Code ceiling", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+
+    const listed = await mcpJsonRpc(port, "tools/list", {});
+    const tools = (listed.result as {
+      tools: Array<{ name: string; description?: string }>;
+    }).tools;
+    expect(tools.length).toBeGreaterThan(0);
+    for (const t of tools) {
+      const bytes = Buffer.byteLength(t.description ?? "", "utf8");
+      // Same silent-truncation rule as server instructions. Descriptions have
+      // their own budget, so detail pushed out of the workflow prompt can land
+      // here — but not without limit.
+      expect({ tool: t.name, bytes }).toMatchObject({ tool: t.name });
+      expect(bytes).toBeLessThanOrEqual(2048);
     }
   });
 
@@ -1917,6 +3003,43 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     const json = sseMatch ? JSON.parse(sseMatch[1]) : JSON.parse(res.body);
     return json as { result?: unknown; error?: { message: string } };
   }
+
+  test("write queue: N parallel update_ticket_progress calls all land (skill-path fan-out)", async () => {
+    // Skill callers are bare curl — parallel subagents produce genuinely
+    // concurrent HTTP mutations with no client-side serialization. Open the
+    // read-modify-write window explicitly: a delay inside upsert *after* the
+    // handler's store.get() means that without the per-store write queue,
+    // later handlers read stale state and erase earlier record entries
+    // (last writer wins). With the queue, every entry must land.
+    const store = await makeStore([makeIssue({ id: "DS-001", number: 1, status: "Working" })]);
+    const origUpsert = store.upsert.bind(store);
+    store.upsert = async (issue: Issue, opts?: { preserveTimestamps?: boolean }) => {
+      await new Promise((r) => setTimeout(r, 2));
+      return origUpsert(issue, opts);
+    };
+    ({ server, port } = await bootServer(store));
+
+    const N = 8;
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        mcpJsonRpc(port, "tools/call", {
+          name: "update_ticket_progress",
+          arguments: { id: "DS-001", recordEntry: `parallel entry ${i}` },
+        }),
+      ),
+    );
+    for (const r of results) {
+      expect(r.error).toBeUndefined();
+      expect((r.result as { isError?: boolean }).isError ?? false).toBe(false);
+    }
+
+    const ticket = store.get("DS-001")!;
+    expect(ticket.record).toHaveLength(N);
+    const texts = ticket.record.map((e) => e.text);
+    for (let i = 0; i < N; i++) {
+      expect(texts).toContain(`parallel entry ${i}`);
+    }
+  });
 
   test("resource dostuff://tickets returns Thinking + active-lane tickets (Complete/Closed hidden)", async () => {
     const store = await makeStore([
@@ -1942,6 +3065,66 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     for (const t of payload.tickets) {
       expect(["Thinking", "Planned", "Working", "Verification"]).toContain(t.status);
     }
+  });
+
+  test("resource dostuff://tickets serves summary rows, not full ticket bodies", async () => {
+    const store = await makeStore([
+      makeIssue({
+        id: "DS-001",
+        number: 1,
+        title: "Heavy",
+        status: "Working",
+        description: "## Context\n\nSync clobbers edits across two windows.\n\nMore detail here.",
+        verifyCriteria: "must not clobber",
+        record: recordEntries(30),
+        tasks: [
+          { id: "t1", text: "a", done: true },
+          { id: "t2", text: "b", done: false },
+        ],
+      }),
+    ]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets" });
+    const contents = (json.result as { contents: Array<{ text: string }> }).contents;
+    const body = JSON.parse(contents[0].text) as {
+      count: number;
+      detailUriTemplate: string;
+      tickets: Array<Record<string, unknown>>;
+    };
+
+    expect(body.count).toBe(1);
+    // Emitted once for the whole collection instead of a uri on every row.
+    expect(body.detailUriTemplate).toBe("dostuff://tickets/{id}");
+
+    const row = body.tickets[0];
+    for (const heavy of ["description", "record", "verifyCriteria", "attachments", "links"]) {
+      expect(heavy in row).toBe(false);
+    }
+    expect(row.tasks).toBe("1/2");
+    // The excerpt skips the leading heading and stops at the paragraph break.
+    expect(row.excerpt).toBe("Sync clobbers edits across two windows.");
+  });
+
+  test("resource dostuff://tickets windows nothing but is materially smaller than full bodies", async () => {
+    const seed = Array.from({ length: 5 }, (_, i) =>
+      makeIssue({
+        id: `DS-00${i + 1}`,
+        number: i + 1,
+        title: `Ticket number ${i + 1} with a reasonably typical title`,
+        status: "Working",
+        description: "Prose paragraph explaining the ticket.\n\n" + "filler. ".repeat(200),
+        record: recordEntries(20),
+      }),
+    );
+    const store = await makeStore(seed);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "resources/read", { uri: "dostuff://tickets" });
+    const contents = (json.result as { contents: Array<{ text: string }> }).contents;
+    // Each ticket alone carries ~1.6 KB of description plus 20 record entries;
+    // the whole summary index must stay far under a single full body.
+    expect(contents[0].text.length).toBeLessThan(2_000);
   });
 
   test("resource dostuff://tickets/{id} for a servable ticket returns publicView payload", async () => {
@@ -1973,7 +3156,8 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     // publicView strips statusHistory + resolvedAt.
     expect("statusHistory" in payload.ticket).toBe(false);
     expect("resolvedAt" in payload.ticket).toBe(false);
-    expect(typeof payload.workflow).toBe("string");
+    // Per-response embedding is the one-line pointer, not the full prompt.
+    expect(payload.workflow).toBe(WORKFLOW_POINTER);
   });
 
   test("resource dostuff://tickets/{id} for Thinking ticket: returns the ticket", async () => {
@@ -2039,6 +3223,35 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     });
     const contents = (json.result as { contents: Array<{ text: string }> }).contents;
     expect(contents[0].text).toBe(custom);
+  });
+
+  test("initialize result carries the workflow prompt as server instructions", async () => {
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+
+    const json = await mcpJsonRpc(port, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test-client", version: "0.0.0" },
+    });
+    expect(json.error).toBeUndefined();
+    const result = json.result as { instructions?: string };
+    expect(result.instructions).toBe(DEFAULT_WORKFLOW_PROMPT);
+  });
+
+  test("initialize instructions honor the dostuff.mcp.instructions override", async () => {
+    const custom = "CUSTOM INITIALIZE INSTRUCTIONS";
+    const store = await makeStore([]);
+    ({ server, port } = await bootServer(store, { instructions: custom }));
+
+    const json = await mcpJsonRpc(port, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test-client", version: "0.0.0" },
+    });
+    expect(json.error).toBeUndefined();
+    const result = json.result as { instructions?: string };
+    expect(result.instructions).toBe(custom);
   });
 
   test("get_ticket payload includes attachments with dostuff://attachments/<id>/<att> uris", async () => {
@@ -2264,8 +3477,10 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].role).toBe("user");
     expect(result.messages[0].content.type).toBe("text");
-    // Default workflow prompt mentions DoStuff ticket queue.
-    expect(result.messages[0].content.text).toContain("DoStuff issue queue");
+    // Assert identity with the constant, not a substring: the prompt's wording
+    // is free to change (and did, to fit the 2KB ceiling); what this test locks
+    // in is that the `workflow` prompt serves the full text, not the pointer.
+    expect(result.messages[0].content.text).toBe(DEFAULT_WORKFLOW_PROMPT);
   });
 
   test("dispose() releases the port (asynchronously)", async () => {

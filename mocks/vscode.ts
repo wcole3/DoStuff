@@ -222,6 +222,8 @@ export interface ExtensionContext {
   extensionPath: string;
   secrets: SecretStorage;
   asAbsolutePath(relativePath: string): string;
+  /** Mirrors vscode.ExtensionContext.extension (1.55+); tests may omit it. */
+  extension?: { packageJSON: unknown };
 }
 
 export const commands = {

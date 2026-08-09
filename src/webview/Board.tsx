@@ -22,6 +22,7 @@ import {
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, relTime } from "./IssueDetail";
 import { TagStrip } from "./Tags";
+import { pendingCloseTitle } from "./copy";
 import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
 import {
   clearExternalDragLocal,
@@ -31,6 +32,24 @@ import {
 } from "./messaging";
 
 const ACTIVE_LANES: Status[] = ["Planned", "Working", "Verification"];
+
+/**
+ * Left-to-right order of the board surface: Thinking drawer, the three active
+ * lanes, Complete drawer. Closed never renders on the board, so it has no
+ * position here.
+ */
+export const BOARD_ORDER: Status[] = ["Thinking", "Planned", "Working", "Verification", "Complete"];
+
+/**
+ * The status one step left (`-1`) or right (`+1`) of `status` in board order,
+ * or `null` at either end (and for Closed, which is off-board). Pure — drives
+ * the hover step-arrows on cards; the cap guard stays in `setStatus`.
+ */
+export function stepStatus(status: Status, dir: -1 | 1): Status | null {
+  const idx = BOARD_ORDER.indexOf(status);
+  if (idx === -1) return null;
+  return BOARD_ORDER[idx + dir] ?? null;
+}
 // Fits the top meta row, the two-line title clamp, the always-present tag
 // slot (16px min-height per `.bd-drawer-card-tags`), card padding (7px top
 // + 7px bottom), three 5px flex gaps, and the 6px inter-card margin. Pad a
@@ -182,6 +201,57 @@ interface BoardCardProps {
   onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
   justDraggedRef: React.MutableRefObject<boolean>;
   dragging: boolean;
+  onMove: (id: string, status: Status) => void;
+}
+
+/**
+ * Edge-hover step arrow, rendered as two sibling elements:
+ *
+ *   - the "zone": an invisible strip over the card's outer tenth. No handlers;
+ *     its pointer events bubble to the card, so drag-from-edge and
+ *     click-to-open behave exactly as before. It exists purely to scope
+ *     `:hover` to that edge.
+ *   - the "rail": the arrow button itself, a real flex item in the card row
+ *     with width 0. Hovering the zone grows it (`.bd-card-zone-X:hover ~
+ *     .bd-card-step-X` in styles.css), squeezing the card content aside
+ *     rather than overlaying it; the rail's own :hover keeps it open once the
+ *     pointer lands on it. Tinted with the *target* lane's accent color.
+ *
+ * DOM order matters: each zone must precede its rail for the `~` combinator.
+ * Moves go through the cap-guarded `setStatus` path (a full lane toasts, same
+ * as drag). `onPointerDown` is swallowed so pressing the rail never begins a
+ * card drag.
+ */
+function StepArrow({
+  target,
+  side,
+  onMove,
+  issueId,
+}: {
+  target: Status;
+  side: "left" | "right";
+  onMove: (id: string, status: Status) => void;
+  issueId: string;
+}) {
+  return (
+    <>
+      <div className={`bd-card-zone bd-card-zone-${side}`} />
+      <button
+        type="button"
+        className={`bd-card-step bd-card-step-${side}`}
+        title={`Move to ${target}`}
+        aria-label={`Move to ${target}`}
+        style={{ ["--step-accent" as string]: STATUS_META[target].color } as CSSProperties}
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={(e) => {
+          e.stopPropagation();
+          onMove(issueId, target);
+        }}
+      >
+        <Icon name={side === "left" ? "chevronLeft" : "chevronRight"} size={11} />
+      </button>
+    </>
+  );
 }
 
 const BoardCard = memo(function BoardCard({
@@ -190,9 +260,12 @@ const BoardCard = memo(function BoardCard({
   onPointerDown,
   justDraggedRef,
   dragging,
+  onMove,
 }: BoardCardProps) {
   const meta = STATUS_META[issue.status];
   const pri = PRIORITY_META[issue.priority];
+  const stepLeft = stepStatus(issue.status, -1);
+  const stepRight = stepStatus(issue.status, 1);
   return (
     <div
       className={`bd-card ${dragging ? "is-dragging" : ""}`}
@@ -203,33 +276,45 @@ const BoardCard = memo(function BoardCard({
       }}
       style={{ ["--card-accent" as string]: meta.color } as CSSProperties}
     >
-      <div className="bd-card-top">
-        <span className="bd-card-id" title={issue.id}>
-          #{issue.number}
-        </span>
-        <span className="bd-card-type" title={issue.type}>
-          <Icon name={TYPE_ICON[issue.type]} size={11} />
-        </span>
-        <span className="bd-card-spacer" />
-        <span
-          className="bd-card-pri"
-          style={{ color: pri.color }}
-          title={`${issue.priority} priority`}
-        >
-          <Icon name={pri.icon} size={12} />
-        </span>
-      </div>
-      <div className="bd-card-title">{issue.title}</div>
-      {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={3} />}
-      <div className="bd-card-foot">
-        {issue.tasks.length > 0 && (
-          <span className="bd-card-tasks" title="Tasks done / total">
-            <Icon name="check" size={10} />
-            {issue.tasks.filter((t) => t.done).length}/{issue.tasks.length}
+      {stepLeft && <StepArrow target={stepLeft} side="left" onMove={onMove} issueId={issue.id} />}
+      <div className="bd-card-inner">
+        <div className="bd-card-top">
+          <span className="bd-card-id" title={issue.id}>
+            #{issue.number}
           </span>
-        )}
-        <span className="bd-card-date">{relTime(issue.createdAt)}</span>
+          <span className="bd-card-type" title={issue.type}>
+            <Icon name={TYPE_ICON[issue.type]} size={11} />
+          </span>
+          <span className="bd-card-spacer" />
+          {issue.pendingClose && (
+            <span
+              className="bd-card-pending-close"
+              title={pendingCloseTitle(issue.pendingClose)}
+            >
+              <Icon name="clock" size={11} />
+            </span>
+          )}
+          <span
+            className="bd-card-pri"
+            style={{ color: pri.color }}
+            title={`${issue.priority} priority`}
+          >
+            <Icon name={pri.icon} size={12} />
+          </span>
+        </div>
+        <div className="bd-card-title">{issue.title}</div>
+        {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={3} />}
+        <div className="bd-card-foot">
+          {issue.tasks.length > 0 && (
+            <span className="bd-card-tasks" title="Tasks done / total">
+              <Icon name="check" size={10} />
+              {issue.tasks.filter((t) => t.done).length}/{issue.tasks.length}
+            </span>
+          )}
+          <span className="bd-card-date">{relTime(issue.createdAt)}</span>
+        </div>
       </div>
+      {stepRight && <StepArrow target={stepRight} side="right" onMove={onMove} issueId={issue.id} />}
     </div>
   );
 });
@@ -292,6 +377,7 @@ function Lane({
               onOpen={onOpen}
               onPointerDown={onPointerDown}
               justDraggedRef={justDraggedRef}
+              onMove={onDropIssue}
             />
           ))
         )}
@@ -321,6 +407,7 @@ interface DrawerCardRowData {
   status: Status;
   onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
   justDraggedRef: React.MutableRefObject<boolean>;
+  onMove: (id: string, status: Status) => void;
 }
 
 const DrawerCardRow = memo(function DrawerCardRow({
@@ -331,6 +418,8 @@ const DrawerCardRow = memo(function DrawerCardRow({
   const issue = data.issues[index];
   const pri = PRIORITY_META[issue.priority];
   const canPromote = data.status === "Thinking" && data.onPickToBoard !== undefined;
+  const stepLeft = stepStatus(data.status, -1);
+  const stepRight = stepStatus(data.status, 1);
   return (
     <div style={style}>
       <div
@@ -349,22 +438,30 @@ const DrawerCardRow = memo(function DrawerCardRow({
         }}
         title={canPromote ? "Click to view details, Shift+Click to promote to Planned" : "Open"}
       >
-        <div className="bd-drawer-card-top">
-          <Icon name={TYPE_ICON[issue.type]} size={11} style={{ opacity: 0.7 }} />
-          <span className="bd-card-id" title={issue.id}>
-            #{issue.number}
-          </span>
-          <span className="bd-card-spacer" />
-          <Icon name={pri.icon} size={11} style={{ color: pri.color }} />
+        {stepLeft && (
+          <StepArrow target={stepLeft} side="left" onMove={data.onMove} issueId={issue.id} />
+        )}
+        <div className="bd-card-inner">
+          <div className="bd-drawer-card-top">
+            <Icon name={TYPE_ICON[issue.type]} size={11} style={{ opacity: 0.7 }} />
+            <span className="bd-card-id" title={issue.id}>
+              #{issue.number}
+            </span>
+            <span className="bd-card-spacer" />
+            <Icon name={pri.icon} size={11} style={{ color: pri.color }} />
+          </div>
+          <div className="bd-drawer-card-title">{issue.title}</div>
+          {/* Always render the tag slot — even when empty — so every card
+              occupies the same vertical space inside its FixedSizeList row.
+              Without this, tagged + untagged cards drift vertically and gaps
+              appear between siblings (DS-009). */}
+          <div className="bd-drawer-card-tags">
+            {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={1} />}
+          </div>
         </div>
-        <div className="bd-drawer-card-title">{issue.title}</div>
-        {/* Always render the tag slot — even when empty — so every card
-            occupies the same vertical space inside its FixedSizeList row.
-            Without this, tagged + untagged cards drift vertically and gaps
-            appear between siblings (DS-009). */}
-        <div className="bd-drawer-card-tags">
-          {issue.tags.length > 0 && <TagStrip tags={issue.tags} maxChips={1} />}
-        </div>
+        {stepRight && (
+          <StepArrow target={stepRight} side="right" onMove={data.onMove} issueId={issue.id} />
+        )}
       </div>
     </div>
   );
@@ -448,8 +545,8 @@ function Drawer({
   }, [issues, query, typeFilter, priorityFilter, sortKey]);
 
   const rowData = useMemo<DrawerCardRowData>(
-    () => ({ issues: displayedIssues, onOpen, onPickToBoard, status, onPointerDown, justDraggedRef }),
-    [displayedIssues, onOpen, onPickToBoard, status, onPointerDown, justDraggedRef],
+    () => ({ issues: displayedIssues, onOpen, onPickToBoard, status, onPointerDown, justDraggedRef, onMove: onDropIssue }),
+    [displayedIssues, onOpen, onPickToBoard, status, onPointerDown, justDraggedRef, onDropIssue],
   );
 
   const headClick = () => {
@@ -569,9 +666,10 @@ function Drawer({
 interface FocusOverlayProps {
   issue: Issue | null;
   onClose: () => void;
+  onResolveClose: (issue: Issue, verdict: "approve" | "deny") => void;
 }
 
-function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
+function FocusOverlay({ issue, onClose, onResolveClose }: FocusOverlayProps) {
   useEffect(() => {
     if (!issue) return;
     const onKey = (e: KeyboardEvent) => {
@@ -587,7 +685,7 @@ function FocusOverlay({ issue, onClose }: FocusOverlayProps) {
         <button className="bd-focus-close" onClick={onClose} aria-label="Close issue detail">
           <Icon name="close" size={12} />
         </button>
-        <IssueDetail issue={issue} />
+        <IssueDetail issue={issue} onResolveClose={onResolveClose} />
       </div>
     </div>
   );
@@ -700,6 +798,25 @@ export function Board() {
 
   const focused = focusId ? issues.find((i) => i.id === focusId) ?? null : null;
 
+  // Approving an agent's close/complete request removes the ticket from its
+  // lane, so advance the focus overlay to the next ticket in that lane (board
+  // sort order; falls back to the previous one when the resolved ticket was
+  // last). An empty lane dismisses the overlay. Deny keeps focus put.
+  const onResolveClose = useCallback(
+    (issue: Issue, verdict: "approve" | "deny") => {
+      if (verdict !== "approve") return;
+      const lane = byStatus[issue.status];
+      const idx = lane.findIndex((i) => i.id === issue.id);
+      const rest = lane.filter((i) => i.id !== issue.id);
+      if (rest.length === 0) {
+        setFocusId(null);
+        return;
+      }
+      setFocusId(rest[Math.min(Math.max(idx, 0), rest.length - 1)].id);
+    },
+    [byStatus],
+  );
+
   if (!initialized) {
     return <div style={{ padding: 40, color: "var(--vsc-fg-muted)" }}>Loading…</div>;
   }
@@ -755,7 +872,7 @@ export function Board() {
         justDraggedRef={justDraggedRef}
       />
 
-      <FocusOverlay issue={focused} onClose={() => setFocusId(null)} />
+      <FocusOverlay issue={focused} onClose={() => setFocusId(null)} onResolveClose={onResolveClose} />
 
       <DragGhost ghost={ghost} />
 

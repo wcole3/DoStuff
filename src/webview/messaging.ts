@@ -129,6 +129,16 @@ export function startMessageBridge(): void {
           new CustomEvent("dostuff:revealTicket", { detail: { id: msg.id } }),
         );
         break;
+      case "commitDetails":
+        // Consumed by the CommitsSection of whichever IssueDetail requested
+        // it; window event (not the store) because the payload is per-detail
+        // ephemeral display data, not shared truth.
+        window.dispatchEvent(
+          new CustomEvent("dostuff:commitDetails", {
+            detail: { issueId: msg.issueId, pathPrefix: msg.pathPrefix, details: msg.details },
+          }),
+        );
+        break;
       default: {
         const _exhaustive: never = msg;
         void _exhaustive;
@@ -180,6 +190,10 @@ export function postRevealTicket(id: string): void {
 
 export function postOpenGraph(): void {
   vscodeApi.postMessage({ type: "openGraph" });
+}
+
+export function postResolveClose(id: string, verdict: "approve" | "deny"): void {
+  vscodeApi.postMessage({ type: "resolveClose", id, verdict });
 }
 
 export function postStageAttachmentByUri(uri: string): void {
@@ -242,6 +256,10 @@ export function postOpenLink(url: string): void {
   vscodeApi.postMessage({ type: "openLink", url });
 }
 
+export function postFetchCommitDetails(issueId: string): void {
+  vscodeApi.postMessage({ type: "fetchCommitDetails", issueId });
+}
+
 /**
  * Clear the local "external drag in progress" state without a host
  * round-trip. Used by the board after committing a move so the lane pick
@@ -254,6 +272,6 @@ export function clearExternalDragLocal(): void {
   }
 }
 
-export function newTaskId(): string {
-  return "t" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
+// Re-exported so existing webview imports keep working; the implementation now
+// lives in `src/ids.ts` so the MCP tools mint the same format.
+export { newTaskId } from "../ids";

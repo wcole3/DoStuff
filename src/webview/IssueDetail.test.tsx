@@ -12,11 +12,12 @@
 // (covered by extension.test.ts).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render, fireEvent, screen, within } from "@testing-library/react";
+import { act, cleanup, render, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { IssueDetail } from "./IssueDetail";
 import { ACTIVE_LANE_CAP, type Issue } from "../types";
 import {
+  dispatchHost,
   installVsCodeApi,
   makeIssue,
   pushInit,
@@ -544,5 +545,158 @@ describe("IssueDetail links", () => {
     const lastUpdate = updates[updates.length - 1]!;
     expect(lastUpdate.issue.id).toBe("DS-001"); // the source owns the link
     expect(lastUpdate.issue.links).toEqual([]);
+  });
+});
+
+describe("IssueDetail pending close request actions", () => {
+  const pending = { by: "agent" as const, at: "2025-01-02T00:00:00.000Z", target: "Complete" as const };
+
+  test("approve posts resolveClose and notifies onResolveClose", () => {
+    const issue = makeIssue({ id: "DS-050", number: 50, status: "Verification", pendingClose: pending });
+    pushInit([issue]);
+    const calls: Array<{ id: string; verdict: string }> = [];
+    render(
+      <IssueDetail
+        issue={issue}
+        onResolveClose={(i, verdict) => calls.push({ id: i.id, verdict })}
+      />,
+    );
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    expect(api.posted).toContainEqual({ type: "resolveClose", id: "DS-050", verdict: "approve" });
+    expect(calls).toEqual([{ id: "DS-050", verdict: "approve" }]);
+  });
+
+  test("deny notifies onResolveClose with the deny verdict", () => {
+    const issue = makeIssue({ id: "DS-051", number: 51, status: "Verification", pendingClose: pending });
+    pushInit([issue]);
+    const calls: Array<{ id: string; verdict: string }> = [];
+    render(
+      <IssueDetail
+        issue={issue}
+        onResolveClose={(i, verdict) => calls.push({ id: i.id, verdict })}
+      />,
+    );
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-deny") as HTMLElement);
+
+    expect(api.posted).toContainEqual({ type: "resolveClose", id: "DS-051", verdict: "deny" });
+    expect(calls).toEqual([{ id: "DS-051", verdict: "deny" }]);
+  });
+
+  test("approve without the optional callback still posts resolveClose (sidebar path)", () => {
+    const issue = makeIssue({ id: "DS-052", number: 52, status: "Verification", pendingClose: pending });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    fireEvent.click(document.querySelector(".ds-d-close-req-approve") as HTMLElement);
+
+    expect(api.posted).toContainEqual({ type: "resolveClose", id: "DS-052", verdict: "approve" });
+  });
+});
+
+describe("CommitsSection", () => {
+  const AT = "2026-07-01T00:00:00.000Z";
+
+  test("hidden when the ticket has no commits — and no fetch is posted", () => {
+    const issue = makeIssue({ id: "DS-060", number: 60, commits: [] });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+    expect(document.querySelector(".ds-commits")).toBeNull();
+    expect(api.posted.find((m) => m.type === "fetchCommitDetails")).toBeUndefined();
+  });
+
+  test("renders rows, posts fetchCommitDetails, applies the reply, opens files via openLink", () => {
+    const issue = makeIssue({
+      id: "DS-061",
+      number: 61,
+      commits: [{ sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: AT }],
+    });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    // Section renders, request goes out, subject still loading.
+    expect(api.posted).toContainEqual({ type: "fetchCommitDetails", issueId: "DS-061" });
+    const head = document.querySelector(".ds-commit-head") as HTMLElement;
+    expect(head.textContent).toContain("a1b2c3d");
+    expect(head.querySelector(".ds-commit-subject")?.textContent).toBe("…");
+
+    // Host reply flows through the message bridge → CustomEvent → component.
+    act(() => {
+      dispatchHost({
+        type: "commitDetails",
+        issueId: "DS-061",
+        pathPrefix: ".",
+        details: [
+          {
+            sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0",
+            found: true,
+            subject: "wire the widget",
+            files: ["src/a.ts", "src/b.ts"],
+          },
+        ],
+      });
+    });
+    expect(document.querySelector(".ds-commit-subject")?.textContent).toBe("wire the widget");
+
+    // Expand → file list → click posts openLink with the "./" prefix.
+    fireEvent.click(document.querySelector(".ds-commit-head") as HTMLElement);
+    const files = Array.from(document.querySelectorAll(".ds-commit-file"));
+    expect(files.map((f) => f.textContent)).toEqual(["src/a.ts", "src/b.ts"]);
+    fireEvent.click(files[0] as HTMLElement);
+    expect(api.posted).toContainEqual({ type: "openLink", url: "./src/a.ts" });
+  });
+
+  test("a reply for a different ticket is ignored", () => {
+    const issue = makeIssue({ id: "DS-062", number: 62, commits: [{ sha: "abcdef0", at: AT }] });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    act(() => {
+      dispatchHost({
+        type: "commitDetails",
+        issueId: "DS-999",
+        pathPrefix: ".",
+        details: [{ sha: "abcdef0", found: true, subject: "someone else's", files: [] }],
+      });
+    });
+    expect(document.querySelector(".ds-commit-subject")?.textContent).toBe("…");
+  });
+
+  test("not-found sha renders the dimmed fallback and never expands to files", () => {
+    const issue = makeIssue({ id: "DS-063", number: 63, commits: [{ sha: "abcdef0", at: AT }] });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    act(() => {
+      dispatchHost({
+        type: "commitDetails",
+        issueId: "DS-063",
+        pathPrefix: ".",
+        details: [{ sha: "abcdef0", found: false, subject: "", files: [] }],
+      });
+    });
+    expect(document.querySelector(".ds-commit-subject")?.textContent).toBe("not found in this repo");
+    fireEvent.click(document.querySelector(".ds-commit-head") as HTMLElement);
+    expect(document.querySelector(".ds-commit-files")).toBeNull();
+  });
+
+  test("a repo-above-workspace pathPrefix prefixes opened file paths", () => {
+    const issue = makeIssue({ id: "DS-064", number: 64, commits: [{ sha: "abcdef0", at: AT }] });
+    pushInit([issue]);
+    render(<IssueDetail issue={issue} />);
+
+    act(() => {
+      dispatchHost({
+        type: "commitDetails",
+        issueId: "DS-064",
+        pathPrefix: "../..",
+        details: [{ sha: "abcdef0", found: true, subject: "top-level change", files: ["top.txt"] }],
+      });
+    });
+    fireEvent.click(document.querySelector(".ds-commit-head") as HTMLElement);
+    fireEvent.click(document.querySelector(".ds-commit-file") as HTMLElement);
+    expect(api.posted).toContainEqual({ type: "openLink", url: "../../top.txt" });
   });
 });

@@ -101,3 +101,18 @@ describe("unknown host message", () => {
     }
   });
 });
+
+describe("commitDetails bridge", () => {
+  test("re-dispatches the host message as a dostuff:commitDetails CustomEvent", () => {
+    const seen: unknown[] = [];
+    const handler = (e: Event) => seen.push((e as CustomEvent).detail);
+    window.addEventListener("dostuff:commitDetails", handler);
+    try {
+      const details = [{ sha: "abcdef0", found: true, subject: "s", files: ["a.ts"] }];
+      dispatchHost({ type: "commitDetails", issueId: "DS-001", pathPrefix: ".", details });
+      expect(seen).toEqual([{ issueId: "DS-001", pathPrefix: ".", details }]);
+    } finally {
+      window.removeEventListener("dostuff:commitDetails", handler);
+    }
+  });
+});

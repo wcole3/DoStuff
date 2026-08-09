@@ -16,6 +16,7 @@ import {
   type CreateIssuePartial,
 } from "./sidebarProvider";
 import type { Issue, IssueType, Priority, Status } from "./types";
+import { makeIssueFactory } from "./testSupport";
 
 function makeMemento(initial: Record<string, unknown> = {}): vscode.Memento {
   const map = new Map<string, unknown>(Object.entries(initial));
@@ -45,31 +46,7 @@ function makeContext(): vscode.ExtensionContext {
   } as unknown as vscode.ExtensionContext;
 }
 
-let issueCounter = 0;
-function makeIssue(overrides: Partial<Issue> = {}): Issue {
-  issueCounter += 1;
-  const number = overrides.number ?? issueCounter;
-  const id = overrides.id ?? `DS-${String(number).padStart(3, "0")}`;
-  const at = overrides.createdAt ?? new Date(2025, 0, 1, 0, 0, number).toISOString();
-  return {
-    id,
-    number,
-    title: overrides.title ?? `Issue ${number}`,
-    type: overrides.type ?? ("Feature" as IssueType),
-    priority: overrides.priority ?? ("Regular" as Priority),
-    status: overrides.status ?? ("Planned" as Status),
-    description: overrides.description ?? "",
-    tasks: overrides.tasks ?? [],
-    tags: overrides.tags ?? [],
-    verifyCriteria: overrides.verifyCriteria ?? "",
-    createdAt: at,
-    resolvedAt: overrides.resolvedAt ?? null,
-    statusHistory: overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
-    record: overrides.record ?? [],
-    attachments: overrides.attachments ?? [],
-    links: overrides.links ?? [],
-  };
-}
+const makeIssue = makeIssueFactory();
 
 async function makeStore(seed: Issue[] = []): Promise<IssueStore> {
   const store = new IssueStore(makeContext());
@@ -92,7 +69,7 @@ function partial(over: Partial<CreateIssuePartial> = {}): CreateIssuePartial {
 }
 
 beforeEach(() => {
-  issueCounter = 0;
+  makeIssue.reset();
 });
 
 describe("buildCreatedIssue", () => {

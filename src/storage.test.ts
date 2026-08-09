@@ -12,8 +12,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import initSqlJs from "sql.js";
 import { GITIGNORE_CONTENT, IssueStore, normalize } from "./storage";
+import { deriveGuid, TOMBSTONE_TTL_MS } from "./syncMerge";
 import type { Issue, IssueType, Priority, Status } from "./types";
+import { makeIssueFactory } from "./testSupport";
 
 // Real sql.js WASM bytes for the SQLite-backed branch. Loaded once.
 const WASM_BINARY = fs.readFileSync(
@@ -60,35 +63,10 @@ function makeSqlStore(ctx: vscode.ExtensionContext): IssueStore {
   return new IssueStore(ctx, { wasmBinary: WASM_BINARY });
 }
 
-let issueCounter = 0;
-function makeIssue(overrides: Partial<Issue> = {}): Issue {
-  issueCounter += 1;
-  const number = overrides.number ?? issueCounter;
-  const id = overrides.id ?? `DS-${String(number).padStart(3, "0")}`;
-  const at = overrides.createdAt ?? new Date(2025, 0, 1, 0, 0, number).toISOString();
-  return {
-    id,
-    number,
-    title: overrides.title ?? `Issue ${number}`,
-    type: overrides.type ?? ("Feature" as IssueType),
-    priority: overrides.priority ?? ("Regular" as Priority),
-    status: overrides.status ?? ("Planned" as Status),
-    description: overrides.description ?? "",
-    tasks: overrides.tasks ?? [],
-    tags: overrides.tags ?? [],
-    verifyCriteria: overrides.verifyCriteria ?? "",
-    createdAt: at,
-    resolvedAt: overrides.resolvedAt ?? null,
-    statusHistory:
-      overrides.statusHistory ?? [{ status: overrides.status ?? "Planned", at, by: "user" }],
-    record: overrides.record ?? [],
-    attachments: overrides.attachments ?? [],
-    links: overrides.links ?? [],
-  };
-}
+const makeIssue = makeIssueFactory();
 
 beforeEach(() => {
-  issueCounter = 0;
+  makeIssue.reset();
 });
 
 // ----- normalize -------------------------------------------------------------
@@ -115,6 +93,85 @@ describe("normalize", () => {
     expect(issue.tasks).toEqual([]);
     expect(issue.tags).toEqual([]);
     expect(issue.resolvedAt).toBeNull();
+    expect(issue.pendingClose).toBeNull();
+  });
+
+  test("preserves over-cap legacy prose verbatim (MCP input caps never truncate on load)", () => {
+    // The MCP write path caps `description` at 10,000 chars and record notes at
+    // 500. Those are *input* validations on agent writes only — tickets written
+    // by an older build (or by a human in the UI, which has no cap) must load
+    // and round-trip byte-for-byte.
+    const longDescription = "d".repeat(30_000);
+    const longNote = "n".repeat(5_000);
+    const legacy = {
+      id: "DS-007",
+      number: 7,
+      title: "legacy verbose ticket",
+      type: "Bug",
+      priority: "High",
+      status: "Working",
+      description: longDescription,
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      record: [{ at: "2025-01-02T00:00:00.000Z", author: "agent", text: longNote }],
+    } as unknown as Issue;
+
+    const { issue, coerced } = normalize(legacy);
+
+    expect(coerced).toEqual([]);
+    expect(issue.description).toBe(longDescription);
+    expect(issue.record[0].text).toBe(longNote);
+  });
+
+  test("preserves legacy t-<uuid> task ids verbatim (MCP now mints a shorter form)", () => {
+    // Task ids are persisted (issue_tasks.task_id) and are the per-element LWW
+    // merge key in syncMerge. Changing the format NEW ids are minted in must
+    // never rewrite ids already on disk — normalize is the load-side boundary.
+    const legacy = {
+      id: "DS-051",
+      number: 51,
+      title: "legacy tasks",
+      type: "Bug",
+      priority: "High",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      tasks: [
+        { id: "t-3f2504e0-4f89-11d3-9a0c-0305e82c3301", text: "uuid era", done: true },
+        { id: "tm8x2k1abc123", text: "short era", done: false },
+      ],
+    } as unknown as Issue;
+
+    const { issue, coerced } = normalize(legacy);
+
+    expect(coerced).toEqual([]);
+    expect(issue.tasks.map((t) => t.id)).toEqual([
+      "t-3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+      "tm8x2k1abc123",
+    ]);
+    expect(issue.tasks[0].done).toBe(true);
+    expect(issue.tasks[1].done).toBe(false);
+  });
+
+  test("defaults a missing pendingClose to null and coerces a malformed one to null", () => {
+    const missing = {
+      id: "DS-050",
+      title: "legacy",
+      type: "Bug",
+      priority: "High",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-01-01T00:00:00.000Z",
+    } as unknown as Issue;
+    expect(normalize(missing).issue.pendingClose).toBeNull();
+
+    const malformed = {
+      ...missing,
+      pendingClose: { by: "user", at: "not-iso" },
+    } as unknown as Issue;
+    expect(normalize(malformed).issue.pendingClose).toBeNull();
   });
 
   test("tags are normalized: trimmed, deduplicated, non-string entries dropped", () => {
@@ -457,8 +514,87 @@ describe("IssueStore (SQLite-backed branch)", () => {
     const loaded = b.get("DS-077");
     expect(loaded?.title).toBe("persist me");
     expect(loaded?.tags).toEqual(["alpha", "beta"]);
-    expect(loaded?.tasks).toEqual([{ id: "t1", text: "first", done: false }]);
+    // upsert diff-stamps the (new) task, and the stamp round-trips.
+    expect(loaded?.tasks).toEqual([
+      { id: "t1", text: "first", done: false, updatedAt: expect.any(String) },
+    ]);
     b.dispose();
+  });
+
+  test("pendingClose round-trips across store instances and clears on delete-then-insert", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(
+      makeIssue({
+        id: "DS-088",
+        number: 88,
+        status: "Working",
+        pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "wrap up" },
+      }),
+    );
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-088")?.pendingClose).toEqual({
+      by: "agent",
+      at: "2026-05-18T00:00:00.000Z",
+      note: "wrap up",
+    });
+    // Clear it — the child row should be deleted (delete-then-insert), not orphaned.
+    await b.upsert({ ...b.get("DS-088")!, pendingClose: null });
+    b.dispose();
+
+    const c = makeSqlStore(ctx);
+    await c.init();
+    expect(c.get("DS-088")?.pendingClose).toBeNull();
+    c.dispose();
+  });
+
+  test("pendingClose.target round-trips; a pre-target row loads with target absent (Closed meaning)", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(
+      makeIssue({
+        id: "DS-090",
+        number: 90,
+        status: "Verification",
+        pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+      }),
+    );
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-090")?.pendingClose).toEqual({
+      by: "agent",
+      at: "2026-05-18T00:00:00.000Z",
+      target: "Complete",
+    });
+    // Simulate a pre-target build's row: NULL the column directly, re-open.
+    // Loader must degrade to the legacy meaning — target absent, not lost row.
+    // (Direct SQL through a fresh store's db is not exposed; emulate by
+    // writing a target-less pendingClose, which persists NULL.)
+    await b.upsert({
+      ...b.get("DS-090")!,
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
+    });
+    b.dispose();
+
+    const c = makeSqlStore(ctx);
+    await c.init();
+    const pc = c.get("DS-090")?.pendingClose;
+    expect(pc).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z" });
+    expect(pc && "target" in pc).toBe(false);
+    c.dispose();
   });
 
   test("migrates pre-existing JSON tickets into the DB and moves them to legacy-json-backup/", async () => {
@@ -945,6 +1081,32 @@ describe("IssueStore attachments", () => {
     store.dispose();
   });
 
+  test("path traversal ids are refused by every attachment helper (logged no-op)", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs();
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+    await store.writeAttachment("DS-001", "legit", ".png", new Uint8Array([1]));
+    const sizeBefore = vfs.size;
+
+    // write: hostile issue id, attachment id, and extension each refuse.
+    expect(await store.writeAttachment("../../escape", "a", ".png", new Uint8Array([9]))).toBe(false);
+    expect(await store.writeAttachment("DS-001", "../up", ".png", new Uint8Array([9]))).toBe(false);
+    expect(await store.writeAttachment("DS-001", "a", "/../evil", new Uint8Array([9]))).toBe(false);
+    expect(vfs.size).toBe(sizeBefore); // nothing new anywhere in the FS
+
+    // lookup/read: hostile ids resolve to null / missing rather than probing.
+    expect(await store.findAttachmentUri("..", "legit")).toBeNull();
+    expect(await store.findAttachmentUri("DS-001", "../legit")).toBeNull();
+    await expect(store.readAttachment("../..", "x")).rejects.toThrow();
+
+    // delete: hostile ids are no-ops; the legit file survives untouched.
+    await store.deleteAttachmentFile("..", "legit");
+    await store.remove("../../etc"); // routes into deleteIssueAttachments
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/legit.png")).toBeDefined();
+    store.dispose();
+  });
+
   test("deleteAttachmentFile removes a single file without touching siblings", async () => {
     const { fs: vfs, handles: h } = installVirtualFs();
     handles = h;
@@ -1157,5 +1319,467 @@ describe("IssueStore links (SQLite-backed)", () => {
     await store.init();
     expect(store.get("DS-001")?.links).toEqual([]);
     store.dispose();
+  });
+});
+
+// ----- Sync schema groundwork (guid / updatedAt / sync_tombstones) -----------
+//
+// Tenet proofs for docs/plans/ticket-sync/01-schema-groundwork.md: legacy data
+// written by any prior build must load with correct defaults, and the new
+// stamping/tombstone behavior must be confined to the store chokepoint.
+
+// The `issues`/`issue_tasks` DDL exactly as it stood before the sync columns
+// (commit d0efe31) — used to fabricate a pre-sync dostuff.db on disk.
+const PRE_SYNC_DDL = `
+CREATE TABLE issues (
+  id              TEXT PRIMARY KEY,
+  number          INTEGER NOT NULL,
+  title           TEXT NOT NULL,
+  description     TEXT NOT NULL DEFAULT '',
+  verify_criteria TEXT NOT NULL DEFAULT '',
+  type            TEXT NOT NULL,
+  priority        TEXT NOT NULL,
+  status          TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  resolved_at     TEXT
+);
+CREATE TABLE issue_tasks (
+  issue_id  TEXT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+  task_id   TEXT NOT NULL,
+  position  INTEGER NOT NULL,
+  text      TEXT NOT NULL,
+  done      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (issue_id, task_id)
+);
+CREATE TABLE schema_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+async function buildRawDb(build: (db: import("sql.js").Database) => void): Promise<Uint8Array> {
+  const copy = new Uint8Array(WASM_BINARY.byteLength);
+  copy.set(WASM_BINARY);
+  const SQL = await initSqlJs({ wasmBinary: copy.buffer as ArrayBuffer });
+  const db = new SQL.Database();
+  build(db);
+  const bytes = db.export();
+  db.close();
+  return bytes;
+}
+
+describe("sync schema groundwork", () => {
+  let handles: FsHandles | null = null;
+
+  afterEach(() => {
+    if (handles) {
+      restoreFs(handles);
+      handles = null;
+    }
+  });
+
+  test("normalize: legacy object without guid/updatedAt gets deterministic defaults", () => {
+    const legacy = {
+      id: "DS-009",
+      number: 9,
+      title: "old ticket",
+      type: "Feature",
+      priority: "Regular",
+      status: "Planned",
+      description: "",
+      verifyCriteria: "",
+      createdAt: "2025-03-01T00:00:00.000Z",
+      resolvedAt: null,
+      tasks: [{ id: "t1", text: "legacy task", done: false }],
+      tags: [],
+      attachments: [],
+      links: [],
+      statusHistory: [],
+      record: [],
+    } as unknown as Issue;
+
+    const { issue } = normalize(legacy);
+    expect(issue.guid).toBe(deriveGuid("DS-009", "2025-03-01T00:00:00.000Z"));
+    expect(issue.updatedAt).toBe("2025-03-01T00:00:00.000Z");
+    // Legacy task stays untouched — no eager stamp.
+    expect(issue.tasks[0]).toEqual({ id: "t1", text: "legacy task", done: false });
+  });
+
+  test("normalize: garbage task updatedAt is stripped, valid one kept", () => {
+    const input = makeIssue({
+      tasks: [
+        { id: "t1", text: "bad", done: false, updatedAt: "not-a-date" },
+        { id: "t2", text: "good", done: false, updatedAt: "2025-05-01T00:00:00.000Z" },
+      ],
+    });
+    const { issue } = normalize(input);
+    expect(issue.tasks[0]).toEqual({ id: "t1", text: "bad", done: false });
+    expect(issue.tasks[1]?.updatedAt).toBe("2025-05-01T00:00:00.000Z");
+  });
+
+  test("deriveGuid: stable and uuid-shaped", () => {
+    const a = deriveGuid("DS-001", "2025-01-01T00:00:00.000Z");
+    const b = deriveGuid("DS-001", "2025-01-01T00:00:00.000Z");
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(deriveGuid("DS-002", "2025-01-01T00:00:00.000Z")).not.toBe(a);
+  });
+
+  test("hydrates a pre-sync DDL DB: guarded ALTERs apply, defaults derive, zero loss", async () => {
+    const bytes = await buildRawDb((db) => {
+      db.run(PRE_SYNC_DDL);
+      db.run(
+        "INSERT INTO issues (id, number, title, type, priority, status, created_at, resolved_at) VALUES ('DS-001', 1, 'pre-sync', 'Bug', 'High', 'Working', '2025-02-01T00:00:00.000Z', NULL)",
+      );
+      db.run(
+        "INSERT INTO issue_tasks (issue_id, task_id, position, text, done) VALUES ('DS-001', 't1', 0, 'old task', 1)",
+      );
+      // Pre-target shape of issue_pending_close (as it stood at d0efe31) —
+      // the guarded ALTER must add `target` and the row must load with the
+      // legacy Closed meaning.
+      db.run(`CREATE TABLE issue_pending_close (
+        issue_id TEXT PRIMARY KEY REFERENCES issues(id) ON DELETE CASCADE,
+        by       TEXT NOT NULL,
+        note     TEXT,
+        at       TEXT NOT NULL
+      )`);
+      db.run(
+        "INSERT INTO issue_pending_close (issue_id, by, note, at) VALUES ('DS-001', 'agent', NULL, '2025-02-02T00:00:00.000Z')",
+      );
+      db.run("INSERT INTO schema_meta (key, value) VALUES ('version', '1')");
+    });
+    const { handles: h } = installVirtualFs({ "/ws/.vscode/dostuff/dostuff.db": bytes });
+    handles = h;
+
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    const loaded = store.get("DS-001");
+    expect(loaded).toBeDefined();
+    expect(loaded?.title).toBe("pre-sync");
+    expect(loaded?.guid).toBe(deriveGuid("DS-001", "2025-02-01T00:00:00.000Z"));
+    expect(loaded?.updatedAt).toBe("2025-02-01T00:00:00.000Z");
+    expect(loaded?.tasks).toEqual([{ id: "t1", text: "old task", done: true }]);
+    // Pre-target pendingClose row: loads, target absent (= legacy Closed).
+    expect(loaded?.pendingClose).toEqual({ by: "agent", at: "2025-02-02T00:00:00.000Z" });
+    expect(loaded?.pendingClose && "target" in loaded.pendingClose).toBe(false);
+    // sync_tombstones was created by SCHEMA_DDL — readable and empty.
+    expect(store.getSyncTombstones()).toEqual({ tickets: [], elements: [] });
+    store.dispose();
+  });
+
+  test("upsert stamps updatedAt, mints guid, and diff-stamps tasks", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    const before = Date.now();
+    const issue = {
+      ...makeIssue({
+        id: "DS-001",
+        number: 1,
+        tasks: [{ id: "t1", text: "one", done: false }],
+      }),
+      guid: "",
+      updatedAt: "1999-01-01T00:00:00.000Z",
+    };
+    await store.upsert(issue);
+    const v1 = store.get("DS-001")!;
+    expect(v1.guid).not.toBe("");
+    expect(Date.parse(v1.updatedAt)).toBeGreaterThanOrEqual(before);
+    const t1Stamp = v1.tasks[0]?.updatedAt;
+    expect(t1Stamp).toBeDefined();
+
+    // Round-trip the ticket unchanged (webview strips task stamps): the task
+    // keeps its prior stamp, the ticket restamps, the guid is carried.
+    await store.upsert({
+      ...v1,
+      tasks: v1.tasks.map(({ updatedAt: _s, ...rest }) => rest),
+    });
+    const v2 = store.get("DS-001")!;
+    expect(v2.guid).toBe(v1.guid);
+    expect(v2.tasks[0]?.updatedAt).toBe(t1Stamp!);
+
+    // Toggling done restamps the task.
+    await store.upsert({
+      ...v2,
+      tasks: [{ id: "t1", text: "one", done: true }],
+    });
+    const v3 = store.get("DS-001")!;
+    expect(v3.tasks[0]?.updatedAt).not.toBe(t1Stamp);
+    expect(Date.parse(v3.tasks[0]!.updatedAt!)).toBeGreaterThanOrEqual(Date.parse(t1Stamp!));
+
+    // Editing text restamps too; a smuggled incoming stamp is discarded.
+    await store.upsert({
+      ...v3,
+      tasks: [{ id: "t1", text: "one edited", done: true, updatedAt: "1990-01-01T00:00:00.000Z" }],
+    });
+    const v4 = store.get("DS-001")!;
+    expect(v4.tasks[0]?.updatedAt).not.toBe("1990-01-01T00:00:00.000Z");
+    store.dispose();
+  });
+
+  test("upsert with preserveTimestamps writes exactly as given and records nothing", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    const remote = makeIssue({
+      id: "DS-001",
+      number: 1,
+      guid: "remote-guid",
+      updatedAt: "2025-06-01T12:00:00.000Z",
+      tasks: [{ id: "t1", text: "remote task", done: false, updatedAt: "2025-06-01T11:00:00.000Z" }],
+    });
+    await store.upsert(remote, { preserveTimestamps: true });
+    const loaded = store.get("DS-001")!;
+    expect(loaded.guid).toBe("remote-guid");
+    expect(loaded.updatedAt).toBe("2025-06-01T12:00:00.000Z");
+    expect(loaded.tasks[0]?.updatedAt).toBe("2025-06-01T11:00:00.000Z");
+    expect(store.getSyncTombstones()).toEqual({ tickets: [], elements: [] });
+    store.dispose();
+  });
+
+  test("deletion witnesses: upsert task-drop, remove(), replaceAll([]) all record tombstones", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    const withTask = makeIssue({
+      id: "DS-001",
+      number: 1,
+      tasks: [{ id: "t1", text: "doomed", done: false }],
+      attachments: [
+        { id: "att1", name: "a.png", mimeType: "image/png", sizeBytes: 10, addedAt: "2025-01-01T00:00:00.000Z" },
+      ],
+    });
+    await store.upsert(withTask);
+    const g1 = store.get("DS-001")!.guid;
+
+    // Drop the task and the attachment in one edit → two element tombstones.
+    await store.upsert({ ...store.get("DS-001")!, tasks: [], attachments: [] });
+    let tombs = store.getSyncTombstones();
+    expect(tombs.elements).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ ticketGuid: g1, scope: "task", elementId: "t1" }),
+        expect.objectContaining({ ticketGuid: g1, scope: "attachment", elementId: "att1" }),
+      ]),
+    );
+
+    // remove() records a ticket tombstone carrying the DS id.
+    const other = makeIssue({ id: "DS-002", number: 2 });
+    await store.upsert(other);
+    const g2 = store.get("DS-002")!.guid;
+    await store.remove("DS-002");
+    tombs = store.getSyncTombstones();
+    expect(tombs.tickets).toEqual(
+      expect.arrayContaining([expect.objectContaining({ guid: g2, lastId: "DS-002" })]),
+    );
+
+    // replaceAll([]) tombstones every remaining ticket.
+    await store.replaceAll([]);
+    tombs = store.getSyncTombstones();
+    expect(tombs.tickets.map((t) => t.guid)).toEqual(expect.arrayContaining([g1, g2]));
+    store.dispose();
+  });
+
+  test("replaceAll import keeps provided guids/timestamps, derives missing ones", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    const provided = makeIssue({
+      id: "DS-001",
+      number: 1,
+      guid: "kept-guid",
+      updatedAt: "2025-04-01T00:00:00.000Z",
+    });
+    const missing = {
+      ...makeIssue({ id: "DS-002", number: 2, createdAt: "2025-03-15T00:00:00.000Z" }),
+      guid: "",
+      updatedAt: "",
+    };
+    await store.replaceAll([provided, missing]);
+    expect(store.get("DS-001")?.guid).toBe("kept-guid");
+    expect(store.get("DS-001")?.updatedAt).toBe("2025-04-01T00:00:00.000Z");
+    expect(store.get("DS-002")?.guid).toBe(deriveGuid("DS-002", "2025-03-15T00:00:00.000Z"));
+    expect(store.get("DS-002")?.updatedAt).toBe("2025-03-15T00:00:00.000Z");
+    store.dispose();
+  });
+
+  test("applySync: targeted removals + link scrub + one onChange + no tombstones", async () => {
+    const { fs: vfs, handles: h } = installVirtualFs({});
+    handles = h;
+    const store = makeSqlStore(makeContext());
+    await store.init();
+
+    await store.upsert(makeIssue({ id: "DS-001", number: 1 }));
+    await store.upsert(makeIssue({ id: "DS-002", number: 2, links: [{ targetId: "DS-001", kind: "blocks" }] }));
+    await store.upsert(makeIssue({ id: "DS-003", number: 3 }));
+    // Attachment dirs on disk for both the tombstoned and surviving ticket.
+    vfs.set("/ws/.vscode/dostuff/attachments/DS-001/att.png", { content: new Uint8Array([1]) } as never);
+    vfs.set("/ws/.vscode/dostuff/attachments/DS-003/att.png", { content: new Uint8Array([2]) } as never);
+
+    const events: number[] = [];
+    const sub = store.onChange((issues) => events.push(issues.length));
+
+    const merged = makeIssue({
+      id: "DS-004",
+      number: 4,
+      guid: "remote-guid-4",
+      updatedAt: "2025-06-01T00:00:00.000Z",
+    });
+    await store.applySync({
+      upserts: [merged],
+      removals: ["DS-001", "DS-003"],
+      tombstoned: ["DS-001"],
+    });
+    sub.dispose();
+
+    expect(events).toEqual([2]); // exactly one fire, post-apply cache size (3 − 2 removals + 1 upsert)
+    expect(store.get("DS-001")).toBeUndefined();
+    expect(store.get("DS-003")).toBeUndefined();
+    expect(store.get("DS-004")?.guid).toBe("remote-guid-4");
+    expect(store.get("DS-004")?.updatedAt).toBe("2025-06-01T00:00:00.000Z"); // preserveTimestamps semantics
+    expect(store.get("DS-002")?.links).toEqual([]); // scrubbed
+    // Tombstoned dir deleted; renumber-style removal keeps its dir.
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/att.png")).toBeUndefined();
+    expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-003/att.png")).toBeDefined();
+    // applySync never records witnesses.
+    expect(store.getSyncTombstones().tickets).toEqual([]);
+    store.dispose();
+  });
+
+  test("init() prunes tombstones older than the TTL", async () => {
+    const ancient = new Date(Date.now() - TOMBSTONE_TTL_MS - 24 * 3600 * 1000).toISOString();
+    const fresh = new Date().toISOString();
+    const bytes = await buildRawDb((db) => {
+      db.run(PRE_SYNC_DDL);
+      db.run(`CREATE TABLE sync_tombstones (
+        scope TEXT NOT NULL, ticket_guid TEXT NOT NULL, element_id TEXT NOT NULL,
+        deleted_at TEXT NOT NULL, last_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (scope, ticket_guid, element_id))`);
+      db.run(
+        "INSERT INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('ticket', 'old-guid', 'old-guid', ?, 'DS-001')",
+        [ancient],
+      );
+      db.run(
+        "INSERT INTO sync_tombstones (scope, ticket_guid, element_id, deleted_at, last_id) VALUES ('ticket', 'new-guid', 'new-guid', ?, 'DS-002')",
+        [fresh],
+      );
+      db.run("INSERT INTO schema_meta (key, value) VALUES ('version', '1')");
+    });
+    const { handles: h } = installVirtualFs({ "/ws/.vscode/dostuff/dostuff.db": bytes });
+    handles = h;
+
+    const store = makeSqlStore(makeContext());
+    await store.init();
+    const tombs = store.getSyncTombstones();
+    expect(tombs.tickets.map((t) => t.guid)).toEqual(["new-guid"]);
+    store.dispose();
+  });
+});
+
+// ─── Commit anchors (`commits` + `issue_commits`) — tenet proofs ─────────────
+
+describe("commit anchors schema", () => {
+  let handles: FsHandles | null = null;
+
+  afterEach(() => {
+    if (handles) {
+      restoreFs(handles);
+      handles = null;
+    }
+  });
+
+  test("normalize() on a legacy issue without `commits` returns []", () => {
+    const legacy = makeIssue({ id: "DS-001" }) as unknown as Record<string, unknown>;
+    delete legacy.commits;
+    const { issue } = normalize(legacy as unknown as Issue);
+    expect(issue.commits).toEqual([]);
+  });
+
+  test("normalize() drops garbage commits, keeps valid ones", () => {
+    const raw = makeIssue({ id: "DS-002" }) as unknown as Record<string, unknown>;
+    raw.commits = [
+      { sha: "A1B2C3D", at: "2026-07-01T00:00:00.000Z" }, // lowercased on load
+      { sha: "nothex!", at: "2026-07-01T00:00:00.000Z" },
+      { sha: "abcdef012345", at: "garbage" },
+      "junk",
+    ];
+    const { issue } = normalize(raw as unknown as Issue);
+    expect(issue.commits).toEqual([{ sha: "a1b2c3d", at: "2026-07-01T00:00:00.000Z" }]);
+  });
+
+  test("hydrates a DB created without issue_commits: loads [], then round-trips", async () => {
+    const bytes = await buildRawDb((db) => {
+      db.run(PRE_SYNC_DDL); // no issue_commits table at all
+      db.run(
+        "INSERT INTO issues (id, number, title, type, priority, status, created_at, resolved_at) VALUES ('DS-001', 1, 'old', 'Bug', 'High', 'Working', '2025-02-01T00:00:00.000Z', NULL)",
+      );
+      db.run("INSERT INTO schema_meta (key, value) VALUES ('version', '1')");
+    });
+    const { handles: h } = installVirtualFs({ "/ws/.vscode/dostuff/dostuff.db": bytes });
+    handles = h;
+
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    expect(a.get("DS-001")?.commits).toEqual([]);
+
+    // SCHEMA_DDL created the table on open — commits persist through a reopen.
+    await a.upsert({
+      ...a.get("DS-001")!,
+      commits: [{ sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: "2026-07-01T00:00:00.000Z" }],
+    });
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-001")?.commits).toEqual([
+      { sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: "2026-07-01T00:00:00.000Z" },
+    ]);
+    b.dispose();
+  });
+
+  test("commit order (at, sha) round-trips the DB even when PK lexical order differs", async () => {
+    const { handles: h } = installVirtualFs({});
+    handles = h;
+
+    // (at, sha) order is zzzzzzz first — PK/lexical order would flip it.
+    const commits = [
+      { sha: "zzzzzzz".replace(/z/g, "f"), at: "2026-07-01T00:00:00.000Z" },
+      { sha: "aaaaaaa", at: "2026-07-02T00:00:00.000Z" },
+    ];
+    const ctx = makeContext();
+    const a = makeSqlStore(ctx);
+    await a.init();
+    await a.upsert(makeIssue({ id: "DS-300", commits }));
+    a.dispose();
+
+    const b = makeSqlStore(ctx);
+    await b.init();
+    expect(b.get("DS-300")?.commits).toEqual(commits);
+    b.dispose();
+  });
+
+  test("globalState fallback round-trips commits through normalize()", async () => {
+    // No virtual FS installed → no workspace folder → memento branch. The same
+    // context object (thus the same memento) backs both store instances.
+    const ctx = makeContext();
+    const store = new IssueStore(ctx);
+    await store.init();
+    const commits = [{ sha: "0123abc", at: "2026-07-01T00:00:00.000Z" }];
+    await store.upsert(makeIssue({ id: "DS-001", commits }));
+    store.dispose();
+
+    const reopened = new IssueStore(ctx);
+    await reopened.init();
+    expect(reopened.get("DS-001")?.commits).toEqual(commits);
+    reopened.dispose();
   });
 });

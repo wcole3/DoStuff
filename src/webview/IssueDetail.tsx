@@ -7,6 +7,7 @@ import {
   TYPES,
   canMoveToActiveLane,
   type Attachment,
+  type CommitDetail,
   type Issue,
   type IssueType,
   type LinkKind,
@@ -21,9 +22,11 @@ import {
   postAddAttachmentByUri,
   postDeleteAttachment,
   postDeleteIssue,
+  postFetchCommitDetails,
   postOpenAttachment,
   postOpenLink,
   postPickAttachment,
+  postResolveClose,
   postUpdateIssue,
   useIssues,
 } from "./messaging";
@@ -125,9 +128,17 @@ export function absTime(iso: string | null | undefined): string {
 
 interface IssueDetailProps {
   issue: Issue;
+  /**
+   * Notified after the human resolves a pending close/complete request from
+   * this panel (the `resolveClose` message is already posted). Lets the host
+   * view decide where focus goes next — e.g. the board advances to the next
+   * ticket in the resolved ticket's lane. Optional; the sidebar omits it and
+   * keeps showing the same ticket.
+   */
+  onResolveClose?: (issue: Issue, verdict: "approve" | "deny") => void;
 }
 
-export function IssueDetail({ issue }: IssueDetailProps) {
+export function IssueDetail({ issue, onResolveClose }: IssueDetailProps) {
   const { issues, settings } = useIssues();
   // Unique tags across every ticket in the store, sorted for stable
   // datalist ordering. Cheap O(N tags) and recomputes only when the issue
@@ -275,6 +286,42 @@ export function IssueDetail({ issue }: IssueDetailProps) {
           <Icon name="trash" size={12} />
         </button>
       </div>
+
+      {issue.pendingClose && (
+        <div className="ds-d-close-req" role="alert">
+          <div className="ds-d-close-req-head">
+            <Icon name="clock" size={12} />
+            <span>
+              {issue.pendingClose.target === "Complete"
+                ? "An agent reports this ticket's work as finished."
+                : "An agent requested to close this ticket (no longer needed)."}
+            </span>
+          </div>
+          {issue.pendingClose.note && (
+            <div className="ds-d-close-req-note">“{issue.pendingClose.note}”</div>
+          )}
+          <div className="ds-d-close-req-actions">
+            <button
+              className="ds-d-close-req-approve"
+              onClick={() => {
+                postResolveClose(issue.id, "approve");
+                onResolveClose?.(issue, "approve");
+              }}
+            >
+              {issue.pendingClose.target === "Complete" ? "Accept & complete" : "Approve & close"}
+            </button>
+            <button
+              className="ds-d-close-req-deny"
+              onClick={() => {
+                postResolveClose(issue.id, "deny");
+                onResolveClose?.(issue, "deny");
+              }}
+            >
+              Deny
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="ds-d-grid">
         <label className="ds-d-label">Status</label>
@@ -484,6 +531,8 @@ export function IssueDetail({ issue }: IssueDetailProps) {
         </div>
       </div>
 
+      {(issue.commits || []).length > 0 && <CommitsSection issue={issue} />}
+
       <div>
         <div className="ds-d-section-h">State history</div>
         <div className="ds-d-history">
@@ -497,6 +546,101 @@ export function IssueDetail({ issue }: IssueDetailProps) {
             </div>
           ))}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Commits reported against this ticket over MCP. Only `{sha, at}` lives on the
+ * ticket; subject + touched files arrive lazily via `fetchCommitDetails` →
+ * `commitDetails` (see messaging.ts). Rendered only when the ticket has
+ * commits — most never do. Rows expand to the derived file list; file clicks
+ * reuse the openLink path (host resolves workspace-relative and opens the
+ * editor). A sha that no longer resolves shows "not found in this repo".
+ */
+function CommitsSection({ issue }: { issue: Issue }) {
+  const [details, setDetails] = useState<Map<string, CommitDetail>>(new Map());
+  const [pathPrefix, setPathPrefix] = useState(".");
+  const [expandedSha, setExpandedSha] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    setDetails(new Map());
+    setLoaded(false);
+    setExpandedSha(null);
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent).detail as {
+        issueId: string;
+        pathPrefix: string;
+        details: CommitDetail[];
+      };
+      // A stale response for a previously-shown ticket must not clobber this one.
+      if (d.issueId !== issue.id) return;
+      setPathPrefix(d.pathPrefix);
+      setDetails(new Map(d.details.map((x) => [x.sha, x])));
+      setLoaded(true);
+    };
+    window.addEventListener("dostuff:commitDetails", handler);
+    postFetchCommitDetails(issue.id);
+    return () => window.removeEventListener("dostuff:commitDetails", handler);
+  }, [issue.id, issue.commits.length]);
+
+  const openFile = (file: string) => {
+    postOpenLink(pathPrefix === "." ? `./${file}` : `${pathPrefix}/${file}`);
+  };
+
+  return (
+    <div>
+      <div className="ds-d-section-h">
+        Commits
+        <span style={{ opacity: 0.5, fontWeight: 400, marginLeft: 6 }}>
+          {issue.commits.length}
+        </span>
+        <span className="ds-d-record-hint">reported by agents · derived from git</span>
+      </div>
+      <div className="ds-commits">
+        {issue.commits.map((c) => {
+          const detail = details.get(c.sha);
+          const expanded = expandedSha === c.sha;
+          return (
+            <div key={c.sha} className="ds-commit-row">
+              <button
+                type="button"
+                className="ds-commit-head"
+                onClick={() => setExpandedSha(expanded ? null : c.sha)}
+                title={c.sha}
+              >
+                <code className="ds-commit-sha">{c.sha.slice(0, 7)}</code>
+                <span className={`ds-commit-subject${detail?.found ? "" : " ds-commit-dim"}`}>
+                  {!loaded ? "…" : detail?.found ? detail.subject : "not found in this repo"}
+                </span>
+                <span className="ds-commit-when" title={absTime(c.at)}>
+                  {relTime(c.at)}
+                </span>
+              </button>
+              {expanded && detail?.found && (
+                <div className="ds-commit-files">
+                  {detail.files.length === 0 ? (
+                    <div className="ds-d-empty">No file list (merge commit).</div>
+                  ) : (
+                    detail.files.map((f) => (
+                      <button
+                        type="button"
+                        key={f}
+                        className="ds-commit-file"
+                        onClick={() => openFile(f)}
+                        title={`Open ${f}`}
+                      >
+                        {f}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

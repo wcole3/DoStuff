@@ -12,6 +12,7 @@ import {
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import { IssueDetail, absTime, relTime } from "./IssueDetail";
 import { TagStrip } from "./Tags";
+import { pendingCloseTitle } from "./copy";
 import { postExternalDragStart, useIssues } from "./messaging";
 import { AddIssueModal, DeleteConfirmModal } from "./Modals";
 import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
@@ -147,6 +148,18 @@ const Row = memo(function Row({ index, style, data }: ListChildComponentProps<Ro
                 <TagStrip tags={issue.tags} />
               </>
             )}
+            {issue.pendingClose && (
+              <>
+                <span className="ds-row-dot">·</span>
+                <span
+                  className="ds-row-pending-close"
+                  title={pendingCloseTitle(issue.pendingClose)}
+                >
+                  <Icon name="clock" size={10} />
+                  {issue.pendingClose.target === "Complete" ? "awaiting acceptance" : "awaiting close"}
+                </span>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -185,6 +198,7 @@ export function Sidebar() {
   const [priorityFilter, setPriorityFilter] = useState<Priority | "All">("All");
   const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT);
   const [showCompleted, setShowCompleted] = useState(false);
+  const [pendingCloseOnly, setPendingCloseOnly] = useState(false);
   const [modal, setModal] = useState<"add" | { kind: "delete"; issue: Issue } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [listRef, listSize] = useParentSize();
@@ -220,6 +234,7 @@ export function Sidebar() {
       })
       .filter((i) => typeFilter === "All" || i.type === typeFilter)
       .filter((i) => priorityFilter === "All" || i.priority === priorityFilter)
+      .filter((i) => !pendingCloseOnly || i.pendingClose != null)
       .filter((i) => {
         if (!q) return true;
         return (
@@ -233,7 +248,12 @@ export function Sidebar() {
         );
       });
     return sortIssues(matched, sortKey);
-  }, [issues, query, statusFilter, typeFilter, priorityFilter, sortKey, showCompleted]);
+  }, [issues, query, statusFilter, typeFilter, priorityFilter, sortKey, showCompleted, pendingCloseOnly]);
+
+  const pendingCloseCount = useMemo(
+    () => issues.filter((i) => i.pendingClose != null).length,
+    [issues],
+  );
 
   const expandedIssue = expandedId ? issues.find((i) => i.id === expandedId) ?? null : null;
 
@@ -315,6 +335,20 @@ export function Sidebar() {
           />
           Show completed
         </label>
+        {(pendingCloseCount > 0 || pendingCloseOnly) && (
+          <label
+            className="ds-pending-filter"
+            title="Show only tickets with a pending agent request (close or completion)"
+          >
+            <input
+              type="checkbox"
+              checked={pendingCloseOnly}
+              onChange={(e) => setPendingCloseOnly(e.target.checked)}
+              style={{ margin: 0 }}
+            />
+            Awaiting decision ({pendingCloseCount})
+          </label>
+        )}
       </div>
 
       <div className="ds-sb-controls">
