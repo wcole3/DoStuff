@@ -13,7 +13,7 @@
   "priority": "Regular",
   "record": [],
   "resolvedAt": null,
-  "status": "Thinking",
+  "status": "Planned",
   "statusHistory": [
     {
       "at": "2026-08-28T15:13:17.726Z",
@@ -39,12 +39,37 @@
       "at": "2026-08-28T15:13:25.548Z",
       "by": "user",
       "status": "Thinking"
+    },
+    {
+      "at": "2026-08-28T15:13:34.750Z",
+      "by": "user",
+      "status": "Planned"
+    },
+    {
+      "at": "2026-08-28T15:13:35.883Z",
+      "by": "user",
+      "status": "Thinking"
+    },
+    {
+      "at": "2026-08-28T15:13:37.029Z",
+      "by": "user",
+      "status": "Planned"
+    },
+    {
+      "at": "2026-08-28T15:13:38.022Z",
+      "by": "user",
+      "status": "Working"
+    },
+    {
+      "at": "2026-08-28T15:13:39.057Z",
+      "by": "user",
+      "status": "Planned"
     }
   ],
   "tags": [],
   "tasks": [],
   "title": "test",
   "type": "Bug",
-  "updatedAt": "2026-08-28T15:13:25.549Z",
+  "updatedAt": "2026-08-28T15:13:39.057Z",
   "verifyCriteria": ""
 }
