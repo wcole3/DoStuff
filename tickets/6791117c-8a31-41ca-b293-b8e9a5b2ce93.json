@@ -19,12 +19,32 @@
       "at": "2026-08-28T15:13:17.726Z",
       "by": "user",
       "status": "Thinking"
+    },
+    {
+      "at": "2026-08-28T15:13:21.274Z",
+      "by": "user",
+      "status": "Planned"
+    },
+    {
+      "at": "2026-08-28T15:13:23.132Z",
+      "by": "user",
+      "status": "Working"
+    },
+    {
+      "at": "2026-08-28T15:13:24.397Z",
+      "by": "user",
+      "status": "Planned"
+    },
+    {
+      "at": "2026-08-28T15:13:25.548Z",
+      "by": "user",
+      "status": "Thinking"
     }
   ],
   "tags": [],
   "tasks": [],
   "title": "test",
   "type": "Bug",
-  "updatedAt": "2026-08-28T15:13:17.727Z",
+  "updatedAt": "2026-08-28T15:13:25.549Z",
   "verifyCriteria": ""
 }
