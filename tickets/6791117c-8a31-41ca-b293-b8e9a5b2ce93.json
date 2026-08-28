@@ -1,0 +1,30 @@
+{
+  "attachments": [],
+  "commits": [],
+  "createdAt": "2026-08-28T15:13:17.726Z",
+  "deletedAttachments": [],
+  "deletedTasks": [],
+  "description": "",
+  "guid": "6791117c-8a31-41ca-b293-b8e9a5b2ce93",
+  "id": "DS-001",
+  "links": [],
+  "number": 1,
+  "pendingClose": null,
+  "priority": "Regular",
+  "record": [],
+  "resolvedAt": null,
+  "status": "Thinking",
+  "statusHistory": [
+    {
+      "at": "2026-08-28T15:13:17.726Z",
+      "by": "user",
+      "status": "Thinking"
+    }
+  ],
+  "tags": [],
+  "tasks": [],
+  "title": "test",
+  "type": "Bug",
+  "updatedAt": "2026-08-28T15:13:17.727Z",
+  "verifyCriteria": ""
+}
