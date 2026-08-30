@@ -866,3 +866,131 @@ describe("GitSyncController + IssueStoreCore (headless pairing)", () => {
     }
   });
 });
+
+// ----- responsiveness: network stalls must not block local operations -------
+
+/**
+ * PATH shim: `git ls-remote|fetch|push` sleep `sleepSec` before running,
+ * every other subcommand passes straight through. Simulates a slow/hung
+ * remote with the real binary. Returns a restore function.
+ */
+function slowGitShim(sleepSec: number): () => void {
+  const bin = path.join(tmpRoot, `slow-bin-${++repoCounter}`);
+  fs.mkdirSync(bin, { recursive: true });
+  const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  fs.writeFileSync(
+    path.join(bin, "git"),
+    `#!/bin/sh\ncase "$1" in ls-remote|fetch|push) sleep ${sleepSec};; esac\nexec ${real} "$@"\n`,
+    { mode: 0o755 },
+  );
+  const prior = process.env.PATH;
+  process.env.PATH = `${bin}:${prior}`;
+  return () => {
+    process.env.PATH = prior;
+  };
+}
+
+describe("network stalls", () => {
+  test("a debounced local commit lands while a network sync is stalled", async () => {
+    const bare = mkRepo("slow-origin", true);
+    const c = track(mkClone("slow-clone", bare));
+    c.controller.start();
+    await sleep(50);
+    c.store.put(
+      makeIssue({ guid: "g-before", number: 1, id: "DS-001", createdAt: T(1), updatedAt: T(1) }),
+    );
+    await sleep(80); // debounce (5ms) → ref is born before the stall begins
+
+    const restore = slowGitShim(2);
+    try {
+      const syncP = c.controller.syncNow("manual"); // stalls inside ls-remote
+      await sleep(300); // firmly inside the 2s network sleep now
+      c.store.put(
+        makeIssue({ guid: "g-during", number: 2, id: "DS-002", createdAt: T(2), updatedAt: T(2) }),
+      );
+      // The debounced local commit must NOT queue behind the stalled network
+      // call — the ticket blob must appear in the local ref well before the
+      // network op completes.
+      const deadline = Date.now() + 1200;
+      let seen = false;
+      while (Date.now() < deadline) {
+        if (git(c.dir, "ls-tree", "-r", REF).includes("g-during.json")) {
+          seen = true;
+          break;
+        }
+        await sleep(50);
+      }
+      expect(seen).toBe(true);
+      await syncP;
+    } finally {
+      restore();
+    }
+  }, 15_000);
+
+  test("concurrent syncNow calls coalesce into at most one running + one queued", async () => {
+    const bare = mkRepo("coalesce-origin", true);
+    const c = track(mkClone("coalesce-clone", bare));
+    c.controller.start();
+    await sleep(50);
+    c.store.put(
+      makeIssue({ guid: "g-co", number: 1, id: "DS-001", createdAt: T(1), updatedAt: T(1) }),
+    );
+    await sleep(80);
+    let cycles = 0;
+    c.controller.onStatusChange((s) => {
+      if (s.state === "syncing") cycles += 1;
+    });
+    const restore = slowGitShim(1);
+    try {
+      await Promise.all([
+        c.controller.syncNow("manual"),
+        c.controller.syncNow("manual"),
+        c.controller.syncNow("manual"),
+        c.controller.syncNow("manual"),
+      ]);
+    } finally {
+      restore();
+    }
+    expect(cycles).toBeLessThanOrEqual(2);
+  }, 20_000);
+
+  test("a failed sync schedules an automatic retry that recovers without manual action", async () => {
+    const missing = path.join(tmpRoot, `missing-remote-${++repoCounter}`);
+    const dir = mkRepo("retry-clone");
+    git(dir, "remote", "add", "origin", missing);
+    const store = new FakeStore();
+    const controller = new GitSyncController(store as unknown as SyncStoreLike, () => dir, {
+      remote: "origin",
+      ref: REF,
+      intervalMinutes: 0,
+      activeLaneCap: 6,
+      debounceMs: 5,
+      tipPollMs: 3_600_000,
+      pushFollowUpMs: 3_600_000,
+      startupSync: false,
+      retryBaseMs: 100,
+      notify: () => {},
+    });
+    try {
+      controller.start();
+      await sleep(50);
+      store.put(
+        makeIssue({ guid: "g-re", number: 1, id: "DS-001", createdAt: T(1), updatedAt: T(1) }),
+      );
+      await sleep(80);
+      await controller.syncNow("manual");
+      expect(controller.status.state).toBe("error");
+
+      // Remote comes back — the controller must clear the warning on its own.
+      fs.mkdirSync(missing, { recursive: true });
+      git(missing, "init", "-q", "--bare");
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && controller.status.state !== "idle") {
+        await sleep(50);
+      }
+      expect(controller.status.state).toBe("idle");
+    } finally {
+      controller.dispose();
+    }
+  }, 15_000);
+});

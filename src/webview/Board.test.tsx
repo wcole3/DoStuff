@@ -344,6 +344,21 @@ describe("Board card step arrows", () => {
     expect((updates[0] as unknown as { issue: Issue }).issue.status).toBe("Verification");
   });
 
+  test("a lane move renders optimistically before the host echoes", () => {
+    const a = makeIssue({ id: "DS-220", number: 220, title: "Optimist", status: "Working" });
+    installVsCodeApi();
+    render(<Board />);
+    pushInit([a]);
+
+    const card = document.querySelector(".bd-card") as HTMLElement;
+    fireEvent.click(card.querySelector(".bd-card-step-right") as HTMLElement);
+
+    // No `issues` echo has been pushed — the card must already render inside
+    // the Verification lane (the host echo later confirms or reverts).
+    const laneCard = document.querySelector('[data-drop-status="Verification"] .bd-card');
+    expect(laneCard?.textContent ?? "").toContain("Optimist");
+  });
+
   test("clicking left on a Planned card demotes it into the Thinking drawer", () => {
     const a = makeIssue({ id: "DS-202", number: 202, title: "Back to drawer", status: "Planned" });
     const api = installVsCodeApi();

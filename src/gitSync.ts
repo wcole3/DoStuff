@@ -106,6 +106,10 @@ export interface GitSyncOptions {
   debounceMs?: number; // outbound debounce (default 2000)
   pushFollowUpMs?: number; // one coalesced push after a local commit (default 30000)
   tipPollMs?: number; // same-machine tip poll (default 15000)
+  /** Base delay for the automatic retry after a failed network cycle
+   *  (default 30000). Doubles per consecutive failure, capped at
+   *  RETRY_MAX_MS; reset on the first successful cycle. */
+  retryBaseMs?: number;
   git?: GitRepoOptions; // timeout overrides for tests
   /** Notification sink — the extension passes vscode toasts; defaults to the
    *  store log so the controller stays host-agnostic. */
@@ -118,6 +122,8 @@ export interface GitSyncOptions {
 const TRACKING_REF = "refs/dostuff/remote";
 const CAS_RETRIES = 5;
 const PUSH_RETRIES = 3;
+/** Ceiling for the exponential failure backoff (10 minutes). */
+const RETRY_MAX_MS = 600_000;
 
 /**
  * Is `target` strictly inside `rootPath`? Belt-and-braces behind the
@@ -139,6 +145,12 @@ export class GitSyncController {
   private timers: ReturnType<typeof setTimeout>[] = [];
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pushFollowUpTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryFailures = 0;
+  // syncNow coalescing (exportDb pattern): one running cycle, at most one
+  // queued follow-up that every mid-cycle caller shares.
+  private syncRunning: Promise<SyncResult> | null = null;
+  private syncQueued: Promise<SyncResult> | null = null;
   private applyingRemote = 0; // echo suppression counter
   private lastSeenTip: string | null = null;
   private warnedOverflow = false;
@@ -229,8 +241,12 @@ export class GitSyncController {
     this.debounceTimer = null;
     if (this.pushFollowUpTimer) clearTimeout(this.pushFollowUpTimer);
     this.pushFollowUpTimer = null;
+    this.clearRetryBackoff();
     for (const d of this.disposables) d.dispose();
     this.disposables = [];
+    // Null the repo so any cycle still in flight (off-chain network wait)
+    // no-ops at its next hop instead of mutating state after stop.
+    this.repo = null;
     this.setStatus("disabled");
   }
 
@@ -255,6 +271,46 @@ export class GitSyncController {
       });
     this.opChain = this.opChain.then(run, run);
     return this.opChain;
+  }
+
+  /**
+   * Chain variant for the sync cycle's state hops: the op still runs
+   * serialized on the op chain, but its rejection propagates to the caller
+   * (runSyncCycle owns error handling for the whole cycle) while the chain
+   * itself continues unbroken for later ops.
+   */
+  private chainThrough<T>(op: () => Promise<T>): Promise<T> {
+    const run = this.opChain.then(op, op);
+    this.opChain = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
+  /**
+   * Failure backoff (issue: a transient network blip used to latch the
+   * warning until the next interval — or forever with intervalMinutes 0).
+   * Doubles from retryBaseMs per consecutive failure, capped at RETRY_MAX_MS;
+   * a successful cycle clears it. One timer at a time.
+   */
+  private scheduleRetry(): void {
+    if (!this.started || this.retryTimer) return;
+    const base = this.opts.retryBaseMs ?? 30_000;
+    const delay = Math.min(base * 2 ** this.retryFailures, RETRY_MAX_MS);
+    this.retryFailures += 1;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.syncNow("retry").catch(() => {});
+    }, delay);
+  }
+
+  private clearRetryBackoff(): void {
+    this.retryFailures = 0;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
   }
 
   private notify(kind: "info" | "warn", message: string): void {
@@ -586,69 +642,120 @@ export class GitSyncController {
     }
   }
 
-  /** Full network cycle: commit local → fetch → merge → apply → push. */
-  async syncNow(reason: "manual" | "interval" | "startup" | "push-follow-up"): Promise<SyncResult> {
-    const result: SyncResult = { applied: 0, pushed: false, renames: [] };
-    await this.chain(async () => {
-      const repo = this.repo;
-      if (!repo) return;
-      this.setStatus("syncing", `sync (${reason})`);
+  /**
+   * Full network cycle: commit local → fetch → merge → apply → push.
+   * Coalesced (exportDb pattern): a call while a cycle runs shares one queued
+   * follow-up instead of stacking cycles — timers firing faster than a slow
+   * remote drains can no longer grow the queue without bound. Never rejects.
+   */
+  syncNow(
+    reason: "manual" | "interval" | "startup" | "push-follow-up" | "retry",
+  ): Promise<SyncResult> {
+    if (this.syncRunning) {
+      if (!this.syncQueued) {
+        this.syncQueued = this.syncRunning.then(() => {
+          this.syncQueued = null;
+          return this.syncNow(reason);
+        });
+      }
+      return this.syncQueued;
+    }
+    const run = (async () => {
       try {
-        await this.commitLocalOp();
+        return await this.runSyncCycle(reason);
+      } finally {
+        this.syncRunning = null;
+      }
+    })();
+    this.syncRunning = run;
+    return run;
+  }
 
-        const remoteUrl = await repo.remoteUrl(this.opts.remote);
-        if (!remoteUrl) {
-          this.setStatus("noRemote", `Remote "${this.opts.remote}" is not configured — local-only mode`);
-          return;
-        }
+  /**
+   * One sync cycle. State mutations (local commit, ref CAS, store applies)
+   * run serialized on the op chain via `chainThrough`; the network waits
+   * (ls-remote, fetch, push) run OFF the chain so a slow or hung remote never
+   * blocks debounced local commits or tip-poll applies. Each on-chain hop
+   * re-reads the local tip, so state that advanced during a network wait is
+   * integrated, never clobbered.
+   */
+  private async runSyncCycle(
+    reason: "manual" | "interval" | "startup" | "push-follow-up" | "retry",
+  ): Promise<SyncResult> {
+    const result: SyncResult = { applied: 0, pushed: false, renames: [] };
+    // Barrier: start()'s init op runs on the chain and is what sets
+    // `this.repo` — a syncNow fired right after start() must see it.
+    await this.chainThrough(async () => {});
+    const repo = this.repo;
+    if (!repo) return result;
+    this.setStatus("syncing", `sync (${reason})`);
+    try {
+      // Hop 1 (chain): fold pending store state into the local ref.
+      await this.chainThrough(() => this.commitLocalOp());
 
-        const remoteOid = await repo.lsRemote(this.opts.remote, this.opts.ref);
-        let localTip = await repo.revParse(this.opts.ref);
+      const remoteUrl = await repo.remoteUrl(this.opts.remote);
+      if (!remoteUrl) {
+        this.setStatus("noRemote", `Remote "${this.opts.remote}" is not configured — local-only mode`);
+        return result;
+      }
 
-        if (remoteOid && remoteOid !== localTip) {
-          await repo.fetchStateRef(this.opts.remote, this.opts.ref, TRACKING_REF);
-          const remoteTip = (await repo.revParse(TRACKING_REF))!;
+      // Network reads — off the chain.
+      const remoteOid = await repo.lsRemote(this.opts.remote, this.opts.ref);
+      let localTip = await repo.revParse(this.opts.ref);
 
-          if (localTip && (await repo.isAncestor(remoteTip, localTip))) {
+      if (remoteOid && remoteOid !== localTip) {
+        await repo.fetchStateRef(this.opts.remote, this.opts.ref, TRACKING_REF);
+
+        // Hop 2 (chain): integrate the fetched tip. Local tip re-read inside
+        // the hop — a debounced commit may have advanced it during the fetch.
+        await this.chainThrough(async () => {
+          if (!this.repo) return; // stopped mid-cycle
+          const remoteTip = await repo.revParse(TRACKING_REF);
+          if (!remoteTip) return;
+          const tip = await repo.revParse(this.opts.ref);
+          if (tip && (await repo.isAncestor(remoteTip, tip))) {
             // Remote is behind — nothing to apply; push below.
-          } else if (localTip && (await repo.isAncestor(localTip, remoteTip))) {
+          } else if (tip && (await repo.isAncestor(tip, remoteTip))) {
             // Fast-forward: adopt the remote tip, no new commit.
-            await repo.updateRefCas(this.opts.ref, remoteTip, localTip);
+            await repo.updateRefCas(this.opts.ref, remoteTip, tip);
             this.lastSeenTip = remoteTip;
             const applied = await this.applyState(await this.readState(remoteTip), remoteTip);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
-            localTip = remoteTip;
           } else {
             // True divergence (or unborn local): merge-commit with both parents.
-            const { commit, applied } = await this.mergeTips(localTip, remoteTip);
+            const { applied } = await this.mergeTips(tip, remoteTip);
             result.applied += applied.applied;
             result.renames.push(...applied.renames);
-            localTip = commit;
           }
-        }
-
-        // Push when we're ahead (or the remote ref doesn't exist yet).
-        localTip = localTip ?? (await repo.revParse(this.opts.ref));
-        if (localTip && localTip !== remoteOid) {
-          result.pushed = await this.pushWithRetry();
-          if (!result.pushed) return; // status already pendingPush
-        }
-        this._status = { ...this._status, lastSyncAt: new Date().toISOString() };
-        this.setStatus("idle");
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (e instanceof GitError && e.code === "AuthFailed") {
-          this.setStatus(
-            "error",
-            "Git auth failed — run `git fetch` in a terminal once to prime credentials",
-          );
-        } else {
-          this.setStatus("error", msg);
-        }
-        this.store.appendLog(`Sync failed (${reason}): ${msg}`);
+        });
       }
-    });
+
+      // Push when we're ahead (or the remote ref doesn't exist yet).
+      localTip = await repo.revParse(this.opts.ref);
+      if (localTip && localTip !== remoteOid) {
+        result.pushed = await this.pushWithRetry();
+        if (!result.pushed) {
+          this.scheduleRetry();
+          return result; // status already pendingPush
+        }
+      }
+      this._status = { ...this._status, lastSyncAt: new Date().toISOString() };
+      this.clearRetryBackoff();
+      this.setStatus("idle");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (e instanceof GitError && e.code === "AuthFailed") {
+        this.setStatus(
+          "error",
+          "Git auth failed — run `git fetch` in a terminal once to prime credentials",
+        );
+      } else {
+        this.setStatus("error", msg);
+      }
+      this.store.appendLog(`Sync failed (${reason}): ${msg}`);
+      this.scheduleRetry();
+    }
     return result;
   }
 
@@ -660,13 +767,17 @@ export class GitSyncController {
         return true;
       } catch (e) {
         if (e instanceof GitError && e.code === "NonFastForward") {
-          // Someone pushed since our fetch: fetch → merge → try again.
+          // Someone pushed since our fetch: fetch (off chain) → merge (on
+          // chain — it CASes the local ref and applies to the store) → retry.
           await repo.fetchStateRef(this.opts.remote, this.opts.ref, TRACKING_REF);
-          const remoteTip = await repo.revParse(TRACKING_REF);
-          const localTip = await repo.revParse(this.opts.ref);
-          if (remoteTip && localTip && !(await repo.isAncestor(remoteTip, localTip))) {
-            await this.mergeTips(localTip, remoteTip);
-          }
+          await this.chainThrough(async () => {
+            if (!this.repo) return; // stopped mid-cycle
+            const remoteTip = await repo.revParse(TRACKING_REF);
+            const localTip = await repo.revParse(this.opts.ref);
+            if (remoteTip && localTip && !(await repo.isAncestor(remoteTip, localTip))) {
+              await this.mergeTips(localTip, remoteTip);
+            }
+          });
           continue;
         }
         this.setStatus("pendingPush", e instanceof Error ? e.message : String(e));

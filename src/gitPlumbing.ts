@@ -45,7 +45,10 @@ const AUTH_PATTERNS = [
   /403 forbidden/i,
 ];
 
-const NON_FF_PATTERNS = [/non-fast-forward/i, /\[rejected\]/i, /fetch first/i, /failed to push/i];
+// Deliberately narrow: git's generic "failed to push some refs" line appears
+// on ANY push failure (hook declines, disk-full remotes), where a fetch+merge
+// retry can never help. Only genuine stale-tip signals belong here.
+const NON_FF_PATTERNS = [/non-fast-forward/i, /\[rejected\]/i, /fetch first/i];
 
 function classify(args: string[], stderr: string): GitErrorCode {
   if (AUTH_PATTERNS.some((re) => re.test(stderr))) return "AuthFailed";

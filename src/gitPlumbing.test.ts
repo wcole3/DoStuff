@@ -277,6 +277,30 @@ describe("remote operations against a bare origin", () => {
     expect(err).toBeInstanceOf(GitError);
     expect((err as GitError).code).toBe("NonFastForward");
   });
+
+  test("a hook-declined push classifies as GitFailed, not NonFastForward", async () => {
+    const bare = mkRepo("hook-origin.git", true);
+    const dir = mkRepo("hook-clone");
+    git(dir, "remote", "add", "origin", bare);
+    const repo = new GitRepo(dir);
+    await commitState(repo, STATE_REF, { "t.json": "x" }, []);
+    // Remote declines every push. Git's stderr still says "failed to push
+    // some refs", but a fetch+merge retry can never fix a hook decline — it
+    // must NOT classify as NonFastForward or the retry loop spins.
+    fs.writeFileSync(
+      path.join(bare, "hooks", "pre-receive"),
+      "#!/bin/sh\necho declined >&2\nexit 1\n",
+      { mode: 0o755 },
+    );
+    let err: unknown;
+    try {
+      await repo.pushStateRef("origin", STATE_REF);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(GitError);
+    expect((err as GitError).code).toBe("GitFailed");
+  });
 });
 
 describe("timeout", () => {

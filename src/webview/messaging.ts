@@ -170,6 +170,20 @@ export function postUpdateIssue(issue: Issue): void {
   vscodeApi.postMessage({ type: "updateIssue", issue });
 }
 
+/**
+ * Optimistic local status move: re-render the card in its target lane
+ * immediately instead of waiting for the host's `issues` echo. The host still
+ * owns truth — its next broadcast (the accepted update, or the unchanged
+ * state after a rejection) replaces this wholesale, so a rejected move snaps
+ * back exactly as before. Only `status` is touched; statusHistory and
+ * updatedAt arrive with the echo.
+ */
+export function applyOptimisticStatus(id: string, status: Issue["status"]): void {
+  setState({
+    issues: state.issues.map((i) => (i.id === id ? { ...i, status } : i)),
+  });
+}
+
 export function postDeleteIssue(id: string): void {
   vscodeApi.postMessage({ type: "deleteIssue", id });
 }

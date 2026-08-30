@@ -26,6 +26,7 @@ import { pendingCloseTitle } from "./copy";
 import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "./sort";
 import {
   clearExternalDragLocal,
+  applyOptimisticStatus,
   postUpdateIssue,
   useExternalDragIssueId,
   useIssues,
@@ -753,6 +754,8 @@ export function Board() {
         showToast(guard);
         return;
       }
+      // Move the card locally right away; the host echo confirms or reverts.
+      applyOptimisticStatus(id, newStatus);
       postUpdateIssue({ ...issue, status: newStatus });
     },
     [issues, showToast, cap],
