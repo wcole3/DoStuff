@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type DragEvent } from "react";
 import {
+  type IssueRow,
   ACTIVE_LANE_CAP,
   MAX_ATTACHMENT_BYTES,
   PRIORITIES,
@@ -17,6 +18,7 @@ import {
 } from "../types";
 import { Icon, PRIORITY_META, STATUS_META, TYPE_ICON } from "./Icons";
 import {
+  useIssueDetail,
   newTaskId,
   postAddAttachmentBytes,
   postAddAttachmentByUri,
@@ -127,7 +129,7 @@ export function absTime(iso: string | null | undefined): string {
 }
 
 interface IssueDetailProps {
-  issue: Issue;
+  issue: IssueRow;
   /**
    * Notified after the human resolves a pending close/complete request from
    * this panel (the `resolveClose` message is already posted). Lets the host
@@ -138,8 +140,12 @@ interface IssueDetailProps {
   onResolveClose?: (issue: Issue, verdict: "approve" | "deny") => void;
 }
 
-export function IssueDetail({ issue, onResolveClose }: IssueDetailProps) {
+export function IssueDetail({ issue: row, onResolveClose }: IssueDetailProps) {
   const { issues, settings } = useIssues();
+  // The list only carries rows; record / statusHistory / commits are fetched
+  // on demand and merged here. Edits below spread `issue`, which the host
+  // merges per field (the three windowed fields are never read from it).
+  const { issue } = useIssueDetail(row);
   // Unique tags across every ticket in the store, sorted for stable
   // datalist ordering. Cheap O(N tags) and recomputes only when the issue
   // list shifts. Used as TagEditor autocomplete suggestions.

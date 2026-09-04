@@ -4,7 +4,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   PRIORITIES,
   TYPES,
-  type Issue,
+  type IssueRow,
   type IssueType,
   type LinkKind,
   type Priority,
@@ -483,7 +483,7 @@ function PendingAttachmentChip({ attachment, onRemove }: PendingAttachmentChipPr
 }
 
 interface DeleteConfirmModalProps {
-  issue: Issue;
+  issue: IssueRow;
   onClose: () => void;
 }
 

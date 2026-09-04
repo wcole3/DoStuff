@@ -15,7 +15,7 @@ import { BoardPanel } from "./boardProvider";
 import { GraphPanel } from "./graphProvider";
 import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
-import {
+import { type IssueRow,
   ACTIVE_LANE_CAP,
   DS_ID_RE,
   MAX_ATTACHMENT_BYTES,
@@ -306,8 +306,12 @@ export function activeLaneOverflow(set: Issue[], cap = ACTIVE_LANE_CAP): Array<{
   return out;
 }
 
+/** The live store, for `deactivate()` to flush. */
+let activeStore: IssueStore | null = null;
+
 export function activate(context: vscode.ExtensionContext) {
   const store = new IssueStore(context);
+  activeStore = store;
   // Hydrate the store in the background. The webview shows its "Loading…"
   // state until the first store.onChange fires; awaiting here would gate
   // every other activation step on disk I/O for ticket files.
@@ -341,7 +345,7 @@ export function activate(context: vscode.ExtensionContext) {
     GraphPanel.broadcast(store.list());
   };
 
-  const applyIssueUpdate = async (incoming: Issue): Promise<void> => {
+  const applyIssueUpdate = async (incoming: IssueRow): Promise<void> => {
     const prior = store.get(incoming.id);
     if (!prior) {
       vscode.window.showWarningMessage(`DoStuff: No ticket with id ${incoming.id}.`);
@@ -1173,7 +1177,13 @@ export function activate(context: vscode.ExtensionContext) {
   reconcileSync();
 }
 
-export function deactivate() {}
+/**
+ * VSCode awaits the returned promise (bounded), so the write-behind persist
+ * window (`persistDelayMs`) never loses an edit on a normal window close.
+ */
+export function deactivate(): Promise<void> | undefined {
+  return activeStore?.flush();
+}
 
 // Re-export the lane cap for tests / consumers that want the constant.
 export { ACTIVE_LANE_CAP };

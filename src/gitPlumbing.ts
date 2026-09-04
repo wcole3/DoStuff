@@ -79,6 +79,20 @@ interface RunResult {
   stderr: string;
 }
 
+/** A spawn delayed this long past its call is reported as a host stall. */
+export const STALL_REPORT_MS = 1000;
+
+/** Suffix for Timeout messages: elapsed since spawn, plus any pre-spawn stall. */
+function timeoutDetail(calledAt: number, spawnedAt: number): string {
+  const now = Date.now();
+  let s = `, ${now - spawnedAt}ms since spawn`;
+  const stall = spawnedAt - calledAt;
+  if (stall >= STALL_REPORT_MS) {
+    s += ` (spawned ${stall}ms after the call — the host event loop stalled)`;
+  }
+  return s;
+}
+
 /**
  * Spawn one git process. Env policy (03 §2): terminal prompts disabled,
  * optional locks off, sync identity injected so commits work in repos with no
@@ -118,10 +132,22 @@ function runGit(args: string[], opts: RunOpts): Promise<RunResult> {
     let settled = false;
     let timedOut = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, opts.timeoutMs);
+    // The deadline is measured from the moment the child actually spawned,
+    // not from this call: `spawn` is delivered on the next tick, so a
+    // synchronous stall of the host's event loop between the call and the
+    // tick (e.g. a burst of forks from a large process) can no longer expire
+    // the timer before the child's `close` is even serviced — which used to
+    // report finished processes as "timed out".
+    const calledAt = Date.now();
+    let spawnedAt = calledAt;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    child.on("spawn", () => {
+      spawnedAt = Date.now();
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, opts.timeoutMs);
+    });
 
     child.stdout.on("data", (c: Buffer) => stdout.push(c));
     child.stderr.on("data", (c: Buffer) => stderr.push(c));
@@ -143,7 +169,11 @@ function runGit(args: string[], opts: RunOpts): Promise<RunResult> {
       clearTimeout(timer);
       if (timedOut) {
         reject(
-          new GitError("Timeout", `git ${args[0]} timed out after ${opts.timeoutMs}ms`),
+          new GitError(
+            "Timeout",
+            `git ${args[0]} timed out after ${opts.timeoutMs}ms` +
+              timeoutDetail(calledAt, spawnedAt),
+          ),
         );
         return;
       }
@@ -312,6 +342,43 @@ export class GitRepo {
     return r.stdout.toString("utf8").trim();
   }
 
+  /**
+   * Write many blobs through ONE `git fast-import` process; returns their
+   * OIDs in input order. One spawn regardless of count — every `spawn()`
+   * forks the host process, and a fork's cost grows with the host's RSS
+   * (17-45ms each at an ~1GB extension host), so a per-blob fan-out blocks
+   * the event loop for seconds on a large board. fast-import checks the
+   * object store first, so already-present blobs are not rewritten, an
+   * import that adds nothing leaves no pack behind, and small imports are
+   * loosened to plain loose objects (`fastimport.unpackLimit`).
+   *
+   * Stream: `blob` + `mark :i` + exact-byte-count `data` per input, then
+   * `get-mark :i` for each (fast-import prints the OID to stdout), then
+   * `done` (`--done` makes a truncated stream a hard error, never a partial
+   * success).
+   */
+  async writeBlobsBatch(contents: Buffer[]): Promise<string[]> {
+    if (contents.length === 0) return [];
+    const parts: Buffer[] = [];
+    contents.forEach((c, i) => {
+      parts.push(Buffer.from(`blob\nmark :${i + 1}\ndata ${c.length}\n`, "utf8"), c, Buffer.from("\n"));
+    });
+    for (let i = 1; i <= contents.length; i++) parts.push(Buffer.from(`get-mark :${i}\n`, "utf8"));
+    parts.push(Buffer.from("done\n", "utf8"));
+    const args = ["fast-import", "--quiet", "--done"];
+    const r = await this.local(args, Buffer.concat(parts));
+    if (r.code !== 0) GitRepo.fail(args, r);
+    const oids = r.stdout.toString("utf8").split("\n").filter(Boolean);
+    if (oids.length !== contents.length || !oids.every((o) => /^[0-9a-f]{40,64}$/.test(o))) {
+      throw new GitError(
+        "GitFailed",
+        `git fast-import returned ${oids.length} marks for ${contents.length} blobs`,
+        r.stderr,
+      );
+    }
+    return oids;
+  }
+
   /** `git mktree` from entry lines; mktree normalizes entry order itself. */
   async mkTree(entries: TreeEntry[]): Promise<string> {
     const lines = entries.map((e) => `${e.mode} ${e.type} ${e.oid}\t${e.path}`).join("\n");
@@ -353,9 +420,14 @@ export class GitRepo {
     }
   }
 
-  /** Recursive listing of the tree at `tip` (`ls-tree -r -z`). */
+  /**
+   * Recursive listing of the tree at `tip` (`ls-tree -r -t -z`). `-t` also
+   * emits the intermediate `tree` entries so callers can reuse an unchanged
+   * subtree's OID instead of re-running `mktree` for it; blob-only consumers
+   * filter on `type`.
+   */
   async readTree(tip: string): Promise<TreeEntry[]> {
-    const args = ["ls-tree", "-r", "-z", tip];
+    const args = ["ls-tree", "-r", "-t", "-z", tip];
     const r = await this.local(args);
     if (r.code !== 0) GitRepo.fail(args, r);
     const out: TreeEntry[] = [];
@@ -415,10 +487,18 @@ export class GitRepo {
         stdio: ["ignore", "pipe", "pipe"],
       });
       let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGKILL");
-      }, this.localMs);
+      let settled = false;
+      // Same spawn-anchored deadline as `runGit` — see the comment there.
+      const calledAt = Date.now();
+      let spawnedAt = calledAt;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      child.on("spawn", () => {
+        spawnedAt = Date.now();
+        timer = setTimeout(() => {
+          timedOut = true;
+          child.kill("SIGKILL");
+        }, this.localMs);
+      });
       const stderr: Buffer[] = [];
       child.stderr.on("data", (c: Buffer) => stderr.push(c));
 
@@ -439,6 +519,8 @@ export class GitRepo {
         child.kill("SIGKILL");
       });
       child.on("error", async (e: NodeJS.ErrnoException) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         await discardPart();
         reject(
@@ -448,6 +530,8 @@ export class GitRepo {
         );
       });
       child.on("close", async (code) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         try {
           if (!out.closed) {
@@ -464,7 +548,11 @@ export class GitRepo {
         if (timedOut) {
           await discardPart();
           return reject(
-            new GitError("Timeout", `git cat-file blob ${oid} timed out after ${this.localMs}ms`),
+            new GitError(
+              "Timeout",
+              `git cat-file blob ${oid} timed out after ${this.localMs}ms` +
+                timeoutDetail(calledAt, spawnedAt),
+            ),
           );
         }
         if (code !== 0) {

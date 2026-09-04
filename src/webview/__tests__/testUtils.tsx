@@ -8,7 +8,7 @@
 //      by dispatching synthetic `{type:"init"}` host messages.
 //   4. `flushAsync` — wait one microtask + paint for React to commit.
 
-import type { Issue, IssueType, Priority, Settings, Status, HostToWebview } from "../../types";
+import type { Issue, IssueRow, IssueType, Priority, Settings, Status, HostToWebview } from "../../types";
 import { startMessageBridge } from "../messaging";
 import { act } from "@testing-library/react";
 import { makeIssueFactory } from "../../testSupport";
@@ -96,6 +96,18 @@ export function pushInit(issues: Issue[], settings: Settings = defaultSettings):
 export function pushIssues(issues: Issue[]): void {
   act(() => {
     dispatchHostRaw({ type: "issues", issues });
+  });
+}
+
+export function pushIssuesDelta(upserted: IssueRow[], removed: string[] = []): void {
+  act(() => {
+    dispatchHostRaw({ type: "issuesDelta", upserted, removed });
+  });
+}
+
+export function pushIssueDetail(issue: Issue): void {
+  act(() => {
+    dispatchHostRaw({ type: "issueDetail", issue });
   });
 }
 
