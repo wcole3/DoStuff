@@ -6,6 +6,7 @@
 // the real `registerMcpTools`, field caps from FIELD_LIMITS, and the script is
 // exercised end-to-end against a live HTTP server.
 
+import * as net from "node:net";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -436,4 +437,45 @@ describe("agent skill: SSE unwrapping", async () => {
       fake.close();
     }
   });
+});
+
+// ----- transport failures name the likely cause ------------------------------
+// One "Cannot reach" message for every curl failure sent people chasing a
+// stale registry entry when the host was merely busy (a blocked extension
+// event loop). The exit code tells them apart: 7 refused, 28 timed out,
+// 52 empty reply.
+describe("agent skill: transport failure messages", () => {
+  test("a closed port says nothing is listening (stale registry / disabled)", async () => {
+    const closed = await new Promise<number>((resolve) => {
+      const srv = net.createServer();
+      srv.listen(0, "127.0.0.1", () => {
+        const p = (srv.address() as net.AddressInfo).port;
+        srv.close(() => resolve(p));
+      });
+    });
+    const r = await runScript(["call", "list_issues", "{}"], { env: { DOSTUFF_PORT: String(closed) } });
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toMatch(/nothing is listening/i);
+    expect(r.stderr).not.toMatch(/busy|timed out/i);
+  });
+
+  test("a port that accepts but never answers says the host is busy, not unreachable", async () => {
+    const sockets: net.Socket[] = [];
+    const srv = net.createServer((s) => void sockets.push(s));
+    const port = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as net.AddressInfo).port)),
+    );
+    try {
+      const r = await runScript(["call", "list_issues", "{}"], {
+        env: { DOSTUFF_PORT: String(port), DOSTUFF_TIMEOUT: "2" },
+      });
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toMatch(/did not answer within 2s/i);
+      expect(r.stderr).toMatch(/busy/i);
+      expect(r.stderr).not.toMatch(/stale registry/i);
+    } finally {
+      for (const s of sockets) s.destroy();
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  }, 20_000);
 });

@@ -110,12 +110,26 @@ post() { # $1=JSON-RPC body
     line=$(discover) || exit $?
     port=${line%%"$(printf '\t')"*}
   fi
-  resp=$(curl -sS --max-time 15 -X POST "http://127.0.0.1:${port}/mcp" \
+  timeout=${DOSTUFF_TIMEOUT:-15}
+  resp=$(curl -sS --max-time "$timeout" -X POST "http://127.0.0.1:${port}/mcp" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
-    --data-binary "$1" 2>&1) || \
-    die "Cannot reach DoStuff at 127.0.0.1:${port} — extension not running, dostuff.mcp.enabled off, or a stale registry entry. Re-run discover. ($resp)"
+    --data-binary "$1" 2>&1)
+  rc=$?
+  [ "$rc" -eq 0 ] || transport_die "$port" "$rc" "$timeout" "$resp"
   unwrap "$resp"
+}
+
+# curl failed: say what the exit code actually means. A blanket "cannot
+# reach" sent people after stale registry entries when the extension host
+# was merely stalled (one blocked event loop can't answer HTTP either).
+transport_die() { # $1=port $2=curl exit code $3=timeout seconds $4=curl output
+  case "$2" in
+    7)  die "Nothing is listening at 127.0.0.1:$1 — extension not running, dostuff.mcp.enabled off, or a stale registry entry. Re-run discover. ($4)" ;;
+    28) die "DoStuff at 127.0.0.1:$1 did not answer within ${3}s — the extension host is busy (large sync or persist), not gone. Retry shortly; raise DOSTUFF_TIMEOUT if it recurs. ($4)" ;;
+    52) die "DoStuff at 127.0.0.1:$1 accepted the connection but sent an empty reply — the extension host was likely stalled and dropped it. Retry shortly. ($4)" ;;
+    *)  die "Cannot reach DoStuff at 127.0.0.1:$1 (curl exit $2). ($4)" ;;
+  esac
 }
 
 unwrap() { # SSE or plain-JSON HTTP body -> tool payload (raw JSON-RPC when jq is absent)
