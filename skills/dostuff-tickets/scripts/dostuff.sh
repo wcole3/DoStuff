@@ -111,13 +111,47 @@ post() { # $1=JSON-RPC body
     port=${line%%"$(printf '\t')"*}
   fi
   timeout=${DOSTUFF_TIMEOUT:-15}
-  resp=$(curl -sS --max-time "$timeout" -X POST "http://127.0.0.1:${port}/mcp" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    --data-binary "$1" 2>&1)
-  rc=$?
-  [ "$rc" -eq 0 ] || transport_die "$port" "$rc" "$timeout" "$resp"
-  unwrap "$resp"
+  attempts=${DOSTUFF_RETRIES:-3}
+  key=$(idem_key)
+  n=0; delay=1
+  while :; do
+    n=$((n + 1))
+    # One Idempotency-Key for every attempt of this call: the server replays
+    # the first result for a repeat, so a retried create never duplicates.
+    # curl appends the HTTP status as a final line; on failure the output is
+    # curl's own error text. Only sh, curl, sed and awk are assumed here.
+    out=$(curl -sS --max-time "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:${port}/mcp" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json, text/event-stream' \
+      -H "Idempotency-Key: $key" \
+      --data-binary "$1" 2>&1)
+    rc=$?
+    code=$(printf '%s\n' "$out" | sed -n '$p')
+    resp=$(printf '%s\n' "$out" | sed '$d')
+    if [ "$rc" -eq 0 ] && [ "$code" != "503" ] && [ "$code" != "429" ]; then
+      unwrap "$resp"
+      return
+    fi
+    # Retry only what a busy host produces: timeout, empty reply, 503/429.
+    case "$rc:$code" in
+      0:503 | 0:429 | 28:* | 52:*) retryable=1 ;;
+      *) retryable=0 ;;
+    esac
+    if [ "$retryable" -eq 0 ] || [ "$n" -ge "$attempts" ]; then
+      if [ "$rc" -eq 0 ]; then
+        die "DoStuff at 127.0.0.1:${port} is busy (HTTP $code after $n attempts) — writes are queued behind other agents. Retry shortly. ($resp)"
+      fi
+      transport_die "$port" "$rc" "$timeout" "$out (after $n attempts)"
+    fi
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+idem_key() { # a random token; the server scopes it per tool
+  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+  else awk 'BEGIN { srand(); for (i = 0; i < 4; i++) printf "%08x", int(rand() * 4294967296); print "" }'
+  fi
 }
 
 # curl failed: say what the exit code actually means. A blanket "cannot

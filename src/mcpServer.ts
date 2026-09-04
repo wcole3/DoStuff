@@ -1512,6 +1512,55 @@ export class DoStuffMcpServer {
       }
     }
 
+    // Read the body ourselves (streamed, capped) so mutating calls can be
+    // refused before the transport queues them, then hand the parsed body
+    // to the transport.
+    let parsedBody: unknown = undefined;
+    if (req.method === "POST") {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let tooLarge = false;
+      for await (const chunk of req) {
+        total += (chunk as Buffer).length;
+        if (total > MAX_BODY_BYTES) {
+          tooLarge = true;
+          break;
+        }
+        chunks.push(chunk as Buffer);
+      }
+      if (tooLarge) {
+        res.statusCode = 413;
+        res.end("Request body too large (max 1 MB)");
+        return;
+      }
+      const text = Buffer.concat(chunks).toString("utf8");
+      if (text.length > 0) {
+        try {
+          parsedBody = JSON.parse(text);
+        } catch {
+          res.statusCode = 400;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }));
+          return;
+        }
+      }
+      if (isMutatingRpc(parsedBody) && writeQueueDepth(this.store) >= MAX_PENDING_WRITES) {
+        // Backpressure: a bare-curl caller with a 15s budget would time out
+        // behind this queue anyway. Refuse early; the skill retries with backoff.
+        res.statusCode = 503;
+        res.setHeader("Retry-After", "1");
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: null,
+            error: { code: -32000, message: `DoStuff is busy: ${MAX_PENDING_WRITES} writes already queued. Retry shortly.` },
+          }),
+        );
+        return;
+      }
+    }
+
     const mcp = new McpServer(
       { name: "dostuff", version: "1.0.0" },
       {
@@ -1531,7 +1580,7 @@ export class DoStuffMcpServer {
 
     try {
       await mcp.connect(transport);
-      await transport.handleRequest(req, res);
+      await transport.handleRequest(req, res, parsedBody);
     } catch (e) {
       this.logger.error(`Transport error: ${e instanceof Error ? e.message : String(e)}`);
       if (!res.headersSent) {
@@ -1777,28 +1826,121 @@ export function registerMcpPrompts(mcp: McpServer, host: ToolHost = DEFAULT_TOOL
 // scale. Keyed per store (WeakMap) because the per-request McpServer means
 // `registerMcpTools` runs on every HTTP request.
 
+/**
+ * Mutating tool calls queued (not yet settled) beyond which a new mutating
+ * `tools/call` is refused with 503 + `Retry-After` instead of being queued.
+ * Skill callers are bare curl with a 15s budget: a queue deeper than this
+ * would time them out anyway, so refusing early turns a pile-up into a
+ * clean retry. Reads are never refused.
+ */
+export const MAX_PENDING_WRITES = 32;
+/** Idempotency replay window and cache bound. */
+const IDEMPOTENCY_TTL_MS = 10 * 60_000;
+const IDEMPOTENCY_MAX_ENTRIES = 500;
+
 class WriteQueue {
   private tail: Promise<unknown> = Promise.resolve();
+  /** Tasks accepted and not yet settled (includes the running one). */
+  pending = 0;
+  /** Idempotency-Key (scoped per tool) → in-flight or finished result. */
+  private readonly replays = new Map<string, { at: number; promise: Promise<unknown> }>();
 
-  run<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(task);
+  /**
+   * Serialize `task` behind every earlier write. With `key`, a repeat of the
+   * same key returns the first call's result (or joins it while it is still
+   * running) instead of running the task again — what makes a retried
+   * `create_ticket` safe. Rejections are not cached, so a retry after a
+   * genuine failure runs for real.
+   */
+  run<T>(task: () => Promise<T>, key?: string): Promise<T> {
+    if (key) {
+      this.sweep();
+      const hit = this.replays.get(key);
+      if (hit) return hit.promise as Promise<T>;
+    }
+    this.pending += 1;
+    const next = this.tail.then(task).finally(() => {
+      this.pending -= 1;
+    });
     // The queue must survive a rejected task; callers still see the rejection.
     this.tail = next.catch(() => undefined);
+    if (key) {
+      this.replays.set(key, { at: Date.now(), promise: next });
+      next.catch(() => this.replays.delete(key));
+      if (this.replays.size > IDEMPOTENCY_MAX_ENTRIES) {
+        const oldest = this.replays.keys().next().value;
+        if (oldest !== undefined) this.replays.delete(oldest);
+      }
+    }
     return next;
+  }
+
+  private sweep(): void {
+    const cutoff = Date.now() - IDEMPOTENCY_TTL_MS;
+    for (const [k, v] of this.replays) {
+      if (v.at < cutoff) this.replays.delete(k);
+      else break; // insertion-ordered: the rest are newer
+    }
   }
 }
 
 const WRITE_QUEUES = new WeakMap<IssueStore, WriteQueue>();
 
-/** Per-store mutation queue. Exposed for the headless entry point. */
-export function storeWriteQueue(store: IssueStore): <T>(task: () => Promise<T>) => Promise<T> {
+function queueFor(store: IssueStore): WriteQueue {
   let queue = WRITE_QUEUES.get(store);
   if (!queue) {
     queue = new WriteQueue();
     WRITE_QUEUES.set(store, queue);
   }
-  const q = queue;
-  return (task) => q.run(task);
+  return queue;
+}
+
+/** Per-store mutation queue. Exposed for the headless entry point. */
+export function storeWriteQueue(
+  store: IssueStore,
+): <T>(task: () => Promise<T>, idempotencyKey?: string) => Promise<T> {
+  const q = queueFor(store);
+  return (task, key) => q.run(task, key);
+}
+
+/** Mutations accepted and not yet settled for `store`. */
+export function writeQueueDepth(store: IssueStore): number {
+  return WRITE_QUEUES.get(store)?.pending ?? 0;
+}
+
+/** Tools that mutate — the ones the write queue serializes and backpressure gates. */
+export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
+  "create_ticket",
+  "update_ticket_status",
+  "update_ticket_progress",
+  "update_ticket_draft",
+  "update_ticket_description",
+  "request_ticket_close",
+  "request_ticket_complete",
+]);
+
+/** `Idempotency-Key` header of the HTTP request behind a tool call, scoped per tool. */
+function idemKey(extra: { requestInfo?: { headers: Record<string, unknown> } } | undefined, tool: string): string | undefined {
+  const raw = extra?.requestInfo?.headers?.["idempotency-key"];
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof v !== "string") return undefined;
+  const key = v.trim().slice(0, 200);
+  return key ? `${tool}:${key}` : undefined;
+}
+
+/**
+ * Does this JSON-RPC body (single or batch) contain a mutating `tools/call`?
+ * Decides whether write backpressure applies before the transport runs.
+ */
+export function isMutatingRpc(body: unknown): boolean {
+  const items = Array.isArray(body) ? body : [body];
+  return items.some(
+    (m) =>
+      !!m &&
+      typeof m === "object" &&
+      (m as { method?: unknown }).method === "tools/call" &&
+      MUTATING_TOOLS.has(String((m as { params?: { name?: unknown } }).params?.name)),
+  );
 }
 
 /**
@@ -1865,7 +2007,7 @@ export function registerMcpTools(
         "with a warning; links cannot be edited afterwards via the MCP server.",
       inputSchema: NEW_TICKET_INPUT,
     },
-    async (args) => serialized(() => runCreateTicket(store, args as CreateTicketInput, host)),
+    async (args, extra) => serialized(() => runCreateTicket(store, args as CreateTicketInput, host), idemKey(extra, "runCreateTicket")),
   );
 
   const liveCap = host.activeLaneCap();
@@ -1880,7 +2022,7 @@ export function registerMcpTools(
         `Each active lane is capped at ${liveCap} tickets; a move that would exceed the cap is rejected. Thinking is uncapped.`,
       inputSchema: STATUS_INPUT,
     },
-    async (args) => serialized(() => runUpdateTicketStatus(store, args as UpdateStatusInput, host)),
+    async (args, extra) => serialized(() => runUpdateTicketStatus(store, args as UpdateStatusInput, host), idemKey(extra, "runUpdateTicketStatus")),
   );
 
   mcp.registerTool(
@@ -1898,8 +2040,8 @@ export function registerMcpTools(
         "To reshape a draft's tags/links/task-list, use update_ticket_draft (Thinking only).",
       inputSchema: PROGRESS_INPUT,
     },
-    async (args) =>
-      serialized(() => runUpdateTicketProgress(store, args as UpdateProgressInput, host)),
+    async (args, extra) =>
+      serialized(() => runUpdateTicketProgress(store, args as UpdateProgressInput, host), idemKey(extra, "runUpdateTicketProgress")),
   );
 
   mcp.registerTool(
@@ -1914,7 +2056,7 @@ export function registerMcpTools(
         "Link kinds: blocks, child-of, relates-to (unknown targets are dropped).",
       inputSchema: DRAFT_INPUT,
     },
-    async (args) => serialized(() => runUpdateTicketDraft(store, args as UpdateDraftInput, host)),
+    async (args, extra) => serialized(() => runUpdateTicketDraft(store, args as UpdateDraftInput, host), idemKey(extra, "runUpdateTicketDraft")),
   );
 
   mcp.registerTool(
@@ -1926,8 +2068,8 @@ export function registerMcpTools(
         "changes (plus a record entry) — title, priority, type, and verifyCriteria stay locked.",
       inputSchema: DESCRIPTION_INPUT,
     },
-    async (args) =>
-      serialized(() => runUpdateTicketDescription(store, args as UpdateDescriptionInput, host)),
+    async (args, extra) =>
+      serialized(() => runUpdateTicketDescription(store, args as UpdateDescriptionInput, host), idemKey(extra, "runUpdateTicketDescription")),
   );
 
   mcp.registerTool(
@@ -1943,7 +2085,7 @@ export function registerMcpTools(
         "ticket left the board. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
-    async (args) => serialized(() => runRequestTicketClose(store, args as RequestCloseInput, host)),
+    async (args, extra) => serialized(() => runRequestTicketClose(store, args as RequestCloseInput, host), idemKey(extra, "runRequestTicketClose")),
   );
 
   mcp.registerTool(
@@ -1959,8 +2101,8 @@ export function registerMcpTools(
         "instead. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
-    async (args) =>
-      serialized(() => runRequestTicketComplete(store, args as RequestCloseInput, host)),
+    async (args, extra) =>
+      serialized(() => runRequestTicketComplete(store, args as RequestCloseInput, host), idemKey(extra, "runRequestTicketComplete")),
   );
 }
 

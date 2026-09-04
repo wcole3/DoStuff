@@ -6,6 +6,7 @@
 // the real `registerMcpTools`, field caps from FIELD_LIMITS, and the script is
 // exercised end-to-end against a live HTTP server.
 
+import * as http from "node:http";
 import * as net from "node:net";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
@@ -467,7 +468,7 @@ describe("agent skill: transport failure messages", () => {
     );
     try {
       const r = await runScript(["call", "list_issues", "{}"], {
-        env: { DOSTUFF_PORT: String(port), DOSTUFF_TIMEOUT: "2" },
+        env: { DOSTUFF_PORT: String(port), DOSTUFF_TIMEOUT: "2", DOSTUFF_RETRIES: "1" },
       });
       expect(r.code).not.toBe(0);
       expect(r.stderr).toMatch(/did not answer within 2s/i);
@@ -475,6 +476,59 @@ describe("agent skill: transport failure messages", () => {
       expect(r.stderr).not.toMatch(/stale registry/i);
     } finally {
       for (const s of sockets) s.destroy();
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  }, 20_000);
+});
+
+describe("agent skill: retries with a stable Idempotency-Key", () => {
+  test("a 503 is retried and both attempts carry the same key", async () => {
+    const seen: Array<{ key: string | undefined; accept: string | undefined }> = [];
+    const result = { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ ok: true }) }] } };
+    const srv = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        seen.push({ key: req.headers["idempotency-key"] as string | undefined, accept: req.headers.accept });
+        if (seen.length === 1) {
+          res.statusCode = 503;
+          res.setHeader("Retry-After", "1");
+          res.end("busy");
+          return;
+        }
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(result));
+      });
+    });
+    const port = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as net.AddressInfo).port)),
+    );
+    try {
+      const r = await runScript(["call", "list_issues", "{}"], { env: { DOSTUFF_PORT: String(port) } });
+      expect(r.code).toBe(0);
+      expect(JSON.parse(r.stdout)).toEqual({ ok: true });
+      expect(seen).toHaveLength(2);
+      expect(seen[0]!.key).toBeTruthy();
+      expect(seen[1]!.key).toBe(seen[0]!.key);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  }, 20_000);
+
+  test("a 503 that never clears fails with a busy message after the retry budget", async () => {
+    const srv = http.createServer((_req, res) => {
+      res.statusCode = 503;
+      res.end("busy");
+    });
+    const port = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as net.AddressInfo).port)),
+    );
+    try {
+      const r = await runScript(["call", "list_issues", "{}"], { env: { DOSTUFF_PORT: String(port), DOSTUFF_RETRIES: "2" } });
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toMatch(/busy/i);
+      expect(r.stderr).toMatch(/2 attempts/i);
+    } finally {
       await new Promise((resolve) => srv.close(resolve));
     }
   }, 20_000);
