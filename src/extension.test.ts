@@ -264,6 +264,8 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
 
     expect(next.pendingClose).toBe(prior.pendingClose);
     expect(next.pendingClose).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z", note: "keep" });
+    // No status move, so the auto-resolve never fires and no record is appended.
+    expect(next.record).toBe(prior.record);
     expect(next.title).toBe("edit");
   });
 
@@ -304,6 +306,102 @@ describe("mergeIssueUpdate — server-derived fields are ignored", () => {
     expect(next.commits).toBe(prior.commits);
     expect(next.commits).toEqual([{ sha: "abcdef0", at: "2026-07-01T00:00:00.000Z" }]);
     expect(next.title).toBe("edit");
+  });
+});
+
+describe("mergeIssueUpdate — pending request auto-resolution", () => {
+  const NOW = () => "2026-06-01T00:00:00.000Z";
+
+  test("Verification -> Complete consumes a pending completion request", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      resolvedAt: null,
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = ok(mergeIssueUpdate(prior, { status: "Complete" }, "user", NOW));
+
+    expect(next.status).toBe("Complete");
+    expect(next.pendingClose).toBeNull();
+    expect(next.resolvedAt).toBe(NOW());
+    expect(next.record.at(-1)).toEqual({
+      at: NOW(),
+      author: "user",
+      text: "Completion request approved by move to Complete",
+    });
+    expect(next.statusHistory.at(-1)).toEqual({ status: "Complete", at: NOW(), by: "user" });
+  });
+
+  test("move to Closed consumes a legacy target-less request (absent target means Closed)", () => {
+    const prior = makeIssue({
+      status: "Working",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "obe" },
+    });
+    const next = ok(mergeIssueUpdate(prior, { status: "Closed" }, "user", NOW));
+
+    expect(next.status).toBe("Closed");
+    expect(next.pendingClose).toBeNull();
+    expect(next.record.at(-1)).toMatchObject({
+      author: "user",
+      text: "Close request approved by move to Closed",
+    });
+    // Closed is "won't do" — acceptance is never stamped.
+    expect(next.resolvedAt).toBe(prior.resolvedAt);
+  });
+
+  test("mismatch: move to Closed leaves a pending completion request alone", () => {
+    const prior = makeIssue({
+      status: "Working",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = ok(mergeIssueUpdate(prior, { status: "Closed" }, "user", NOW));
+
+    expect(next.status).toBe("Closed");
+    expect(next.pendingClose).toBe(prior.pendingClose);
+    expect(next.record).toBe(prior.record);
+  });
+
+  test("mismatch: move to Complete leaves a pending close (OBE) request alone", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Closed" },
+    });
+    const next = ok(mergeIssueUpdate(prior, { status: "Complete" }, "user", NOW));
+
+    expect(next.status).toBe("Complete");
+    expect(next.pendingClose).toBe(prior.pendingClose);
+    expect(next.record).toBe(prior.record);
+  });
+
+  test("a non-terminal move never consumes a pending request", () => {
+    const prior = makeIssue({
+      status: "Thinking",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = ok(mergeIssueUpdate(prior, { status: "Working" }, "user", NOW));
+
+    expect(next.status).toBe("Working");
+    expect(next.pendingClose).toBe(prior.pendingClose);
+    expect(next.record).toBe(prior.record);
+  });
+
+  test("an agent-authored move never consumes a pending request", () => {
+    const prior = makeIssue({
+      status: "Verification",
+      pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
+    });
+    const next = ok(mergeIssueUpdate(prior, { status: "Complete" }, "agent", NOW));
+
+    expect(next.pendingClose).toBe(prior.pendingClose);
+    expect(next.record).toBe(prior.record);
+  });
+
+  test("nothing pending: a plain move to Complete appends no record entry", () => {
+    const prior = makeIssue({ status: "Verification", pendingClose: null });
+    const next = ok(mergeIssueUpdate(prior, { status: "Complete" }, "user", NOW));
+
+    expect(next.pendingClose).toBeNull();
+    expect(next.record).toBe(prior.record);
+    expect(next.resolvedAt).toBe(NOW());
   });
 });
 

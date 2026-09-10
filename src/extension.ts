@@ -15,7 +15,7 @@ import { BoardPanel } from "./boardProvider";
 import { GraphPanel } from "./graphProvider";
 import { buildDefaultWorkflowPrompt } from "./workflowPrompt";
 import type { DoStuffMcpServer } from "./mcpServer";
-import {
+import { type IssueRow,
   ACTIVE_LANE_CAP,
   DS_ID_RE,
   MAX_ATTACHMENT_BYTES,
@@ -76,7 +76,9 @@ export function inferMimeType(filename: string): string {
  * Server-derived fields (`id`, `number`, `createdAt`, `record`, `statusHistory`,
  * `resolvedAt`, `pendingClose`, `guid`, `updatedAt`, `commits`) are NEVER copied
  * from `incoming` — they are reconstructed from `prior` plus this function's own
- * bookkeeping (`updatedAt` and per-task `tasks[].updatedAt` are then re-stamped
+ * bookkeeping (which, on a human status move into the terminal state a pending
+ * agent request already asked for, clears `pendingClose` and appends one derived
+ * `record` entry — see the auto-resolve block below) (`updatedAt` and per-task `tasks[].updatedAt` are then re-stamped
  * by `IssueStore.upsert`, which discards any smuggled task stamps by diffing
  * against `prior`). The webview can lie about any of those and we'll ignore it.
  *
@@ -161,6 +163,29 @@ export function mergeIssueUpdate(
       next.resolvedAt = ts;
     } else if (prior.status === "Complete") {
       next.resolvedAt = null;
+    }
+
+    // A human move into the terminal state an agent already asked for IS the
+    // verdict — consume the pending request here instead of leaving it dangling
+    // in the "Awaiting decision" filter for the user to resolve later. Mismatched
+    // targets (moved to Complete while a Closed/OBE request is pending, or vice
+    // versa) are deliberately left alone: the two flows mean different things, so
+    // that verdict stays explicit. `effectiveCloseTarget` is the single home for
+    // the "absent target means Closed" rule.
+    if (
+      by === "user" &&
+      prior.pendingClose &&
+      (next.status === "Complete" || next.status === "Closed") &&
+      effectiveCloseTarget(prior.pendingClose) === next.status
+    ) {
+      const label = next.status === "Complete" ? "Completion" : "Close";
+      next.pendingClose = null;
+      // Wording is deliberately distinct from `resolveCloseRequest`'s so the
+      // record shows which route resolved the request.
+      next.record = [
+        ...prior.record,
+        { at: ts, author: "user", text: `${label} request approved by move to ${next.status}` },
+      ];
     }
   }
 
@@ -306,8 +331,12 @@ export function activeLaneOverflow(set: Issue[], cap = ACTIVE_LANE_CAP): Array<{
   return out;
 }
 
+/** The live store, for `deactivate()` to flush. */
+let activeStore: IssueStore | null = null;
+
 export function activate(context: vscode.ExtensionContext) {
   const store = new IssueStore(context);
+  activeStore = store;
   // Hydrate the store in the background. The webview shows its "Loading…"
   // state until the first store.onChange fires; awaiting here would gate
   // every other activation step on disk I/O for ticket files.
@@ -323,7 +352,9 @@ export function activate(context: vscode.ExtensionContext) {
    *      fields (see {@link mergeIssueUpdate}). Server-derived fields like
    *      `statusHistory`, `resolvedAt`, `id`, `number`, `createdAt`, `record`,
    *      `pendingClose` are never trusted from the webview payload (an agent
-   *      close request is set via MCP and cleared only by {@link resolveClose}).
+   *      close request is set via MCP and cleared only by {@link resolveClose}
+   *      or, when the human's own move lands on the state the request asked
+   *      for, by the auto-resolve in {@link mergeIssueUpdate}).
    *   2. Enforcing the active-lane cap (Planned/Working/Verification ≤ 6).
    *   3. Note: the UI is allowed to move a ticket out of "Complete" (humans can
    *      correct mis-clicks). The MCP layer enforces a stricter contract.
@@ -341,7 +372,7 @@ export function activate(context: vscode.ExtensionContext) {
     GraphPanel.broadcast(store.list());
   };
 
-  const applyIssueUpdate = async (incoming: Issue): Promise<void> => {
+  const applyIssueUpdate = async (incoming: IssueRow): Promise<void> => {
     const prior = store.get(incoming.id);
     if (!prior) {
       vscode.window.showWarningMessage(`DoStuff: No ticket with id ${incoming.id}.`);
@@ -1173,7 +1204,13 @@ export function activate(context: vscode.ExtensionContext) {
   reconcileSync();
 }
 
-export function deactivate() {}
+/**
+ * VSCode awaits the returned promise (bounded), so the write-behind persist
+ * window (`persistDelayMs`) never loses an edit on a normal window close.
+ */
+export function deactivate(): Promise<void> | undefined {
+  return activeStore?.flush();
+}
 
 // Re-export the lane cap for tests / consumers that want the constant.
 export { ACTIVE_LANE_CAP };

@@ -14,7 +14,7 @@ import {
   PRIORITIES,
   TYPES,
   canMoveToActiveLane,
-  type Issue,
+  type IssueRow,
   type IssueType,
   type Priority,
   type Status,
@@ -75,13 +75,13 @@ const PRI_ORDER: Record<string, number> = { Critical: 0, High: 1, Regular: 2, Lo
  * DataTransfer roundtrip. Mirrors the logic used by `setStatus` below.
  */
 export type DropDecision =
-  | { kind: "noop"; issue: Issue }
-  | { kind: "ok"; next: Issue }
+  | { kind: "noop"; issue: IssueRow }
+  | { kind: "ok"; next: IssueRow }
   | { kind: "blocked"; reason: string }
   | { kind: "missing" };
 
 export function decideDrop(
-  currentIssues: Issue[],
+  currentIssues: IssueRow[],
   id: string,
   targetStatus: Status,
   cap = ACTIVE_LANE_CAP,
@@ -103,7 +103,7 @@ export function decideDrop(
  * contained inside the webview where VSCode never disables it.
  */
 interface PointerDragState {
-  beginDrag: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  beginDrag: (e: ReactPointerEvent<HTMLDivElement>, issue: IssueRow) => void;
   dragId: string | null;
   ghost: { x: number; y: number; title: string } | null;
   hoverStatus: Status | null;
@@ -132,7 +132,7 @@ function usePointerDrag(
   useEffect(() => () => cleanupRef.current?.(), []);
 
   const beginDrag = useCallback(
-    (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => {
+    (e: ReactPointerEvent<HTMLDivElement>, issue: IssueRow) => {
       if (e.button !== 0) return;
       const start = { x: e.clientX, y: e.clientY };
       const issueId = issue.id;
@@ -197,9 +197,9 @@ function usePointerDrag(
 }
 
 interface BoardCardProps {
-  issue: Issue;
-  onOpen: (issue: Issue) => void;
-  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  issue: IssueRow;
+  onOpen: (issue: IssueRow) => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: IssueRow) => void;
   justDraggedRef: React.MutableRefObject<boolean>;
   dragging: boolean;
   onMove: (id: string, status: Status) => void;
@@ -322,15 +322,15 @@ const BoardCard = memo(function BoardCard({
 
 interface LaneProps {
   status: Status;
-  issues: Issue[];
+  issues: IssueRow[];
   cap: number;
   dragId: string | null;
   hoverStatus: Status | null;
   externalPickId: string | null;
-  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: IssueRow) => void;
   justDraggedRef: React.MutableRefObject<boolean>;
   onDropIssue: (id: string, status: Status) => void;
-  onOpen: (issue: Issue) => void;
+  onOpen: (issue: IssueRow) => void;
 }
 
 function Lane({
@@ -402,11 +402,11 @@ function Lane({
 }
 
 interface DrawerCardRowData {
-  issues: Issue[];
-  onOpen: (issue: Issue) => void;
+  issues: IssueRow[];
+  onOpen: (issue: IssueRow) => void;
   onPickToBoard?: (id: string) => void;
   status: Status;
-  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: IssueRow) => void;
   justDraggedRef: React.MutableRefObject<boolean>;
   onMove: (id: string, status: Status) => void;
 }
@@ -470,7 +470,7 @@ const DrawerCardRow = memo(function DrawerCardRow({
 
 interface DrawerProps {
   status: Status;
-  issues: Issue[];
+  issues: IssueRow[];
   side: "left" | "right";
   open: boolean;
   dragId: string | null;
@@ -478,9 +478,9 @@ interface DrawerProps {
   externalPickId: string | null;
   onToggle: () => void;
   onDropIssue: (id: string, status: Status) => void;
-  onOpen: (issue: Issue) => void;
+  onOpen: (issue: IssueRow) => void;
   onPickToBoard?: (id: string) => void;
-  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: Issue) => void;
+  onPointerDown: (e: ReactPointerEvent<HTMLDivElement>, issue: IssueRow) => void;
   justDraggedRef: React.MutableRefObject<boolean>;
 }
 
@@ -665,9 +665,9 @@ function Drawer({
 }
 
 interface FocusOverlayProps {
-  issue: Issue | null;
+  issue: IssueRow | null;
   onClose: () => void;
-  onResolveClose: (issue: Issue, verdict: "approve" | "deny") => void;
+  onResolveClose: (issue: IssueRow, verdict: "approve" | "deny") => void;
 }
 
 function FocusOverlay({ issue, onClose, onResolveClose }: FocusOverlayProps) {
@@ -762,29 +762,29 @@ export function Board() {
   );
 
   const { beginDrag, dragId, ghost, hoverStatus, justDraggedRef } = usePointerDrag(setStatus);
-  const onOpen = useCallback((issue: Issue) => setFocusId(issue.id), []);
+  const onOpen = useCallback((issue: IssueRow) => setFocusId(issue.id), []);
 
-  const sortLane = useCallback((status: Status, list: Issue[]): Issue[] => {
-    if (status === "Complete") {
-      return [...list].sort((a, b) => {
-        const ra = a.resolvedAt ? new Date(a.resolvedAt).getTime() : new Date(a.createdAt).getTime();
-        const rb = b.resolvedAt ? new Date(b.resolvedAt).getTime() : new Date(b.createdAt).getTime();
-        return rb - ra;
-      });
-    }
-    return [...list].sort((a, b) => {
-      const pa = PRI_ORDER[a.priority] ?? 99;
-      const pb = PRI_ORDER[b.priority] ?? 99;
-      if (pa !== pb) return pa - pb;
-      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-    });
+  // Keys are computed once per item, not per comparison (see sort.ts).
+  const sortLane = useCallback((status: Status, list: IssueRow[]): IssueRow[] => {
+    const keyed = list.map((i, index) => ({
+      i,
+      index,
+      when: Date.parse(status === "Complete" && i.resolvedAt ? i.resolvedAt : i.createdAt) || 0,
+      pri: PRI_ORDER[i.priority] ?? 99,
+    }));
+    keyed.sort((a, b) =>
+      status === "Complete"
+        ? b.when - a.when || a.index - b.index
+        : a.pri - b.pri || b.when - a.when || a.index - b.index,
+    );
+    return keyed.map((k) => k.i);
   }, []);
 
   const byStatus = useMemo(() => {
     // Closed tickets exist in the store but are never rendered on the board
     // (per the workflow rules: Closed lives only in the sidebar). The bucket
-    // is present to satisfy the Record<Status, Issue[]> shape.
-    const map: Record<Status, Issue[]> = {
+    // is present to satisfy the Record<Status, IssueRow[]> shape.
+    const map: Record<Status, IssueRow[]> = {
       Thinking: [],
       Planned: [],
       Working: [],
@@ -806,7 +806,7 @@ export function Board() {
   // sort order; falls back to the previous one when the resolved ticket was
   // last). An empty lane dismisses the overlay. Deny keeps focus put.
   const onResolveClose = useCallback(
-    (issue: Issue, verdict: "approve" | "deny") => {
+    (issue: IssueRow, verdict: "approve" | "deny") => {
       if (verdict !== "approve") return;
       const lane = byStatus[issue.status];
       const idx = lane.findIndex((i) => i.id === issue.id);

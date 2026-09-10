@@ -18,6 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { IssueStore } from "./storage";
 import {
+  MAX_PENDING_WRITES,
   runGetTicket,
   runListIssues,
   runCreateTicket,
@@ -2388,7 +2389,7 @@ async function rawRequest(
     body?: string;
     headers?: Record<string, string>;
   } = {},
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {
       Accept: "application/json, text/event-stream",
@@ -2413,7 +2414,7 @@ async function rawRequest(
         let buf = "";
         res.setEncoding("utf8");
         res.on("data", (c) => (buf += c));
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: buf }));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: buf, headers: res.headers }));
       },
     );
     req.on("error", reject);
@@ -3521,5 +3522,99 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     setMcpConfig({ "mcp.enabled": false });
     await server.reconcile();
     expect(server.status.running).toBe(false);
+  });
+});
+
+// ----- concurrency: idempotent replays and backpressure ---------------------
+// Skill callers are bare curl. Under a burst they retry on timeouts, so a
+// mutation must be safe to send twice (Idempotency-Key), and the server must
+// refuse early (503 + Retry-After) rather than queue a minute of writes.
+describe("concurrency: Idempotency-Key and write backpressure", () => {
+  let server: DoStuffMcpServer | null = null;
+  let port = 0;
+  let store: IssueStore;
+
+  async function post(
+    body: unknown,
+    headers: Record<string, string> = {},
+  ): Promise<{ status: number; retryAfter: string | null; json: { result?: unknown; error?: unknown } | null }> {
+    // node:http rather than fetch — happy-dom's fetch enforces same-origin.
+    const res = await rawRequest(port, { body: JSON.stringify(body), headers });
+    const text = res.body;
+    const sse = text.match(/data:\s*(\{[\s\S]*?\})\s*$/m);
+    let json: { result?: unknown; error?: unknown } | null = null;
+    try {
+      json = JSON.parse(sse ? sse[1]! : text);
+    } catch {
+      json = null;
+    }
+    const ra = res.headers["retry-after"];
+    return { status: res.status, retryAfter: Array.isArray(ra) ? ra[0] ?? null : ra ?? null, json };
+  }
+  const call = (name: string, args: Record<string, unknown>, headers?: Record<string, string>) =>
+    post({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }, headers);
+  const payloadOf = (r: { json: { result?: unknown } | null }) =>
+    JSON.parse(((r.json?.result as { content: Array<{ text: string }> }).content[0]!.text)) as Record<string, unknown>;
+
+  beforeEach(async () => {
+    store = await makeStore([]);
+    ({ server, port } = await bootServer(store));
+  });
+  afterEach(async () => {
+    await server?.stop();
+    server?.dispose();
+    server = null;
+  });
+
+  test("the same Idempotency-Key replays the first result instead of creating twice", async () => {
+    const key = "11111111-2222-3333-4444-555555555555";
+    const a = await call("create_ticket", { title: "Once", description: "d" }, { "Idempotency-Key": key });
+    const b = await call("create_ticket", { title: "Once", description: "d" }, { "Idempotency-Key": key });
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    expect(payloadOf(b).id).toBe(payloadOf(a).id);
+    expect(store.list()).toHaveLength(1);
+    const c = await call("create_ticket", { title: "Once", description: "d" }, { "Idempotency-Key": "another-key" });
+    expect(payloadOf(c).id).not.toBe(payloadOf(a).id);
+    expect(store.list()).toHaveLength(2);
+  });
+
+  test("keys are scoped per tool, and calls without a key are never deduplicated", async () => {
+    const key = "shared-key";
+    const created = await call("create_ticket", { title: "Scoped", description: "d" }, { "Idempotency-Key": key });
+    const id = payloadOf(created).id as string;
+    const moved = await call("update_ticket_status", { id, status: "Planned" }, { "Idempotency-Key": key });
+    expect(moved.status).toBe(200);
+    expect(payloadOf(moved).id).toBe(id);
+    expect(store.get(id)?.status).toBe("Planned"); // real work, not the create replay
+    await call("create_ticket", { title: "Dup", description: "d" });
+    await call("create_ticket", { title: "Dup", description: "d" });
+    expect(store.list().filter((i) => i.title === "Dup")).toHaveLength(2);
+  });
+
+  test("a deep write queue answers 503 + Retry-After early; reads still answer", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const origUpsert = store.upsert.bind(store);
+    store.upsert = async (issue: Issue, opts?: { preserveTimestamps?: boolean }) => {
+      await gate;
+      return origUpsert(issue, opts);
+    };
+    const burst = MAX_PENDING_WRITES + 8;
+    const inflight = Array.from({ length: burst }, (_, i) =>
+      call("create_ticket", { title: `burst ${i}`, description: "d" }),
+    );
+    // Give the burst time to reach the queue, then a read must still be served.
+    await new Promise((r) => setTimeout(r, 200));
+    const read = await call("list_issues", {});
+    expect(read.status).toBe(200);
+    release();
+    const results = await Promise.all(inflight);
+    const refused = results.filter((r) => r.status === 503);
+    const accepted = results.filter((r) => r.status === 200);
+    expect(refused.length).toBeGreaterThan(0);
+    expect(refused.every((r) => r.retryAfter !== null)).toBe(true);
+    expect(accepted.length).toBeLessThanOrEqual(MAX_PENDING_WRITES + 1);
+    expect(store.list()).toHaveLength(accepted.length);
   });
 });

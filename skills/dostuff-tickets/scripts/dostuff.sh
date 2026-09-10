@@ -110,12 +110,60 @@ post() { # $1=JSON-RPC body
     line=$(discover) || exit $?
     port=${line%%"$(printf '\t')"*}
   fi
-  resp=$(curl -sS --max-time 15 -X POST "http://127.0.0.1:${port}/mcp" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    --data-binary "$1" 2>&1) || \
-    die "Cannot reach DoStuff at 127.0.0.1:${port} — extension not running, dostuff.mcp.enabled off, or a stale registry entry. Re-run discover. ($resp)"
-  unwrap "$resp"
+  timeout=${DOSTUFF_TIMEOUT:-15}
+  attempts=${DOSTUFF_RETRIES:-3}
+  key=$(idem_key)
+  n=0; delay=1
+  while :; do
+    n=$((n + 1))
+    # One Idempotency-Key for every attempt of this call: the server replays
+    # the first result for a repeat, so a retried create never duplicates.
+    # curl appends the HTTP status as a final line; on failure the output is
+    # curl's own error text. Only sh, curl, sed and awk are assumed here.
+    out=$(curl -sS --max-time "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:${port}/mcp" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json, text/event-stream' \
+      -H "Idempotency-Key: $key" \
+      --data-binary "$1" 2>&1)
+    rc=$?
+    code=$(printf '%s\n' "$out" | sed -n '$p')
+    resp=$(printf '%s\n' "$out" | sed '$d')
+    if [ "$rc" -eq 0 ] && [ "$code" != "503" ] && [ "$code" != "429" ]; then
+      unwrap "$resp"
+      return
+    fi
+    # Retry only what a busy host produces: timeout, empty reply, 503/429.
+    case "$rc:$code" in
+      0:503 | 0:429 | 28:* | 52:*) retryable=1 ;;
+      *) retryable=0 ;;
+    esac
+    if [ "$retryable" -eq 0 ] || [ "$n" -ge "$attempts" ]; then
+      if [ "$rc" -eq 0 ]; then
+        die "DoStuff at 127.0.0.1:${port} is busy (HTTP $code after $n attempts) — writes are queued behind other agents. Retry shortly. ($resp)"
+      fi
+      transport_die "$port" "$rc" "$timeout" "$out (after $n attempts)"
+    fi
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+idem_key() { # a random token; the server scopes it per tool
+  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+  else awk 'BEGIN { srand(); for (i = 0; i < 4; i++) printf "%08x", int(rand() * 4294967296); print "" }'
+  fi
+}
+
+# curl failed: say what the exit code actually means. A blanket "cannot
+# reach" sent people after stale registry entries when the extension host
+# was merely stalled (one blocked event loop can't answer HTTP either).
+transport_die() { # $1=port $2=curl exit code $3=timeout seconds $4=curl output
+  case "$2" in
+    7)  die "Nothing is listening at 127.0.0.1:$1 — extension not running, dostuff.mcp.enabled off, or a stale registry entry. Re-run discover. ($4)" ;;
+    28) die "DoStuff at 127.0.0.1:$1 did not answer within ${3}s — the extension host is busy (large sync or persist), not gone. Retry shortly; raise DOSTUFF_TIMEOUT if it recurs. ($4)" ;;
+    52) die "DoStuff at 127.0.0.1:$1 accepted the connection but sent an empty reply — the extension host was likely stalled and dropped it. Retry shortly. ($4)" ;;
+    *)  die "Cannot reach DoStuff at 127.0.0.1:$1 (curl exit $2). ($4)" ;;
+  esac
 }
 
 unwrap() { # SSE or plain-JSON HTTP body -> tool payload (raw JSON-RPC when jq is absent)

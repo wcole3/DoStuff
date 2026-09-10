@@ -9,16 +9,19 @@ import { renderHook, cleanup, act } from "@testing-library/react";
 import {
   onHostMessage,
   postUpdateIssue,
+  useIssueDetail,
   useIssues,
   vscodeApi,
 } from "./messaging";
-import type { Issue } from "../types";
+import { toRow, type Issue } from "../types";
 import {
   dispatchHost,
   installVsCodeApi,
   makeIssue,
   pushInit,
+  pushIssueDetail,
   pushIssues,
+  pushIssuesDelta,
   resetCounter,
   restoreVsCodeApi,
   type FakeVsCodeApi,
@@ -114,5 +117,64 @@ describe("commitDetails bridge", () => {
     } finally {
       window.removeEventListener("dostuff:commitDetails", handler);
     }
+  });
+});
+
+describe("issuesDelta", () => {
+  test("upserts, replaces and removes rows without a full list", () => {
+    const a = makeIssue({ id: "DS-001", title: "a", status: "Planned" });
+    const b = makeIssue({ id: "DS-002", title: "b", status: "Planned" });
+    pushInit([a, b]);
+    const { result } = renderHook(() => useIssues());
+    pushIssuesDelta([toRow({ ...b, title: "b2" }), toRow(makeIssue({ id: "DS-003", title: "c" }))], ["DS-001"]);
+    expect(result.current.issues.map((i) => `${i.id}:${i.title}`).sort()).toEqual(["DS-002:b2", "DS-003:c"]);
+  });
+
+  test("untouched rows keep their identity across a delta", () => {
+    const a = makeIssue({ id: "DS-001", title: "a" });
+    const b = makeIssue({ id: "DS-002", title: "b" });
+    pushInit([a, b]);
+    const { result } = renderHook(() => useIssues());
+    const before = result.current.issues.find((i) => i.id === "DS-001");
+    pushIssuesDelta([toRow({ ...b, title: "b2" })]);
+    expect(result.current.issues.find((i) => i.id === "DS-001")).toBe(before);
+  });
+});
+
+describe("useIssueDetail", () => {
+  test("a row without the heavy fields triggers exactly one fetch, then resolves from issueDetail", () => {
+    const full = makeIssue({ id: "DS-001", title: "a", record: [{ at: "2026-01-01T00:00:00.000Z", author: "user", text: "note" }] });
+    const row = toRow(full);
+    pushInit([row as Issue]);
+    const { result, rerender } = renderHook(() => useIssueDetail(row));
+    expect(result.current.loaded).toBe(false);
+    expect(result.current.issue.record).toEqual([]);
+    rerender();
+    expect(api.posted.filter((p) => (p as { type: string }).type === "fetchIssueDetail")).toEqual([
+      { type: "fetchIssueDetail", id: "DS-001" },
+    ]);
+    pushIssueDetail(full);
+    expect(result.current.loaded).toBe(true);
+    expect(result.current.issue.record).toHaveLength(1);
+  });
+
+  test("a delta for the open ticket keeps the stale detail visible and refetches", () => {
+    const full = makeIssue({ id: "DS-001", title: "a", record: [{ at: "2026-01-01T00:00:00.000Z", author: "user", text: "note" }] });
+    pushInit([toRow(full) as Issue]);
+    const { result } = renderHook(() => useIssueDetail(toRow(full)));
+    pushIssueDetail(full);
+    api.posted.length = 0;
+    pushIssuesDelta([toRow({ ...full, title: "a2" })]);
+    expect(result.current.issue.record).toHaveLength(1); // stale body stays until the refresh lands
+    expect(api.posted).toEqual([{ type: "fetchIssueDetail", id: "DS-001" }]);
+  });
+
+  test("a full Issue counts as loaded and never fetches", () => {
+    const full = makeIssue({ id: "DS-001", title: "a" });
+    pushInit([full]);
+    const { result, rerender } = renderHook(() => useIssueDetail(full));
+    rerender();
+    expect(result.current.loaded).toBe(true);
+    expect(api.posted).toEqual([]);
   });
 });

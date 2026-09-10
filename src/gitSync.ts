@@ -121,6 +121,25 @@ export interface GitSyncOptions {
 
 const TRACKING_REF = "refs/dostuff/remote";
 const CAS_RETRIES = 5;
+/** A tree write slower than this gets its own log line even on no-op cycles. */
+const SLOW_WRITE_MS = 1000;
+
+/** Attachment objects at one or more tips — see `attachmentOidsAt`. */
+interface AttachmentOids {
+  /** `attachments/<guid>/<attId>` → blob oid. */
+  blobs: Map<string, string>;
+  /** Per-guid subtree candidates with their exact `attId → oid` listing. */
+  subtrees: Array<{ guid: string; treeOid: string; files: Map<string, string> }>;
+}
+const EMPTY_ATTACHMENT_OIDS: AttachmentOids = { blobs: new Map(), subtrees: [] };
+function mergeAttachmentOids(a: AttachmentOids, b: AttachmentOids): AttachmentOids {
+  return { blobs: new Map([...a.blobs, ...b.blobs]), subtrees: [...a.subtrees, ...b.subtrees] };
+}
+/** One ticket's attachment files: reused (`oid`) or queued for the batch (`blobIndex`). */
+interface AttachmentPlan {
+  guid: string;
+  files: Array<{ attId: string; oid?: string; blobIndex?: number }>;
+}
 const PUSH_RETRIES = 3;
 /** Ceiling for the exponential failure backoff (10 minutes). */
 const RETRY_MAX_MS = 600_000;
@@ -153,6 +172,8 @@ export class GitSyncController {
   private syncQueued: Promise<SyncResult> | null = null;
   private applyingRemote = 0; // echo suppression counter
   private lastSeenTip: string | null = null;
+  /** Human summary of the most recent `writeState`, for the commit log line. */
+  private lastWriteSummary = "";
   private warnedOverflow = false;
   private started = false;
 
@@ -437,32 +458,60 @@ export class GitSyncController {
   }
 
   /** path (`attachments/<guid>/<attId>`) → blob oid map at a tip. */
-  private async attachmentOidsAt(tip: string | null): Promise<Map<string, string>> {
-    const out = new Map<string, string>();
+  /**
+   * Attachment objects reachable from a tip: every blob by tree path
+   * (`attachments/<guid>/<attId>` → oid) plus each per-guid subtree with its
+   * exact file listing, so an unchanged subtree can be reused verbatim. Two
+   * tips' results are merged by `mergeAttachmentOids` (blobs union, subtree
+   * candidates concatenated — a candidate is only ever reused on an exact
+   * listing match, so mixing tips is safe).
+   */
+  private async attachmentOidsAt(tip: string | null): Promise<AttachmentOids> {
+    const out: AttachmentOids = { blobs: new Map(), subtrees: [] };
     if (!tip || !this.repo) return out;
+    const filesByGuid = new Map<string, Map<string, string>>();
+    const treeByGuid = new Map<string, string>();
     for (const e of await this.entriesAt(tip)) {
-      if (e.type === "blob" && e.path.startsWith("attachments/")) out.set(e.path, e.oid);
+      if (!e.path.startsWith("attachments/")) continue;
+      const rest = e.path.slice("attachments/".length);
+      const slash = rest.indexOf("/");
+      if (e.type === "blob" && slash > 0) {
+        out.blobs.set(e.path, e.oid);
+        const guid = rest.slice(0, slash);
+        let files = filesByGuid.get(guid);
+        if (!files) filesByGuid.set(guid, (files = new Map()));
+        files.set(rest.slice(slash + 1), e.oid);
+      } else if (e.type === "tree" && slash < 0) {
+        treeByGuid.set(rest, e.oid);
+      }
+    }
+    for (const [guid, treeOid] of treeByGuid) {
+      out.subtrees.push({ guid, treeOid, files: filesByGuid.get(guid) ?? new Map() });
     }
     return out;
   }
 
   /**
-   * Attachment-bytes tree entries (05-attachments §2): skip entirely when
-   * disabled; over-cap files sync metadata only (logged — no silent caps);
-   * previously-committed blobs reuse their OID without touching the file
-   * (attachments are immutable per id), keeping commits O(changed bytes);
-   * a missing local file never fails the commit.
+   * Attachment-bytes tree entries (05-attachments §2), planned before the
+   * blob batch and resolved after it: skip entirely when disabled; over-cap
+   * files sync metadata only (logged — no silent caps); previously-committed
+   * blobs reuse their OID without touching the file (attachments are
+   * immutable per id), keeping commits O(changed bytes); a missing local
+   * file never fails the commit. `enqueue` registers bytes for the single
+   * fast-import and returns their index in the batch. Memory note: every
+   * *new* attachment's bytes are held until the batch runs — bounded by
+   * `maxAttachmentSyncBytes` × new attachments this cycle.
    */
-  private async buildAttachmentEntries(
+  private async planAttachmentEntries(
     sortedTickets: Array<[string, WireTicket]>,
-    prevOids: Map<string, string>,
-  ): Promise<TreeEntry[]> {
+    prev: AttachmentOids,
+    enqueue: (bytes: Buffer) => number,
+  ): Promise<AttachmentPlan[]> {
     if (this.opts.syncAttachments === false) return [];
-    const repo = this.repo!;
     const cap = this.opts.maxAttachmentSyncBytes ?? 5 * 1024 * 1024;
-    const perGuid: TreeEntry[] = [];
+    const plan: AttachmentPlan[] = [];
     for (const [guid, t] of sortedTickets) {
-      const files: TreeEntry[] = [];
+      const files: AttachmentPlan["files"] = [];
       for (const att of t.attachments) {
         if (att.sizeBytes > cap) {
           this.store.appendLog(
@@ -470,70 +519,103 @@ export class GitSyncController {
           );
           continue;
         }
-        const treePath = `attachments/${guid}/${att.id}`;
-        const reused = prevOids.get(treePath);
+        const reused = prev.blobs.get(`attachments/${guid}/${att.id}`);
         if (reused) {
-          files.push({ mode: "100644", type: "blob", oid: reused, path: att.id });
+          files.push({ attId: att.id, oid: reused });
           continue;
         }
         try {
           const bytes = await this.store.readAttachment(t.id, att.id);
-          files.push({
-            mode: "100644",
-            type: "blob",
-            oid: await repo.hashObjectStdin(Buffer.from(bytes)),
-            path: att.id,
-          });
+          files.push({ attId: att.id, blobIndex: enqueue(Buffer.from(bytes)) });
         } catch {
           this.store.appendLog(
             `Sync: attachment file missing for ${t.id}/${att.id} — metadata only.`,
           );
         }
       }
-      if (files.length) {
-        perGuid.push({ mode: "040000", type: "tree", oid: await repo.mkTree(files), path: guid });
-      }
+      if (files.length) plan.push({ guid, files });
     }
-    return perGuid;
+    return plan;
   }
 
-  private async writeState(state: SyncState, prevAttachmentOids?: Map<string, string>): Promise<string> {
+  /** Resolve a plan against the batch OIDs; reuse an identical prior subtree. */
+  private async buildAttachmentTrees(
+    plan: AttachmentPlan[],
+    oids: string[],
+    prev: AttachmentOids,
+  ): Promise<TreeEntry[]> {
     const repo = this.repo!;
+    const out: TreeEntry[] = [];
+    for (const { guid, files } of plan) {
+      const resolved = files.map((f) => ({
+        attId: f.attId,
+        oid: f.oid ?? oids[f.blobIndex!]!,
+      }));
+      const same = prev.subtrees.find(
+        (c) =>
+          c.guid === guid &&
+          c.files.size === resolved.length &&
+          resolved.every((f) => c.files.get(f.attId) === f.oid),
+      );
+      const oid =
+        same?.treeOid ??
+        (await repo.mkTree(
+          resolved.map((f) => ({ mode: "100644", type: "blob", oid: f.oid, path: f.attId })),
+        ));
+      out.push({ mode: "040000", type: "tree", oid, path: guid });
+    }
+    return out;
+  }
+
+  /**
+   * Materialize `state` as a git tree and return the root tree OID. Every
+   * blob (meta, tickets, tombstones, new attachment bytes) goes through ONE
+   * `git fast-import` — never one spawn per object. Each `spawn()` forks the
+   * host process, and a fork costs more the larger the host's RSS is
+   * (17-45ms at an ~1GB extension host), so a per-ticket fan-out blocked the
+   * event loop for 10-30s on a 650-ticket board and made every finished
+   * process look like a 15s timeout. Byte-deterministic: the same state
+   * yields the same root OID, which `commitLocalOp` relies on for no-op
+   * detection.
+   */
+  private async writeState(state: SyncState, prev: AttachmentOids = EMPTY_ATTACHMENT_OIDS): Promise<string> {
+    const repo = this.repo!;
+    const started = Date.now();
     const byKey = ([a]: [string, unknown], [b]: [string, unknown]) => (a < b ? -1 : 1);
     const sortedTickets = [...state.tickets.entries()].sort(byKey);
     const sortedTombs = [...state.tombstones.entries()].sort(byKey);
 
-    // Every blob hash is independent — run them (and the attachment-subtree
-    // build) concurrently instead of one spawn-await per object. Loose-object
-    // writes are atomic, so concurrent `hash-object -w` is safe.
+    // Phase 1: collect every blob in a deterministic order.
+    const blobs: Buffer[] = [];
+    const enqueue = (b: Buffer): number => blobs.push(b) - 1;
+    const metaIndex = enqueue(Buffer.from(canonicalJson({ formatVersion: FORMAT_VERSION }), "utf8"));
+    const ticketIndex = sortedTickets.map(([, t]) => enqueue(Buffer.from(canonicalJson(t), "utf8")));
+    const tombIndex = sortedTombs.map(([, t]) => enqueue(Buffer.from(canonicalJson(t), "utf8")));
+    const attPlan = await this.planAttachmentEntries(sortedTickets, prev, enqueue);
+    const attachmentFiles = attPlan.reduce((n, p) => n + p.files.length, 0);
+
+    // Phase 2: one process writes them all.
+    const oids = await repo.writeBlobsBatch(blobs);
+
+    // Phase 3: trees.
     const blobEntry = (guid: string, oid: string): TreeEntry => ({
       mode: "100644",
       type: "blob",
       oid,
       path: `${guid}.json`,
     });
-    const [metaOid, ticketOids, tombOids, attEntries] = await Promise.all([
-      repo.hashObjectStdin(Buffer.from(canonicalJson({ formatVersion: FORMAT_VERSION }), "utf8")),
-      Promise.all(
-        sortedTickets.map(([, t]) => repo.hashObjectStdin(Buffer.from(canonicalJson(t), "utf8"))),
-      ),
-      Promise.all(
-        sortedTombs.map(([, t]) => repo.hashObjectStdin(Buffer.from(canonicalJson(t), "utf8"))),
-      ),
-      this.buildAttachmentEntries(sortedTickets, prevAttachmentOids ?? new Map()),
-    ]);
-
     const rootEntries: TreeEntry[] = [
-      { mode: "100644", type: "blob", oid: metaOid, path: "meta.json" },
+      { mode: "100644", type: "blob", oid: oids[metaIndex]!, path: "meta.json" },
     ];
     if (sortedTickets.length) {
-      const tree = await repo.mkTree(sortedTickets.map(([guid], i) => blobEntry(guid, ticketOids[i]!)));
+      const tree = await repo.mkTree(sortedTickets.map(([guid], i) => blobEntry(guid, oids[ticketIndex[i]!]!)));
       rootEntries.push({ mode: "040000", type: "tree", oid: tree, path: "tickets" });
     }
     if (sortedTombs.length) {
-      const tree = await repo.mkTree(sortedTombs.map(([guid], i) => blobEntry(guid, tombOids[i]!)));
+      const tree = await repo.mkTree(sortedTombs.map(([guid], i) => blobEntry(guid, oids[tombIndex[i]!]!)));
       rootEntries.push({ mode: "040000", type: "tree", oid: tree, path: "tombstones" });
     }
+    const attEntries = await this.buildAttachmentTrees(attPlan, oids, prev);
     if (attEntries.length) {
       rootEntries.push({
         mode: "040000",
@@ -542,7 +624,11 @@ export class GitSyncController {
         path: "attachments",
       });
     }
-    return repo.mkTree(rootEntries);
+    const root = await repo.mkTree(rootEntries);
+    const ms = Date.now() - started;
+    this.lastWriteSummary = `${blobs.length} blobs via fast-import in ${ms}ms (${sortedTickets.length} tickets, ${sortedTombs.length} tombstones, ${attachmentFiles} attachment files)`;
+    if (ms > SLOW_WRITE_MS) this.store.appendLog(`Sync: slow tree write — ${this.lastWriteSummary}`);
+    return root;
   }
 
   // ─── core ops (always run on the chain) ─────────────────────────────────
@@ -588,6 +674,7 @@ export class GitSyncController {
         throw e;
       }
       this.lastSeenTip = commit;
+      this.store.appendLog(`Sync: committed ${this.lastWriteSummary}`);
       // The commit may have folded in tip-side state we hadn't applied.
       await this.applyState(settled, commit);
       this.schedulePushFollowUp();
@@ -612,10 +699,10 @@ export class GitSyncController {
     const localState = localTip ? await this.readState(localTip) : this.buildLocalState();
     const merged = mergeStates(localState, await this.readState(remoteTip));
     const { state: settled } = renumber(merged);
-    const prevOids = new Map([
-      ...(await this.attachmentOidsAt(localTip)),
-      ...(await this.attachmentOidsAt(remoteTip)),
-    ]);
+    const prevOids = mergeAttachmentOids(
+      await this.attachmentOidsAt(localTip),
+      await this.attachmentOidsAt(remoteTip),
+    );
     const rootTree = await this.writeState(settled, prevOids);
     const commit = await repo.commitTree(
       rootTree,
@@ -965,7 +1052,7 @@ export class GitSyncController {
   private async restoreAttachments(state: SyncState, tip: string, attRootPath: string): Promise<void> {
     const repo = this.repo;
     if (!repo) return;
-    const oids = await this.attachmentOidsAt(tip);
+    const oids = (await this.attachmentOidsAt(tip)).blobs;
     if (oids.size === 0) return;
     for (const wire of state.tickets.values()) {
       if (wire.attachments.length === 0) continue;

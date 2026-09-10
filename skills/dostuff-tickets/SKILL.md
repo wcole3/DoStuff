@@ -27,7 +27,11 @@ sh <this-skill-dir>/scripts/dostuff.sh discover
 ```
 
 Prints `PORT<tab>WORKSPACE` for the instance matching your cwd. `DOSTUFF_PORT`
-env var short-circuits discovery. If the script is unavailable, do it
+env var short-circuits discovery; `DOSTUFF_TIMEOUT` (seconds, default 15)
+bounds each attempt and `DOSTUFF_RETRIES` (default 3) how many. Busy-host
+failures (timeout, 503) retry on their own with one `Idempotency-Key`, so a
+retried write never duplicates. A "busy" error after the budget means back
+off — don't re-discover. If the script is unavailable, do it
 manually: Read the registry — `$DOSTUFF_REGISTRY_PATH` if set, else
 `~/.config/dostuff/instances.json` (Linux/macOS) or
 `%APPDATA%/dostuff/instances.json` (Windows) — a JSON array of

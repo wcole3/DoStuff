@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { IssueStore } from "./storage";
 import { formatIssueId } from "./syncMerge";
 import { getWebviewHtml } from "./webviewHtml";
-import {
+import { type IssueRow,
   coerceLinks,
   coerceTags,
   isLinkKind,
@@ -19,6 +19,8 @@ import {
   type WebviewToHost,
 } from "./types";
 import { validateLinks } from "./types";
+import { changeToMessage, readSettings } from "./webviewProtocol";
+import { toRow } from "./types";
 
 /** The `createIssue` message's `partial` payload (webview → host). */
 export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>["partial"];
@@ -29,7 +31,7 @@ export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>
  * On rejection, the provider re-broadcasts the current truth so the webview
  * reverts whatever optimistic UI state it had applied.
  */
-export type ApplyIssueUpdate = (issue: Issue) => Promise<void>;
+export type ApplyIssueUpdate = (issue: IssueRow) => Promise<void>;
 
 /**
  * Host-supplied resolver for a ticket's commit anchors: reads the shas from
@@ -104,18 +106,6 @@ const NO_OP_ATTACHMENTS: AttachmentHandlers = {
 
 const ID_RE = /^DS-\d+$/;
 
-function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
-  const cfg = vscode.workspace.getConfiguration("dostuff");
-  const attachmentsDir = store.attachmentsDir();
-  return {
-    storagePath:    cfg.get<string>("storagePath", ".vscode/dostuff"),
-    autoSave:       cfg.get<boolean>("autoSave", true),
-    activeLaneCap:  cfg.get<number>("activeLaneCap", 6),
-    attachmentsBaseUri: attachmentsDir
-      ? webview.asWebviewUri(attachmentsDir).toString()
-      : null,
-  };
-}
 
 // ─── createIssue helpers (extracted so they're unit-testable without a webview) ─
 
@@ -254,7 +244,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   ) {
     this.output = vscode.window.createOutputChannel("DoStuff Webview");
     this.disposables.push(this.output);
-    this.disposables.push(store.onChange((issues) => this.broadcast(issues)));
+    this.disposables.push(store.onChange((change) => this.view?.webview.postMessage(changeToMessage(change))));
   }
 
   dispose(): void {
@@ -308,8 +298,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
   }
 
   /** Publish a fresh issue list to the webview. */
+  /** Publish the whole board (as rows) to the webview. */
   broadcast(issues: Issue[] = this.store.list()) {
-    this.view?.webview.postMessage({ type: "issues", issues });
+    this.view?.webview.postMessage({ type: "issues", issues: issues.map(toRow) });
   }
 
   // ─── Internals ──────────────────────────────────────────────────────────
@@ -320,7 +311,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         if (this.view) {
           this.view.webview.postMessage({
             type: "init",
-            issues: this.store.list(),
+            issues: this.store.list().map(toRow),
             settings: readSettings(this.view.webview, this.store),
           });
         }
@@ -366,13 +357,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider, vscode.Dispo
         }
         break;
       }
+      case "fetchIssueDetail": {
+        const full = this.store.get(msg.id);
+        if (full) this.view?.webview.postMessage({ type: "issueDetail", issue: full });
+        break;
+      }
       case "updateIssue": {
         const issue = (msg as { issue?: unknown }).issue;
-        if (!issue || typeof issue !== "object" || !ID_RE.test((issue as Issue).id ?? "")) {
+        if (!issue || typeof issue !== "object" || !ID_RE.test((issue as IssueRow).id ?? "")) {
           this.output.appendLine(`Rejected updateIssue: bad id (${JSON.stringify(issue)})`);
           break;
         }
-        await this.applyUpdate(issue as Issue);
+        await this.applyUpdate(issue as IssueRow);
         break;
       }
       case "deleteIssue": {

@@ -5,7 +5,7 @@
 import {
   INVERSE_LINK_KIND,
   type InverseLinkLabel,
-  type Issue,
+  type IssueRow,
   type LinkKind,
   type TicketLink,
 } from "../types";
@@ -27,7 +27,7 @@ export interface InboundLink {
  * `INVERSE_LINK_KIND`. Skips the target itself so a hypothetical self-link
  * (which `coerceLinks` already drops) never appears as inbound.
  */
-export function deriveInbound(targetId: string, allIssues: Issue[]): InboundLink[] {
+export function deriveInbound(targetId: string, allIssues: IssueRow[]): InboundLink[] {
   const out: InboundLink[] = [];
   for (const i of allIssues) {
     if (i.id === targetId) continue;
@@ -82,8 +82,8 @@ export interface GraphNode {
   id: string;
   number: number;
   title: string;
-  status: Issue["status"];
-  type: Issue["type"];
+  status: IssueRow["status"];
+  type: IssueRow["type"];
   tags: string[];
 }
 
@@ -108,7 +108,7 @@ export interface GraphModel {
  * already enforces this per source, but defending here keeps the graph layer
  * resilient to any future caller that bypasses the coercer.
  */
-export function buildGraphModel(allIssues: Issue[]): GraphModel {
+export function buildGraphModel(allIssues: IssueRow[]): GraphModel {
   const nodeIds = new Set<string>();
   const edges: GraphEdge[] = [];
   const seenEdges = new Set<string>();
@@ -205,10 +205,10 @@ export function visibleGraphNodeIds(
  */
 export function searchIssuesForLink(
   query: string,
-  allIssues: Issue[],
+  allIssues: IssueRow[],
   currentIssueId: string | undefined,
   alreadyLinkedIds: ReadonlySet<string>,
-): Issue[] {
+): IssueRow[] {
   const trimmed = query.trim();
   const numberMatch = /^#?(\d+)$/.exec(trimmed);
   const idMatch = /^DS-\d+$/i.exec(trimmed);
@@ -241,7 +241,7 @@ export const INVERSE_LINK_KIND_LABEL: Record<InverseLinkLabel, string> = {
 };
 
 /** Sort outbound links for stable rendering: group by kind, then by target number. */
-export function sortLinks(links: TicketLink[], byId: Map<string, Issue>): TicketLink[] {
+export function sortLinks(links: TicketLink[], byId: Map<string, IssueRow>): TicketLink[] {
   return [...links].sort((a, b) => {
     if (a.kind !== b.kind) return a.kind.localeCompare(b.kind);
     const an = byId.get(a.targetId)?.number ?? 0;

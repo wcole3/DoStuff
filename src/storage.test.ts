@@ -331,6 +331,7 @@ describe("IssueStore CRUD (globalState backed)", () => {
     await a.init();
     const issue = makeIssue({ id: "DS-077", number: 77, title: "persist me" });
     await a.upsert(issue);
+    await a.flush(); // write-behind: land the KV update before re-reading it
 
     // Spin up a brand-new store against the same context (same globalState
     // memento). Init should rehydrate the previously-upserted issue.
@@ -349,9 +350,9 @@ describe("IssueStore CRUD (globalState backed)", () => {
 
     let fired = false;
     let lastPayload: Issue[] | null = null;
-    const sub = store.onChange((issues) => {
+    const sub = store.onChange((change) => {
       fired = true;
-      lastPayload = issues;
+      lastPayload = change.issues;
     });
 
     await store.replaceAll([]);
@@ -366,7 +367,7 @@ describe("IssueStore CRUD (globalState backed)", () => {
     const store = new IssueStore(makeContext());
     await store.init();
     const events: number[] = [];
-    const sub = store.onChange((issues) => events.push(issues.length));
+    const sub = store.onChange((change) => events.push(change.issues.length));
 
     await store.upsert(makeIssue({ id: "DS-001" }));
     await store.upsert(makeIssue({ id: "DS-002" }));
@@ -505,7 +506,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
       tasks: [{ id: "t1", text: "first", done: false }],
     });
     await a.upsert(issue);
-    a.dispose();
+    await a.close();
 
     expect(vfs.get("/ws/.vscode/dostuff/dostuff.db")).toBeDefined();
 
@@ -518,7 +519,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     expect(loaded?.tasks).toEqual([
       { id: "t1", text: "first", done: false, updatedAt: expect.any(String) },
     ]);
-    b.dispose();
+    await b.close();
   });
 
   test("pendingClose round-trips across store instances and clears on delete-then-insert", async () => {
@@ -536,7 +537,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
         pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", note: "wrap up" },
       }),
     );
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
@@ -547,12 +548,12 @@ describe("IssueStore (SQLite-backed branch)", () => {
     });
     // Clear it — the child row should be deleted (delete-then-insert), not orphaned.
     await b.upsert({ ...b.get("DS-088")!, pendingClose: null });
-    b.dispose();
+    await b.close();
 
     const c = makeSqlStore(ctx);
     await c.init();
     expect(c.get("DS-088")?.pendingClose).toBeNull();
-    c.dispose();
+    await c.close();
   });
 
   test("pendingClose.target round-trips; a pre-target row loads with target absent (Closed meaning)", async () => {
@@ -570,7 +571,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
         pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z", target: "Complete" },
       }),
     );
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
@@ -587,14 +588,14 @@ describe("IssueStore (SQLite-backed branch)", () => {
       ...b.get("DS-090")!,
       pendingClose: { by: "agent", at: "2026-05-18T00:00:00.000Z" },
     });
-    b.dispose();
+    await b.close();
 
     const c = makeSqlStore(ctx);
     await c.init();
     const pc = c.get("DS-090")?.pendingClose;
     expect(pc).toEqual({ by: "agent", at: "2026-05-18T00:00:00.000Z" });
     expect(pc && "target" in pc).toBe(false);
-    c.dispose();
+    await c.close();
   });
 
   test("migrates pre-existing JSON tickets into the DB and moves them to legacy-json-backup/", async () => {
@@ -625,7 +626,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-002.json")).toBeDefined();
     expect(vfs.get("/ws/.vscode/dostuff/DS-001.json")).toBeUndefined();
     expect(vfs.get("/ws/.vscode/dostuff/DS-002.json")).toBeUndefined();
-    store.dispose();
+    await store.close();
   });
 
   test("corrupt JSON file is logged and skipped during migration; valid files still imported", async () => {
@@ -645,7 +646,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     await store.init();
 
     expect(store.list().map((i) => i.id)).toEqual(["DS-001"]);
-    store.dispose();
+    await store.close();
   });
 
   test("idempotent: second init against an existing dostuff.db doesn't re-migrate", async () => {
@@ -658,7 +659,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     const ctx = makeContext();
     const a = makeSqlStore(ctx);
     await a.init();
-    a.dispose();
+    await a.close();
 
     // After first init: db exists, json file moved to backup.
     expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-001.json")).toBeDefined();
@@ -673,7 +674,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.list().map((i) => i.id)).toEqual(["DS-001"]);
-    b.dispose();
+    await b.close();
 
     const backupAfter = Array.from(vfs.keys()).filter((k) =>
       k.startsWith("/ws/.vscode/dostuff/legacy-json-backup/")
@@ -710,14 +711,14 @@ describe("IssueStore (SQLite-backed branch)", () => {
     await a.upsert(other);
 
     await a.remove("DS-001");
-    a.dispose();
+    await a.close();
 
     // Re-open and confirm DS-001 is fully gone but DS-002's "alpha" tag survives.
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-001")).toBeUndefined();
     expect(b.get("DS-002")?.tags).toEqual(["alpha"]);
-    b.dispose();
+    await b.close();
   });
 
   test("writes .gitignore on init when none present", async () => {
@@ -731,7 +732,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     const entry = vfs.get("/ws/.vscode/dostuff/.gitignore");
     expect(entry).toBeDefined();
     expect(new TextDecoder().decode(entry!.content)).toBe(GITIGNORE_CONTENT);
-    store.dispose();
+    await store.close();
   });
 
   test("does not overwrite a user-edited .gitignore", async () => {
@@ -747,7 +748,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
 
     const entry = vfs.get("/ws/.vscode/dostuff/.gitignore");
     expect(new TextDecoder().decode(entry!.content)).toBe(customBody);
-    store.dispose();
+    await store.close();
   });
 
   test("respects dostuff.writeStorageGitignore=false (no .gitignore written)", async () => {
@@ -768,7 +769,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
       await store.init();
       await store.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
       expect(vfs.has("/ws/.vscode/dostuff/.gitignore")).toBe(false);
-      store.dispose();
+      await store.close();
     } finally {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (vscode.workspace as any).getConfiguration = origGetConfig;
@@ -788,12 +789,12 @@ describe("IssueStore (SQLite-backed branch)", () => {
       tags: ["zebra", "alpha", "mango"],
     });
     await a.upsert(issue);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-300")?.tags).toEqual(["zebra", "alpha", "mango"]);
-    b.dispose();
+    await b.close();
   });
 
   test("statusHistory and record entries are returned in insertion order", async () => {
@@ -817,7 +818,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
       ],
     });
     await a.upsert(issue);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
@@ -827,7 +828,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     expect(loaded?.record.map((r) => r.text)).toEqual(["first", "second", "third"]);
     expect(loaded?.record[1]?.source).toBe("mcp");
     expect(loaded?.record[0]?.source).toBeUndefined();
-    b.dispose();
+    await b.close();
   });
 
   test("migration normalises legacy JSON missing optional fields", async () => {
@@ -858,7 +859,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     expect(loaded?.statusHistory).toEqual([]);
     expect(loaded?.record).toEqual([]);
     expect(loaded?.resolvedAt).toBeNull();
-    store.dispose();
+    await store.close();
   });
 
   test("init on an empty storage folder creates the DB and yields empty list", async () => {
@@ -874,7 +875,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
       k.startsWith("/ws/.vscode/dostuff/legacy-json-backup/"),
     );
     expect(hasBackup).toBe(false);
-    store.dispose();
+    await store.close();
   });
 
   test("replaceAll wipes prior issues and persists the new set", async () => {
@@ -887,13 +888,13 @@ describe("IssueStore (SQLite-backed branch)", () => {
     await a.upsert(makeIssue({ id: "DS-001", number: 1 }));
     await a.upsert(makeIssue({ id: "DS-002", number: 2 }));
     await a.replaceAll([makeIssue({ id: "DS-099", number: 99, title: "fresh" })]);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.list().map((i) => i.id)).toEqual(["DS-099"]);
     expect(b.get("DS-099")?.title).toBe("fresh");
-    b.dispose();
+    await b.close();
   });
 
   test("mergeAll combines prior + incoming and persists both", async () => {
@@ -908,14 +909,14 @@ describe("IssueStore (SQLite-backed branch)", () => {
       makeIssue({ id: "DS-001", number: 1, title: "overwritten" }),
       makeIssue({ id: "DS-002", number: 2, title: "added" }),
     ]);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-001")?.title).toBe("overwritten");
     expect(b.get("DS-002")?.title).toBe("added");
     expect(b.list()).toHaveLength(2);
-    b.dispose();
+    await b.close();
   });
 
   test("forward-compat: a DB with schema_meta.version newer than this build is not stamped down", async () => {
@@ -927,7 +928,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     const a = makeSqlStore(ctx);
     await a.init();
     await a.upsert(makeIssue({ id: "DS-001", number: 1 }));
-    a.dispose();
+    await a.close();
 
     // Tamper with the on-disk DB: bump schema_meta.version to "999".
     const dbBytes = vfs.get("/ws/.vscode/dostuff/dostuff.db")?.content;
@@ -943,7 +944,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
     // Reopen — should NOT downgrade.
     const b = makeSqlStore(ctx);
     await b.init();
-    b.dispose();
+    await b.close();
 
     const post = vfs.get("/ws/.vscode/dostuff/dostuff.db")?.content;
     const SQL2 = await initSqlJs({ wasmBinary: WASM_BINARY.buffer.slice(0) });
@@ -989,7 +990,7 @@ describe("IssueStore (SQLite-backed branch)", () => {
       expect(vfs.get("/ws/.vscode/dostuff/dostuff.db")).toBeDefined();
       expect(vfs.get("/ws/.vscode/dostuff/DS-001.json")).toBeDefined();
       expect(vfs.get("/ws/.vscode/dostuff/legacy-json-backup/DS-001.json")).toBeUndefined();
-      store.dispose();
+      await store.close();
     } finally {
       (vscode.workspace.fs as any).rename = origRename;
     }
@@ -1003,17 +1004,18 @@ describe("IssueStore (SQLite-backed branch)", () => {
     const writer = makeSqlStore(ctx);
     await writer.init();
     await writer.upsert(makeIssue({ id: "DS-001", number: 1, title: "first" }));
+    await writer.flush(); // write-behind: land it before the second store reads
 
     // A second store opens the same workspace, writes another issue, and
     // exports — simulating an external editor writing to dostuff.db.
     const sideWriter = makeSqlStore(ctx);
     await sideWriter.init();
     await sideWriter.upsert(makeIssue({ id: "DS-002", number: 2, title: "second" }));
-    sideWriter.dispose();
+    await sideWriter.close();
 
     await writer.reload();
     expect(writer.list().map((i) => i.id).sort()).toEqual(["DS-001", "DS-002"]);
-    writer.dispose();
+    await writer.close();
   });
 });
 
@@ -1040,7 +1042,7 @@ describe("IssueStore attachments", () => {
     const entry = vfs.get("/ws/.vscode/dostuff/attachments/DS-001/abc.png");
     expect(entry).toBeDefined();
     expect(Array.from(entry!.content)).toEqual([1, 2, 3, 4]);
-    store.dispose();
+    await store.close();
   });
 
   test("readAttachment round-trips the bytes", async () => {
@@ -1052,7 +1054,7 @@ describe("IssueStore attachments", () => {
     await store.writeAttachment("DS-002", "att2", ".pdf", bytes);
     const out = await store.readAttachment("DS-002", "att2");
     expect(Array.from(out)).toEqual([9, 8, 7]);
-    store.dispose();
+    await store.close();
   });
 
   test("readAttachment on a missing file rejects", async () => {
@@ -1061,7 +1063,7 @@ describe("IssueStore attachments", () => {
     const store = makeSqlStore(makeContext());
     await store.init();
     await expect(store.readAttachment("DS-001", "missing")).rejects.toThrow();
-    store.dispose();
+    await store.close();
   });
 
   test("remove(id) prunes the per-issue attachment folder", async () => {
@@ -1078,7 +1080,7 @@ describe("IssueStore attachments", () => {
 
     expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/att1.png")).toBeUndefined();
     expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/att2.pdf")).toBeUndefined();
-    store.dispose();
+    await store.close();
   });
 
   test("path traversal ids are refused by every attachment helper (logged no-op)", async () => {
@@ -1104,7 +1106,7 @@ describe("IssueStore attachments", () => {
     await store.deleteAttachmentFile("..", "legit");
     await store.remove("../../etc"); // routes into deleteIssueAttachments
     expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/legit.png")).toBeDefined();
-    store.dispose();
+    await store.close();
   });
 
   test("deleteAttachmentFile removes a single file without touching siblings", async () => {
@@ -1117,7 +1119,7 @@ describe("IssueStore attachments", () => {
     await store.deleteAttachmentFile("DS-001", "drop");
     expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/keep.png")).toBeDefined();
     expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-001/drop.pdf")).toBeUndefined();
-    store.dispose();
+    await store.close();
   });
 
   test("normalize() on a legacy issue without `attachments` returns []", () => {
@@ -1163,12 +1165,12 @@ describe("IssueStore attachments", () => {
       ],
     });
     await a.upsert(issue);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-200")?.attachments.map((x) => x.id)).toEqual(["z1", "a1", "m1"]);
-    b.dispose();
+    await b.close();
   });
 
   test("attachment metadata round-trips through the DB", async () => {
@@ -1192,12 +1194,12 @@ describe("IssueStore attachments", () => {
       ],
     });
     await a.upsert(issue);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-100")?.attachments).toEqual(issue.attachments);
-    b.dispose();
+    await b.close();
   });
 });
 
@@ -1230,13 +1232,13 @@ describe("IssueStore links (SQLite-backed)", () => {
       ],
     });
     await a.upsert(source);
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     const loaded = b.get("DS-004");
     expect(loaded?.links).toEqual(source.links);
-    b.dispose();
+    await b.close();
   });
 
   test("deleting the source ticket cascades-removes its outbound link rows", async () => {
@@ -1255,14 +1257,14 @@ describe("IssueStore links (SQLite-backed)", () => {
     await store.remove("DS-002");
     // Verify by reopening: DS-001 still present, DS-002 gone, no dangling rows
     // (next upsert of DS-002 must not re-surface a phantom link).
-    store.dispose();
+    await store.close();
     const reopened = makeSqlStore(ctx);
     await reopened.init();
     expect(reopened.get("DS-002")).toBeUndefined();
     // A fresh DS-002 with no links should be exactly that.
     await reopened.upsert(makeIssue({ id: "DS-002", links: [] }));
     expect(reopened.get("DS-002")?.links).toEqual([]);
-    reopened.dispose();
+    await reopened.close();
   });
 
   test("deleting the TARGET ticket cascades-removes inbound link rows", async () => {
@@ -1285,11 +1287,11 @@ describe("IssueStore links (SQLite-backed)", () => {
     expect(store.get("DS-002")?.links).toEqual([]);
 
     // Confirmed across a reopen as well — exercises the hydrator path.
-    store.dispose();
+    await store.close();
     const reopened = makeSqlStore(ctx);
     await reopened.init();
     expect(reopened.get("DS-002")?.links).toEqual([]);
-    reopened.dispose();
+    await reopened.close();
   });
 
   test("legacy JSON without links field migrates to an empty array", async () => {
@@ -1318,7 +1320,7 @@ describe("IssueStore links (SQLite-backed)", () => {
     const store = makeSqlStore(makeContext());
     await store.init();
     expect(store.get("DS-001")?.links).toEqual([]);
-    store.dispose();
+    await store.close();
   });
 });
 
@@ -1465,7 +1467,7 @@ describe("sync schema groundwork", () => {
     expect(loaded?.pendingClose && "target" in loaded.pendingClose).toBe(false);
     // sync_tombstones was created by SCHEMA_DDL — readable and empty.
     expect(store.getSyncTombstones()).toEqual({ tickets: [], elements: [] });
-    store.dispose();
+    await store.close();
   });
 
   test("upsert stamps updatedAt, mints guid, and diff-stamps tasks", async () => {
@@ -1517,7 +1519,7 @@ describe("sync schema groundwork", () => {
     });
     const v4 = store.get("DS-001")!;
     expect(v4.tasks[0]?.updatedAt).not.toBe("1990-01-01T00:00:00.000Z");
-    store.dispose();
+    await store.close();
   });
 
   test("upsert with preserveTimestamps writes exactly as given and records nothing", async () => {
@@ -1539,7 +1541,7 @@ describe("sync schema groundwork", () => {
     expect(loaded.updatedAt).toBe("2025-06-01T12:00:00.000Z");
     expect(loaded.tasks[0]?.updatedAt).toBe("2025-06-01T11:00:00.000Z");
     expect(store.getSyncTombstones()).toEqual({ tickets: [], elements: [] });
-    store.dispose();
+    await store.close();
   });
 
   test("deletion witnesses: upsert task-drop, remove(), replaceAll([]) all record tombstones", async () => {
@@ -1583,7 +1585,7 @@ describe("sync schema groundwork", () => {
     await store.replaceAll([]);
     tombs = store.getSyncTombstones();
     expect(tombs.tickets.map((t) => t.guid)).toEqual(expect.arrayContaining([g1, g2]));
-    store.dispose();
+    await store.close();
   });
 
   test("replaceAll import keeps provided guids/timestamps, derives missing ones", async () => {
@@ -1608,7 +1610,7 @@ describe("sync schema groundwork", () => {
     expect(store.get("DS-001")?.updatedAt).toBe("2025-04-01T00:00:00.000Z");
     expect(store.get("DS-002")?.guid).toBe(deriveGuid("DS-002", "2025-03-15T00:00:00.000Z"));
     expect(store.get("DS-002")?.updatedAt).toBe("2025-03-15T00:00:00.000Z");
-    store.dispose();
+    await store.close();
   });
 
   test("applySync: targeted removals + link scrub + one onChange + no tombstones", async () => {
@@ -1625,7 +1627,7 @@ describe("sync schema groundwork", () => {
     vfs.set("/ws/.vscode/dostuff/attachments/DS-003/att.png", { content: new Uint8Array([2]) } as never);
 
     const events: number[] = [];
-    const sub = store.onChange((issues) => events.push(issues.length));
+    const sub = store.onChange((change) => events.push(change.issues.length));
 
     const merged = makeIssue({
       id: "DS-004",
@@ -1651,7 +1653,7 @@ describe("sync schema groundwork", () => {
     expect(vfs.get("/ws/.vscode/dostuff/attachments/DS-003/att.png")).toBeDefined();
     // applySync never records witnesses.
     expect(store.getSyncTombstones().tickets).toEqual([]);
-    store.dispose();
+    await store.close();
   });
 
   test("init() prunes tombstones older than the TTL", async () => {
@@ -1680,7 +1682,7 @@ describe("sync schema groundwork", () => {
     await store.init();
     const tombs = store.getSyncTombstones();
     expect(tombs.tickets.map((t) => t.guid)).toEqual(["new-guid"]);
-    store.dispose();
+    await store.close();
   });
 });
 
@@ -1736,14 +1738,14 @@ describe("commit anchors schema", () => {
       ...a.get("DS-001")!,
       commits: [{ sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: "2026-07-01T00:00:00.000Z" }],
     });
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-001")?.commits).toEqual([
       { sha: "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0", at: "2026-07-01T00:00:00.000Z" },
     ]);
-    b.dispose();
+    await b.close();
   });
 
   test("commit order (at, sha) round-trips the DB even when PK lexical order differs", async () => {
@@ -1759,12 +1761,12 @@ describe("commit anchors schema", () => {
     const a = makeSqlStore(ctx);
     await a.init();
     await a.upsert(makeIssue({ id: "DS-300", commits }));
-    a.dispose();
+    await a.close();
 
     const b = makeSqlStore(ctx);
     await b.init();
     expect(b.get("DS-300")?.commits).toEqual(commits);
-    b.dispose();
+    await b.close();
   });
 
   test("globalState fallback round-trips commits through normalize()", async () => {
@@ -1775,11 +1777,11 @@ describe("commit anchors schema", () => {
     await store.init();
     const commits = [{ sha: "0123abc", at: "2026-07-01T00:00:00.000Z" }];
     await store.upsert(makeIssue({ id: "DS-001", commits }));
-    store.dispose();
+    await store.close();
 
     const reopened = new IssueStore(ctx);
     await reopened.init();
     expect(reopened.get("DS-001")?.commits).toEqual(commits);
-    reopened.dispose();
+    await reopened.close();
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "dostuff",
-  "version": "2.0.0",
+  "version": "2.1.1",
   "description": "Agent skill for the DoStuff VSCode ticket-queue extension — drive its loopback MCP HTTP API with curl, no MCP client registration needed.",
   "author": {
     "name": "wcole3"

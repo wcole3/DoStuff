@@ -1,5 +1,5 @@
-import { useSyncExternalStore } from "react";
-import type { HostToWebview, Issue, Settings, WebviewToHost } from "../types";
+import { useEffect, useSyncExternalStore } from "react";
+import type { HostToWebview, Issue, IssueRow, Settings, WebviewToHost } from "../types";
 
 interface VsCodeApi {
   postMessage(msg: WebviewToHost): void;
@@ -49,7 +49,12 @@ export function onHostMessage(handler: (msg: HostToWebview) => void): () => void
 // the webview just re-renders when host pushes `{type:"init"}` or `{type:"issues"}`.
 
 interface StoreState {
-  issues: Issue[];
+  /** List rows — the heavy per-ticket fields live in `details`. */
+  issues: IssueRow[];
+  /** Full bodies fetched on demand, keyed by id. */
+  details: Record<string, Issue>;
+  /** Ids whose cached detail predates a delta — kept visible, refetched. */
+  staleDetails: ReadonlySet<string>;
   settings: Settings | null;
   initialized: boolean;
   externalDragIssueId: string | null;
@@ -58,10 +63,39 @@ interface StoreState {
 const listeners = new Set<() => void>();
 let state: StoreState = {
   issues: [],
+  details: {},
+  staleDetails: new Set(),
   settings: null,
   initialized: false,
   externalDragIssueId: null,
 };
+/** Detail fetches posted and not yet answered (dedupes re-renders). */
+const detailInFlight = new Set<string>();
+
+function applyDelta(upserted: IssueRow[], removed: string[]): void {
+  const byId = new Map(upserted.map((r) => [r.id, r] as const));
+  const gone = new Set(removed);
+  const next: IssueRow[] = [];
+  for (const row of state.issues) {
+    if (gone.has(row.id)) continue;
+    const fresh = byId.get(row.id);
+    if (fresh) {
+      next.push(fresh);
+      byId.delete(row.id);
+    } else {
+      next.push(row); // untouched rows keep their identity
+    }
+  }
+  for (const row of byId.values()) next.unshift(row);
+  const details = { ...state.details };
+  const stale = new Set(state.staleDetails);
+  for (const id of gone) {
+    delete details[id];
+    stale.delete(id);
+  }
+  for (const r of upserted) if (details[r.id]) stale.add(r.id);
+  setState({ issues: next, details, staleDetails: stale });
+}
 
 function setState(next: Partial<StoreState>): void {
   state = { ...state, ...next };
@@ -88,11 +122,32 @@ export function startMessageBridge(): void {
   onHostMessage((msg) => {
     switch (msg.type) {
       case "init":
-        setState({ issues: msg.issues, settings: msg.settings, initialized: true });
+        detailInFlight.clear();
+        setState({
+          issues: msg.issues,
+          details: {},
+          staleDetails: new Set(),
+          settings: msg.settings,
+          initialized: true,
+        });
         break;
       case "issues":
-        setState({ issues: msg.issues });
+        // Wholesale reset: every cached body may be out of date.
+        setState({
+          issues: msg.issues,
+          staleDetails: new Set(Object.keys(state.details)),
+        });
         break;
+      case "issuesDelta":
+        applyDelta(msg.upserted, msg.removed);
+        break;
+      case "issueDetail": {
+        detailInFlight.delete(msg.issue.id);
+        const stale = new Set(state.staleDetails);
+        stale.delete(msg.issue.id);
+        setState({ details: { ...state.details, [msg.issue.id]: msg.issue }, staleDetails: stale });
+        break;
+      }
       case "settings":
         setState({ settings: msg.settings });
         break;
@@ -149,8 +204,41 @@ export function startMessageBridge(): void {
   vscodeApi.postMessage({ type: "ready" });
 }
 
-export function useIssues(): { issues: Issue[]; settings: Settings | null; initialized: boolean } {
+export function useIssues(): { issues: IssueRow[]; settings: Settings | null; initialized: boolean } {
   return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+function isFullIssue(row: IssueRow | Issue): row is Issue {
+  return "record" in row;
+}
+
+export function postFetchIssueDetail(id: string): void {
+  vscodeApi.postMessage({ type: "fetchIssueDetail", id });
+}
+
+/**
+ * The full ticket for a row. A row that already carries the heavy fields
+ * (tests seed full issues) is loaded as-is; otherwise the cached detail is
+ * used and a `fetchIssueDetail` is posted when nothing is cached or the
+ * cache predates a delta. While loading, the heavy fields are empty.
+ */
+export function useIssueDetail(row: IssueRow): { issue: Issue; loaded: boolean } {
+  const snap = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const cached = snap.details[row.id];
+  const full = isFullIssue(row);
+  const stale = snap.staleDetails.has(row.id);
+  const needsFetch = !full && (!cached || stale);
+  useEffect(() => {
+    if (!needsFetch || detailInFlight.has(row.id)) return;
+    detailInFlight.add(row.id);
+    postFetchIssueDetail(row.id);
+  }, [needsFetch, row.id]);
+  if (full) return { issue: row, loaded: true };
+  if (cached) {
+    // The row is the fresher list-level truth; the body may be stale.
+    return { issue: { ...cached, ...row }, loaded: true };
+  }
+  return { issue: { ...row, record: [], statusHistory: [], commits: [] }, loaded: false };
 }
 
 /**
@@ -166,7 +254,7 @@ export function useExternalDragIssueId(): string | null {
   );
 }
 
-export function postUpdateIssue(issue: Issue): void {
+export function postUpdateIssue(issue: IssueRow): void {
   vscodeApi.postMessage({ type: "updateIssue", issue });
 }
 
