@@ -449,6 +449,14 @@ const DrawerCardRow = memo(function DrawerCardRow({
               #{issue.number}
             </span>
             <span className="bd-card-spacer" />
+            {issue.pendingClose && (
+              <span
+                className="bd-card-pending-close"
+                title={pendingCloseTitle(issue.pendingClose)}
+              >
+                <Icon name="clock" size={11} />
+              </span>
+            )}
             <Icon name={pri.icon} size={11} style={{ color: pri.color }} />
           </div>
           <div className="bd-drawer-card-title">{issue.title}</div>
