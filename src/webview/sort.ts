@@ -1,7 +1,7 @@
 // Shared sort options for the sidebar list and board drawers. Kept in its
 // own module so both UIs use the same labels + comparator.
 
-import { PRIORITIES, TYPES, type Issue, type Priority, type IssueType } from "../types";
+import { PRIORITIES, TYPES, type IssueRow, type Priority, type IssueType } from "../types";
 
 export const SORT_KEYS = [
   "first-added",
@@ -30,29 +30,31 @@ const PRIORITY_ORDER: Record<Priority, number> = Object.fromEntries(
   PRIORITIES.map((p, i) => [p, i]),
 ) as Record<Priority, number>;
 
-const tsAsc = (a: Issue, b: Issue) =>
-  new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-const tsDesc = (a: Issue, b: Issue) =>
-  new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+/**
+ * Sort by a per-item key computed ONCE (Schwartzian transform) instead of
+ * allocating two `Date`s per comparison — the list re-sorts on every host
+ * message, and at 600+ tickets the old comparators dominated render time.
+ */
+function sortByKey<T>(items: T[], key: (t: T) => number, tiebreak?: (a: T, b: T) => number): T[] {
+  return items
+    .map((item, index) => ({ item, k: key(item), index }))
+    .sort((a, b) => a.k - b.k || (tiebreak ? tiebreak(a.item, b.item) : 0) || a.index - b.index)
+    .map((e) => e.item);
+}
 
-export function sortIssues(issues: Issue[], key: SortKey): Issue[] {
-  const copy = [...issues];
+const created = (i: IssueRow) => Date.parse(i.createdAt) || 0;
+
+export function sortIssues(issues: IssueRow[], key: SortKey): IssueRow[] {
   switch (key) {
     case "first-added":
-      return copy.sort(tsDesc);
+      return sortByKey(issues, (i) => -created(i));
     case "last-added":
-      return copy.sort(tsAsc);
+      return sortByKey(issues, created);
     case "alphabetical":
-      return copy.sort(
-        (a, b) => a.title.localeCompare(b.title) || tsDesc(a, b),
-      );
+      return sortByKey(issues, () => 0, (a, b) => a.title.localeCompare(b.title) || created(b) - created(a));
     case "by-type":
-      return copy.sort(
-        (a, b) => (TYPE_ORDER[a.type] - TYPE_ORDER[b.type]) || tsDesc(a, b),
-      );
+      return sortByKey(issues, (i) => TYPE_ORDER[i.type], (a, b) => created(b) - created(a));
     case "by-priority":
-      return copy.sort(
-        (a, b) => (PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]) || tsDesc(a, b),
-      );
+      return sortByKey(issues, (i) => PRIORITY_ORDER[i.priority], (a, b) => created(b) - created(a));
   }
 }

@@ -23,6 +23,8 @@ sections relevant to your change; run everything before a release.
 - [ ] Sidebar→board cross-webview drag: dragging a sidebar card opens/focuses the board and shows the "Move to *lane*" overlay; Esc cancels.
 - [ ] A ticket with a pending agent **close** request shows the "no longer needed" badge; **Approve & close** moves it to Closed (vanishes from the board), **Deny** clears the badge and leaves status alone.
 - [ ] A ticket with a pending agent **completion** request shows the "work finished" badge with **Accept & complete**; accepting moves it to Complete (with `resolvedAt` set), denying clears the badge.
+- [ ] With a pending **completion** request, **dragging** the card into the Complete drawer (also: the step-rail arrow, and the detail-panel status picker) auto-resolves it — badge and banner gone, "Awaiting decision" back to 0, `resolvedAt` set, record shows "Completion request approved by move to Complete".
+- [ ] Mismatch stays pending: with a pending **close** (OBE) request, moving the ticket to Complete completes it but **keeps** the badge, the banner, and the "Awaiting decision" entry.
 
 ## 3. Import / export
 

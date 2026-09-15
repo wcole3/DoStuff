@@ -287,10 +287,36 @@ export const AGENT_WRITABLE_STATUSES: Status[] = ["Thinking", "Planned", "Workin
  *  and annotate (update_ticket_progress). Excludes Complete and Closed. */
 export const AGENT_VISIBLE_STATUSES: Status[] = ["Thinking", "Planned", "Working", "Verification"];
 
+/**
+ * What a webview list holds per ticket: everything except the three
+ * append-only, unbounded fields (`record`, `statusHistory`, `commits`) that
+ * only the detail view renders — those arrive via `issueDetail` on demand.
+ * The host's `mergeIssueUpdate` never reads those three from the webview, so
+ * a row spread back through `updateIssue` is a safe edit payload.
+ */
+export type IssueRow = Omit<Issue, "record" | "statusHistory" | "commits">;
+
+/**
+ * Project an issue to its list row. Destructures the heavy keys OUT rather
+ * than building a new object with defaults: an omitted key must reach the
+ * host as `undefined` ("keep prior"), never as `""` / `[]` ("write this").
+ */
+export function toRow(issue: Issue): IssueRow {
+  const { record: _record, statusHistory: _history, commits: _commits, ...row } = issue;
+  return row;
+}
+
 /** Wire format for host ↔ webview messaging. */
 export type HostToWebview =
-  | { type: "init"; issues: Issue[]; settings: Settings }
-  | { type: "issues"; issues: Issue[] }
+  | { type: "init"; issues: IssueRow[]; settings: Settings }
+  // Full replacement of the list (store reset: init, import, merge).
+  | { type: "issues"; issues: IssueRow[] }
+  // The common case after an edit: only what changed. Rows are replaced by
+  // id, ids in `removed` dropped; every other row keeps its identity.
+  | { type: "issuesDelta"; upserted: IssueRow[]; removed: string[] }
+  // Host's reply to `fetchIssueDetail`: the full ticket incl. record,
+  // statusHistory and commits.
+  | { type: "issueDetail"; issue: Issue }
   | { type: "focusSearch" }
   | { type: "settings"; settings: Settings }
   | { type: "showNewIssue" }
@@ -342,7 +368,11 @@ export type WebviewToHost =
         inboundLinks?: Array<{ sourceId: string; kind: LinkKind }>;
       };
     }
-  | { type: "updateIssue"; issue: Issue }
+  // A row (or a full issue) — the host merges per field and never reads the
+  // three windowed fields from here.
+  | { type: "updateIssue"; issue: IssueRow }
+  // Ask for a ticket's full body (record/statusHistory/commits).
+  | { type: "fetchIssueDetail"; id: string }
   | { type: "deleteIssue"; id: string }
   | { type: "openBoard" }
   | { type: "importJson" }
@@ -542,7 +572,7 @@ export function effectiveCloseTarget(pc: PendingClose): PendingCloseTarget {
 }
 
 export function canMoveToActiveLane(
-  currentIssues: Issue[],
+  currentIssues: ReadonlyArray<Pick<Issue, "id" | "status">>,
   targetStatus: Status,
   movingIssueId?: string,
   cap = ACTIVE_LANE_CAP,

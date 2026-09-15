@@ -5,7 +5,7 @@
   "license": "MIT",
   "icon": "media/dostuff-icon-sm.png",
   "description": "Simple software issue board with an MCP server for agent integration",
-  "version": "2.0.1",
+  "version": "2.1.1",
   "main": "./dist/extension.cjs",
   "module": "index.ts",
   "type": "module",
@@ -22,6 +22,7 @@
     "watch": "bun run ./scripts/watch-with-esbuild.ts",
     "vsce-package": "bun run vsce package --no-dependencies",
     "package": "bun run build && bun run vsce-package",
+    "bench:scale": "DOSTUFF_BENCH_SCALE=1 bun test src/perf.bench.test.ts",
     "clean": "rm -rf ./dist ./media/index.js ./media/index.js.map ./media/styles.css ./media/styles.css.map"
   },
   "dependencies": {

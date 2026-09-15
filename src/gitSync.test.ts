@@ -14,6 +14,7 @@ import * as vscode from "vscode";
 import { GitSyncController, type SyncStoreLike } from "./gitSync";
 import { canonicalJson } from "./syncMerge";
 import type { Issue } from "./types";
+import type { StoreChange } from "./storageCore";
 
 const REF = "refs/dostuff/state";
 const T = (h: number, m = 0) =>
@@ -46,7 +47,7 @@ interface TombRow {
 class FakeStore {
   cache: Issue[] = [];
   tombs: TombRow[] = [];
-  private readonly emitter = new vscode.EventEmitter<Issue[]>();
+  private readonly emitter = new vscode.EventEmitter<StoreChange>();
   readonly onChange = this.emitter.event;
   applySyncCalls = 0;
   logs: string[] = [];
@@ -119,7 +120,7 @@ class FakeStore {
     const present = new Set(survivors.map((i) => i.id));
     for (const u of args.upserts) if (!present.has(u.id)) survivors.push(u);
     this.cache = survivors;
-    this.emitter.fire(this.cache);
+    this.emitter.fire({ issues: this.cache, upserted: [], removed: [], reset: true });
   }
 
   /** Test mutators — explicit timestamps, no wall clock. */
@@ -127,7 +128,7 @@ class FakeStore {
     const idx = this.cache.findIndex((i) => i.id === issue.id);
     if (idx >= 0) this.cache[idx] = issue;
     else this.cache.push(issue);
-    this.emitter.fire(this.cache);
+    this.emitter.fire({ issues: this.cache, upserted: [], removed: [], reset: true });
   }
   delete(id: string, deletedAt: string): void {
     const issue = this.get(id);
@@ -140,7 +141,7 @@ class FakeStore {
       deletedAt,
       lastId: issue.id,
     });
-    this.emitter.fire(this.cache);
+    this.emitter.fire({ issues: this.cache, upserted: [], removed: [], reset: true });
   }
   dropTask(id: string, taskId: string, deletedAt: string): void {
     const issue = this.get(id);
@@ -498,8 +499,23 @@ describe("GitSyncController: failure modes & plumbing behavior", () => {
     const readsBefore = a.store.readAttachmentCalls;
     expect(readsBefore).toBeGreaterThan(0);
     a.store.put({ ...a.store.get("DS-001")!, updatedAt: T(5), title: "unrelated edit" });
-    await a.controller.syncNow("manual");
+    const logPath = path.join(tmpRoot, `spawns-${++repoCounter}.log`);
+    const restore = gitShim({ logPath });
+    try {
+      await a.controller.syncNow("manual");
+    } finally {
+      restore();
+    }
     expect(a.store.readAttachmentCalls).toBe(readsBefore);
+    // ...nor re-spawn per ticket: no hash-object, and the unchanged
+    // attachments/<guid> subtree is reused rather than rebuilt with mktree.
+    // Each tree write (one fast-import) needs tickets + attachments + root
+    // = 3 mktree calls at most; a per-guid rebuild would add one more.
+    const counts = spawnCounts(logPath);
+    const writes = counts.get("fast-import") ?? 0;
+    expect(writes).toBeGreaterThan(0);
+    expect(counts.get("hash-object") ?? 0).toBe(0);
+    expect(counts.get("mktree") ?? 0).toBeLessThanOrEqual(3 * writes);
   });
 
   test("syncAttachments: false keeps the ref tree free of attachment blobs", async () => {
@@ -853,6 +869,7 @@ describe("GitSyncController + IssueStoreCore (headless pairing)", () => {
       expect(a.store.get("DS-001")).toBeUndefined();
 
       // And the state survives a reopen from disk in clone B.
+      await b.store.flush();
       const reopened = new IssueStoreCore({
         storageDir: () => path.join(b.dir, ".vscode", "dostuff"),
         wasmBinary: async () => wasm,
@@ -875,20 +892,92 @@ describe("GitSyncController + IssueStoreCore (headless pairing)", () => {
  * remote with the real binary. Returns a restore function.
  */
 function slowGitShim(sleepSec: number): () => void {
-  const bin = path.join(tmpRoot, `slow-bin-${++repoCounter}`);
+  return gitShim({ sleepSec });
+}
+
+/**
+ * PATH shim around the real `git`: optionally sleeps on network verbs
+ * (`sleepSec`) and/or appends each subcommand name to `logPath` — a spawn
+ * counter with no mocks (an `>>` of one short line is atomic, so concurrent
+ * spawns never interleave). Returns a restore function.
+ */
+function gitShim(opts: { sleepSec?: number; logPath?: string }): () => void {
+  const bin = path.join(tmpRoot, `shim-bin-${++repoCounter}`);
   fs.mkdirSync(bin, { recursive: true });
   const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
-  fs.writeFileSync(
-    path.join(bin, "git"),
-    `#!/bin/sh\ncase "$1" in ls-remote|fetch|push) sleep ${sleepSec};; esac\nexec ${real} "$@"\n`,
-    { mode: 0o755 },
-  );
+  const lines = ["#!/bin/sh"];
+  if (opts.logPath) lines.push(`printf '%s\\n' "$1" >> ${JSON.stringify(opts.logPath)}`);
+  if (opts.sleepSec) lines.push(`case "$1" in ls-remote|fetch|push) sleep ${opts.sleepSec};; esac`);
+  lines.push(`exec ${real} "$@"`, "");
+  fs.writeFileSync(path.join(bin, "git"), lines.join("\n"), { mode: 0o755 });
   const prior = process.env.PATH;
   process.env.PATH = `${bin}:${prior}`;
   return () => {
     process.env.PATH = prior;
   };
 }
+
+/** Subcommand → spawn count from a `gitShim` log file (empty when absent). */
+function spawnCounts(logPath: string): Map<string, number> {
+  const out = new Map<string, number>();
+  let text = "";
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch {
+    return out;
+  }
+  for (const line of text.split("\n")) if (line) out.set(line, (out.get(line) ?? 0) + 1);
+  return out;
+}
+
+describe("spawn budget (one fast-import per cycle, never one process per ticket)", () => {
+  test("a 300-ticket sync writes every blob through one fast-import and no hash-object", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare));
+    for (let n = 1; n <= 300; n++) {
+      a.store.put(makeIssue({ guid: `g-${n}`, number: n, title: `Ticket ${n}`, description: "d".repeat(500) }));
+    }
+    const logPath = path.join(tmpRoot, `spawns-${++repoCounter}.log`);
+    const restore = gitShim({ logPath });
+    try {
+      a.controller.start();
+      await a.controller.syncNow("manual");
+    } finally {
+      restore();
+    }
+    const counts = spawnCounts(logPath);
+    expect(counts.get("hash-object") ?? 0).toBe(0);
+    expect(counts.get("fast-import") ?? 0).toBe(1);
+    expect(git(a.dir, "ls-tree", "-r", "--name-only", REF).split("\n").filter((p) => p.startsWith("tickets/"))).toHaveLength(300);
+
+    // Round trip: a second clone receives the whole board intact.
+    const b = track(mkClone("cloneB", bare));
+    b.controller.start();
+    await b.controller.syncNow("manual");
+    expect(b.store.list()).toHaveLength(300);
+    expect(b.store.list().map((i) => i.title).sort()).toEqual(a.store.list().map((i) => i.title).sort());
+  });
+
+  test("a no-op cycle spawns no hash-object and adds no objects", async () => {
+    const bare = mkRepo("origin.git", true);
+    const a = track(mkClone("cloneA", bare));
+    for (let n = 1; n <= 50; n++) a.store.put(makeIssue({ guid: `g-${n}`, number: n }));
+    a.controller.start();
+    await a.controller.syncNow("manual");
+    const objectsBefore = git(a.dir, "count-objects", "-v");
+    const logPath = path.join(tmpRoot, `spawns-${++repoCounter}.log`);
+    const restore = gitShim({ logPath });
+    try {
+      await a.controller.syncNow("manual");
+    } finally {
+      restore();
+    }
+    const counts = spawnCounts(logPath);
+    expect(counts.get("hash-object") ?? 0).toBe(0);
+    expect(counts.get("fast-import") ?? 0).toBeLessThanOrEqual(1);
+    expect(git(a.dir, "count-objects", "-v")).toBe(objectsBefore);
+  });
+});
 
 describe("network stalls", () => {
   test("a debounced local commit lands while a network sync is stalled", async () => {

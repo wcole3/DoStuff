@@ -582,6 +582,27 @@ describe("Focus overlay after resolving a pending close request", () => {
   });
 });
 
+describe("Pending close badge in the Thinking drawer", () => {
+  test("renders only on drawer cards with a pending close request", () => {
+    const pending = makeIssue({
+      id: "DS-341", number: 341, title: "OBE draft", status: "Thinking",
+      pendingClose: { by: "agent" as const, at: "2025-01-02T00:00:00.000Z", target: "Closed" as const },
+    });
+    const plain = makeIssue({ id: "DS-342", number: 342, title: "Live draft", status: "Thinking" });
+    installVsCodeApi();
+    render(<Board />);
+    pushInit([pending, plain]);
+
+    fireEvent.click(document.querySelector(".bd-drawer-left .bd-drawer-head") as HTMLElement);
+    const cards = Array.from(document.querySelectorAll(".bd-drawer-card"));
+    const pendingCard = cards.find((c) => c.textContent?.includes("OBE draft")) as HTMLElement;
+    const plainCard = cards.find((c) => c.textContent?.includes("Live draft")) as HTMLElement;
+
+    expect(pendingCard.querySelector(".bd-card-pending-close")).not.toBeNull();
+    expect(plainCard.querySelector(".bd-card-pending-close")).toBeNull();
+  });
+});
+
 // The "Loading…" empty-state for Board is skipped: the webview store is a
 // module singleton and is `initialized: true` for the remainder of the test
 // process after any earlier test pushed an init message. Asserting against

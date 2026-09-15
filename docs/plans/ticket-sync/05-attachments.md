@@ -20,7 +20,7 @@ For each ticket, for each attachment in metadata:
 1. Skip entirely if `dostuff.sync.syncAttachments` is false.
 2. Skip bytes if `sizeBytes > dostuff.sync.maxAttachmentSyncBytes` (default 5 MiB) — metadata still syncs; the other side shows missing-file UX. Log the skip (no silent caps).
 3. **OID reuse**: if the previous tip's tree already has `attachments/<guid>/<attId>`, reuse that blob OID without reading the file — attachments are immutable per id (append/delete only), so a present path never needs rehashing. This keeps `commitLocal` O(changed bytes), not O(total attachment bytes).
-4. Otherwise read bytes from disk (`store.readAttachment` / the attachment dir under `<storagePath>/attachments/<issueId>/`) and `hash-object -w --stdin`.
+4. Otherwise read bytes from disk (`store.readAttachment` / the attachment dir under `<storagePath>/attachments/<issueId>/`) and queue them for the cycle's single `fast-import` batch (`writeBlobsBatch`) alongside the ticket blobs. **Subtree reuse**: when a ticket's `(attId → oid)` listing is identical to a listing at a previous tip (`ls-tree -r -t` also returns the `attachments/<guid>` tree OIDs), the tree OID is reused and no `mktree` runs for that ticket.
 5. Local file missing (user deleted it manually): log and skip — never fail the commit.
 
 ## 3. Restore (inbound, inside apply)
@@ -39,6 +39,6 @@ Deletion side: when a tombstoned ticket is removed, `applySync` deletes its atta
 
 - Small attachment added in clone A → bytes present in clone B after sync; content identical.
 - Attachment above the size cap → metadata syncs, bytes don't; log entry records the skip; B shows metadata with missing file.
-- OID reuse: second commit after an unrelated ticket edit does not re-read the attachment file (spy/instrument the read path, or assert timing-free via a hash-object call counter on a mocked GitRepo).
+- OID reuse: second commit after an unrelated ticket edit does not re-read the attachment file, spawns no `hash-object`, and rebuilds no per-ticket subtree (asserted with the PATH-shim spawn counter in gitSync.test.ts — real git, no mocks).
 - Renumbered ticket with attachments: dir renamed first, then restore fills only genuinely-missing files — no duplicate dirs under the old id.
 - `syncAttachments: false` → tree contains no `attachments/` entries.

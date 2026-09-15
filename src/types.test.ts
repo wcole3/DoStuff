@@ -2,6 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  toRow,
   INVERSE_LINK_KIND,
   LINK_KINDS,
   coerceAttachments,
@@ -346,5 +347,24 @@ describe("coerceCommits", () => {
     expect(compareCommits(y, x)).toBeGreaterThan(0);
     expect(compareCommits(x, z)).toBeLessThan(0);
     expect(compareCommits(x, { ...x })).toBe(0);
+  });
+});
+
+describe("toRow", () => {
+  test("drops exactly record/statusHistory/commits and adds nothing (an omitted key must stay undefined)", () => {
+    const issue = {
+      id: "DS-001", number: 1, title: "t", type: "Bug", priority: "Regular", status: "Thinking",
+      description: "d", tasks: [], verifyCriteria: "", createdAt: "2026-01-01T00:00:00.000Z",
+      resolvedAt: null, statusHistory: [{ status: "Thinking", at: "2026-01-01T00:00:00.000Z" }],
+      record: [{ at: "2026-01-01T00:00:00.000Z", author: "user", text: "x" }], tags: [], attachments: [],
+      links: [], pendingClose: null, guid: "g", updatedAt: "2026-01-01T00:00:00.000Z",
+      commits: [{ sha: "a".repeat(40), at: "2026-01-01T00:00:00.000Z" }],
+    } as const;
+    const row = toRow(issue as unknown as Parameters<typeof toRow>[0]);
+    const expected = Object.keys(issue).filter((k) => !["record", "statusHistory", "commits"].includes(k));
+    expect(Object.keys(row).sort()).toEqual(expected.sort());
+    expect("record" in row).toBe(false);
+    expect("statusHistory" in row).toBe(false);
+    expect("commits" in row).toBe(false);
   });
 });

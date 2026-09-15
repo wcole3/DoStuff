@@ -4,7 +4,7 @@ import {
   PRIORITIES,
   STATUSES,
   TYPES,
-  type Issue,
+  type IssueRow,
   type IssueType,
   type Priority,
   type Status,
@@ -25,7 +25,7 @@ import { DEFAULT_SORT, SORT_KEYS, SORT_LABELS, sortIssues, type SortKey } from "
 const ROW_HEIGHT = 74;
 
 interface RowData {
-  filtered: Issue[];
+  filtered: IssueRow[];
   expandedId: string | null;
   onToggle: (id: string) => void;
   onContextMenu: (id: string) => void;
@@ -199,7 +199,7 @@ export function Sidebar() {
   const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT);
   const [showCompleted, setShowCompleted] = useState(false);
   const [pendingCloseOnly, setPendingCloseOnly] = useState(false);
-  const [modal, setModal] = useState<"add" | { kind: "delete"; issue: Issue } | null>(null);
+  const [modal, setModal] = useState<"add" | { kind: "delete"; issue: IssueRow } | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const [listRef, listSize] = useParentSize();
 

@@ -7,20 +7,12 @@
 import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
-import type { Issue, Settings, WebviewToHost } from "./types";
+import type { Issue, IssueRow, Settings, WebviewToHost } from "./types";
+import { changeToMessage, readSettings } from "./webviewProtocol";
+import { toRow } from "./types";
 
 const ID_RE = /^DS-\d+$/;
 
-function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
-  const cfg = vscode.workspace.getConfiguration("dostuff");
-  const attachmentsDir = store.attachmentsDir();
-  return {
-    storagePath: cfg.get<string>("storagePath", ".vscode/dostuff"),
-    autoSave: cfg.get<boolean>("autoSave", true),
-    activeLaneCap: cfg.get<number>("activeLaneCap", 6),
-    attachmentsBaseUri: attachmentsDir ? webview.asWebviewUri(attachmentsDir).toString() : null,
-  };
-}
 
 export class GraphPanel {
   public static readonly viewType = "dostuff.graph";
@@ -80,12 +72,13 @@ export class GraphPanel {
       this.disposables,
     );
 
-    this.disposables.push(store.onChange((issues) => this.broadcast(issues)));
+    this.disposables.push(store.onChange((change) => this.panel.webview.postMessage(changeToMessage(change))));
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
   }
 
+  /** Publish the whole board (as rows) to the webview. */
   broadcast(issues: Issue[] = this.store.list()) {
-    this.panel.webview.postMessage({ type: "issues", issues });
+    this.panel.webview.postMessage({ type: "issues", issues: issues.map(toRow) });
   }
 
   private async handleMessage(msg: WebviewToHost) {
@@ -93,7 +86,7 @@ export class GraphPanel {
       case "ready":
         this.panel.webview.postMessage({
           type: "init",
-          issues: this.store.list(),
+          issues: this.store.list().map(toRow),
           settings: readSettings(this.panel.webview, this.store),
         });
         break;

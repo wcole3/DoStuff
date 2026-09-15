@@ -6,22 +6,12 @@ import * as vscode from "vscode";
 import { IssueStore } from "./storage";
 import { getWebviewHtml } from "./webviewHtml";
 import { NO_OP_COMMIT_DETAILS, type ApplyIssueUpdate, type AttachmentHandlers, type FetchCommitDetails } from "./sidebarProvider";
-import type { Issue, Settings, WebviewToHost } from "./types";
+import type { Issue, IssueRow, Settings, WebviewToHost } from "./types";
+import { changeToMessage, readSettings } from "./webviewProtocol";
+import { toRow } from "./types";
 
 const ID_RE = /^DS-\d+$/;
 
-function readSettings(webview: vscode.Webview, store: IssueStore): Settings {
-  const cfg = vscode.workspace.getConfiguration("dostuff");
-  const attachmentsDir = store.attachmentsDir();
-  return {
-    storagePath:    cfg.get<string>("storagePath", ".vscode/dostuff"),
-    autoSave:       cfg.get<boolean>("autoSave", true),
-    activeLaneCap:  cfg.get<number>("activeLaneCap", 6),
-    attachmentsBaseUri: attachmentsDir
-      ? webview.asWebviewUri(attachmentsDir).toString()
-      : null,
-  };
-}
 
 export class BoardPanel {
   public static readonly viewType = "dostuff.board";
@@ -130,14 +120,15 @@ export class BoardPanel {
       this.disposables
     );
 
-    const storeSub = store.onChange((issues) => this.broadcast(issues));
+    const storeSub = store.onChange((change) => this.panel.webview.postMessage(changeToMessage(change)));
     this.disposables.push(storeSub);
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
   }
 
+  /** Publish the whole board (as rows) to the webview. */
   broadcast(issues: Issue[] = this.store.list()) {
-    this.panel.webview.postMessage({ type: "issues", issues });
+    this.panel.webview.postMessage({ type: "issues", issues: issues.map(toRow) });
   }
 
   private async handleMessage(msg: WebviewToHost) {
@@ -145,17 +136,22 @@ export class BoardPanel {
       case "ready":
         this.panel.webview.postMessage({
           type: "init",
-          issues: this.store.list(),
+          issues: this.store.list().map(toRow),
           settings: readSettings(this.panel.webview, this.store),
         });
         break;
+      case "fetchIssueDetail": {
+        const full = this.store.get(msg.id);
+        if (full) this.panel.webview.postMessage({ type: "issueDetail", issue: full });
+        break;
+      }
       case "updateIssue": {
         const issue = (msg as { issue?: unknown }).issue;
-        if (!issue || typeof issue !== "object" || !ID_RE.test((issue as Issue).id ?? "")) {
+        if (!issue || typeof issue !== "object" || !ID_RE.test((issue as IssueRow).id ?? "")) {
           this.output.appendLine(`Rejected updateIssue: bad id (${JSON.stringify(issue)})`);
           break;
         }
-        await this.applyUpdate(issue as Issue);
+        await this.applyUpdate(issue as IssueRow);
         break;
       }
       case "deleteIssue": {

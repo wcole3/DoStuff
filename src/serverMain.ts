@@ -495,7 +495,7 @@ async function runServe(opts: CliOptions): Promise<number> {
   if (!server.status.running) {
     logger.error("Server failed to start; see log above.");
     sync?.dispose();
-    store.dispose();
+    await store.close();
     return 1;
   }
   process.stdout.write(
@@ -511,7 +511,7 @@ async function runServe(opts: CliOptions): Promise<number> {
     try {
       await server.stop();
     } catch {}
-    store.dispose();
+    await store.close();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));

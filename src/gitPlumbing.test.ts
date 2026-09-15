@@ -105,7 +105,9 @@ describe("object round trip", () => {
 
     expect(await repo.revParse(STATE_REF)).toBe(commit);
     const entries = await repo.readTree(commit);
-    expect(entries.map((e) => e.path).sort()).toEqual(["meta.bin", "tickets/abc.json"]);
+    // `-t` lists the intermediate tree too (subtree OID reuse in gitSync).
+    expect(entries.map((e) => e.path).sort()).toEqual(["meta.bin", "tickets", "tickets/abc.json"]);
+    expect(entries.find((e) => e.path === "tickets")?.type).toBe("tree");
 
     const blobs = await repo.catFileBatch([textOid, binOid, "0".repeat(40)]);
     expect(blobs.get(textOid)?.toString("utf8")).toBe('{ "a": 1 }\n');
@@ -320,5 +322,121 @@ describe("timeout", () => {
     }
     expect(err).toBeInstanceOf(GitError);
     expect((err as GitError).code).toBe("Timeout");
+  });
+});
+
+describe("writeBlobsBatch (one fast-import process for every blob)", () => {
+  test("returns OIDs in input order that match hash-object, incl. binary, empty and multibyte", async () => {
+    const dir = mkRepo("batch-parity");
+    const repo = new GitRepo(dir);
+    const inputs = [
+      Buffer.from('{ "a": 1 }\n', "utf8"),
+      Buffer.from([0, 1, 2, 255, 254, 10, 0, 13, 10, 42]),
+      Buffer.alloc(0),
+      Buffer.from("héllo wörld — 日本語\n", "utf8"),
+    ];
+    const oids = await repo.writeBlobsBatch(inputs);
+    expect(oids).toHaveLength(inputs.length);
+    for (let i = 0; i < inputs.length; i++) {
+      expect(oids[i]).toBe(await repo.hashObjectStdin(inputs[i]!));
+      // Round-trips through the object store byte-for-byte.
+      const back = execFileSync("git", ["cat-file", "-p", oids[i]!], { cwd: dir });
+      expect(Buffer.compare(back, inputs[i]!)).toBe(0);
+    }
+  });
+
+  test("empty input returns [] without touching git", async () => {
+    const dir = mkRepo("batch-empty");
+    const repo = new GitRepo(dir);
+    expect(await repo.writeBlobsBatch([])).toEqual([]);
+  });
+
+  test("a repeated batch returns the same OIDs and writes no new objects", async () => {
+    const dir = mkRepo("batch-dedup");
+    const repo = new GitRepo(dir);
+    const inputs = Array.from({ length: 20 }, (_, i) => Buffer.from(`ticket ${i}\n`, "utf8"));
+    const first = await repo.writeBlobsBatch(inputs);
+    const count = () => git(dir, "count-objects", "-v");
+    const before = count();
+    const second = await repo.writeBlobsBatch(inputs);
+    expect(second).toEqual(first);
+    expect(count()).toBe(before);
+  });
+
+  test("700 blobs go through one call", async () => {
+    const dir = mkRepo("batch-700");
+    const repo = new GitRepo(dir);
+    const inputs = Array.from({ length: 700 }, (_, i) =>
+      Buffer.from(JSON.stringify({ i, pad: "x".repeat(2000) }), "utf8"),
+    );
+    const oids = await repo.writeBlobsBatch(inputs);
+    expect(oids).toHaveLength(700);
+    expect(new Set(oids).size).toBe(700);
+    expect(oids[699]).toBe(await repo.hashObjectStdin(inputs[699]!));
+  });
+
+  test("a malformed stream fails with GitFailed instead of hanging", async () => {
+    const dir = mkRepo("batch-bad");
+    // `--done` without a `done` command — fast-import exits non-zero.
+    const r = await __runGitForTests(["fast-import", "--quiet", "--done"], {
+      cwd: dir,
+      timeoutMs: 5000,
+      stdin: Buffer.from("blob\nmark :1\ndata 3\nabc\n", "utf8"),
+    });
+    expect(r.code).not.toBe(0);
+  });
+});
+
+describe("readTree", () => {
+  test("lists tree entries alongside blobs so subtree OIDs can be reused", async () => {
+    const dir = mkRepo("readtree-t");
+    const repo = new GitRepo(dir);
+    const blob = await repo.hashObjectStdin(Buffer.from("x", "utf8"));
+    const sub = await repo.mkTree([{ mode: "100644", type: "blob", oid: blob, path: "a1" }]);
+    const root = await repo.mkTree([{ mode: "040000", type: "tree", oid: sub, path: "attachments" }]);
+    const commit = await repo.commitTree(root, [], "t");
+    const entries = await repo.readTree(commit);
+    expect(entries.find((e) => e.type === "tree" && e.path === "attachments")?.oid).toBe(sub);
+    expect(entries.find((e) => e.type === "blob" && e.path === "attachments/a1")?.oid).toBe(blob);
+  });
+});
+
+describe("timeout clock starts when the process spawns, not when spawn is requested", () => {
+  const busyWait = (ms: number) => {
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      /* block the event loop deliberately */
+    }
+  };
+
+  test("a pre-spawn event-loop stall does not count against the deadline", async () => {
+    const dir = mkRepo("stall-clock");
+    const t0 = performance.now();
+    // Hangs forever (stdin held open) so the only way out is the timeout.
+    const p = __runGitForTests(["cat-file", "--batch"], { cwd: dir, timeoutMs: 200, closeStdin: false });
+    busyWait(300);
+    let err: unknown;
+    try {
+      await p;
+    } catch (e) {
+      err = e;
+    }
+    expect((err as GitError).code).toBe("Timeout");
+    // Pre-fix the timer was armed at the call and expired during the stall,
+    // rejecting at ~300ms; armed at spawn it must run its full 200ms after.
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(480);
+  });
+
+  test("a timeout after a long stall says so in the message", async () => {
+    const dir = mkRepo("stall-msg");
+    const p = __runGitForTests(["cat-file", "--batch"], { cwd: dir, timeoutMs: 100, closeStdin: false });
+    busyWait(1200);
+    let err: unknown;
+    try {
+      await p;
+    } catch (e) {
+      err = e;
+    }
+    expect((err as GitError).message).toContain("stalled");
   });
 });

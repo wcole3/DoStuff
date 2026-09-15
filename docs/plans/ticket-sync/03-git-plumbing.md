@@ -26,7 +26,8 @@ attachments/<guid>/<attId>      raw bytes, no extension (name/mime live in ticke
 
 - `repoRoot` from `git rev-parse --show-toplevel`, run once at controller start with cwd = `workspaceFolders[0].uri.fsPath`. Failure → `NotARepo` state, logged once, no retry spam.
 - Env for every call: `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `GIT_OPTIONAL_LOCKS=0`. Never touch `GIT_SSH_COMMAND` (respect user agents/config). Commit identity via env — `GIT_AUTHOR_NAME="DoStuff Sync"`, `GIT_AUTHOR_EMAIL="dostuff@localhost"` (+ `GIT_COMMITTER_*`) — so sync works in repos with no `user.name` configured.
-- Timeouts: **15s** local plumbing, **120s** network (fetch/push/ls-remote); kill on expiry → `Timeout` error.
+- Timeouts: **15s** local plumbing, **120s** network (fetch/push/ls-remote); kill on expiry → `Timeout` error. The deadline is measured from the child's `spawn` event, not from the call: a stalled host event loop between the two cannot expire the timer before the child's `close` is serviced (which once reported finished processes as timed out). A real timeout reports "<n>ms since spawn" and, when the spawn itself was delayed ≥1s, "the host event loop stalled".
+- **Never one spawn per object.** `spawn()` forks the host, and a fork costs more the larger the host's RSS (17-45ms each at a ~1GB extension host). Writes go through one `git fast-import` per tree write (`writeBlobsBatch`), reads through one `cat-file --batch`.
 - Binary-safe I/O over stdin/stdout only; no temp files, no content ever passed as an argument.
 
 ## 3. Command sequences
@@ -35,8 +36,12 @@ attachments/<guid>/<attId>      raw bytes, no extension (name/mime live in ticke
 
 ```
 git rev-parse --verify --quiet refs/dostuff/state        # → oldTip, or miss (ref not born)
-# per file, content piped to stdin:
-git hash-object -w --stdin                               # → blob oid
+# every blob (meta, tickets, tombstones, new attachment bytes) in ONE process:
+git fast-import --quiet --done                           # stdin: blob/mark/data per blob, then
+                                                          # get-mark per blob → oids on stdout.
+                                                          # Existing objects are skipped (dedup),
+                                                          # an empty import leaves no pack, small
+                                                          # imports are loosened (fastimport.unpackLimit).
 # trees bottom-up; mktree normalizes entry order:
 git mktree     # stdin lines: "100644 blob <oid>\t<name>"  /  "040000 tree <oid>\t<dirname>"
                # order: tickets/, tombstones/, each attachments/<guid>/, attachments/, then root
@@ -97,7 +102,7 @@ Classified from exit code + stderr patterns into typed errors:
 | `AuthFailed` | stderr auth/credential patterns | actionable message: "run `git fetch` in a terminal once to prime credentials" |
 | `NonFastForward` | push rejection | retry loop (d) |
 | `CasFailed` | update-ref old-value mismatch after retries | re-queue sync |
-| `Timeout` | process killed at deadline | `pendingPush`/`error` per operation |
+| `Timeout` | process killed at deadline (armed at `spawn`; message carries elapsed-since-spawn and any pre-spawn stall) | `pendingPush`/`error` per operation |
 
 Notes: shallow clones are fine (merge is base-free; custom-ref fetch/push work; an `--is-ancestor` failure degrades to "treat as diverged" — safe, just re-merges). Repos with zero commits or detached HEAD are irrelevant — the custom ref is independent of HEAD and the worktree. SSH passphrase prompts can't hang forever (120s timeout) and terminal prompts are disabled.
 

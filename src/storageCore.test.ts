@@ -51,7 +51,7 @@ describe("IssueStoreCore on node:fs (headless path)", () => {
     await a.init();
     const issue = makeIssue({ id: "DS-001", title: "core ticket", tags: ["x"] });
     await a.upsert(issue);
-    a.dispose();
+    await a.close();
 
     expect(fs.existsSync(path.join(dir, "dostuff.db"))).toBe(true);
     expect(fs.existsSync(path.join(dir, ".gitignore"))).toBe(true);
@@ -61,7 +61,7 @@ describe("IssueStoreCore on node:fs (headless path)", () => {
     const loaded = b.get("DS-001");
     expect(loaded?.title).toBe("core ticket");
     expect(loaded?.tags).toEqual(["x"]);
-    b.dispose();
+    await b.close();
   });
 
   test("attachments write/find/read/delete on node:fs", async () => {
@@ -80,7 +80,7 @@ describe("IssueStoreCore on node:fs (headless path)", () => {
 
     await store.deleteAttachmentFile("DS-001", "att1");
     expect(await store.findAttachmentPath("DS-001", "att1")).toBeNull();
-    store.dispose();
+    await store.close();
   });
 
   test("no storageDir and no KV: init yields an empty in-memory store", async () => {
@@ -92,7 +92,7 @@ describe("IssueStoreCore on node:fs (headless path)", () => {
     expect(store.list()).toEqual([]);
     await store.upsert(makeIssue({ id: "DS-001" }));
     expect(store.get("DS-001")).toBeDefined();
-    store.dispose();
+    await store.close();
   });
 });
 
@@ -130,12 +130,12 @@ describe("export queue (concurrency L1)", () => {
     const p1 = store.upsert(base);
     const p2 = store.upsert({ ...base, title: "title B" });
     await Promise.all([p1, p2]);
-    store.dispose();
+    await store.close();
 
     const reader = makeCoreStore(dir);
     await reader.init();
     expect(reader.get("DS-001")?.title).toBe("title B");
-    reader.dispose();
+    await reader.close();
   });
 
   test("a burst of upserts coalesces into few exports and the last state wins", async () => {
@@ -150,7 +150,7 @@ describe("export queue (concurrency L1)", () => {
     await Promise.all(
       Array.from({ length: N }, (_, i) => store.upsert({ ...base, title: `v${i + 1}` })),
     );
-    store.dispose();
+    await store.close();
 
     // All N mutations landed synchronously in the DB before any export
     // snapshot, so the queue needs at most: the running export + one queued
@@ -160,7 +160,7 @@ describe("export queue (concurrency L1)", () => {
     const reader = makeCoreStore(dir);
     await reader.init();
     expect(reader.get("DS-001")?.title).toBe(`v${N}`);
-    reader.dispose();
+    await reader.close();
   });
 });
 
@@ -261,7 +261,7 @@ describe("byte identity: extension-hosted store vs bare core", () => {
     const hosted = new IssueStore(ctxStub, { wasmBinary: WASM_BINARY });
     await hosted.init();
     for (const i of seed) await hosted.upsert(i, { preserveTimestamps: true });
-    hosted.dispose();
+    await hosted.close();
     const hostedBytes = vfs.files.get("/ws/.vscode/dostuff/dostuff.db");
     expect(hostedBytes).toBeDefined();
 
@@ -270,9 +270,171 @@ describe("byte identity: extension-hosted store vs bare core", () => {
     const core = makeCoreStore(dir);
     await core.init();
     for (const i of seed) await core.upsert(i, { preserveTimestamps: true });
-    core.dispose();
+    await core.close();
     const coreBytes = fs.readFileSync(path.join(dir, "dostuff.db"));
 
     expect(Buffer.from(hostedBytes!).equals(coreBytes)).toBe(true);
+  });
+});
+
+describe("list() memo and delta change events", () => {
+  test("list() keeps createdAt-desc order (unparsable dates last, ties stable) and stays fresh per call", async () => {
+    const dir = tempDir();
+    const store = makeCoreStore(dir);
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001", createdAt: "2026-01-01T00:00:00.000Z" }));
+    await store.upsert(makeIssue({ id: "DS-002", createdAt: "not a date" }));
+    await store.upsert(makeIssue({ id: "DS-003", createdAt: "2026-03-01T00:00:00.000Z" }));
+    await store.upsert(makeIssue({ id: "DS-004", createdAt: "2026-03-01T00:00:00.000Z" }));
+    const a = store.list();
+    const b = store.list();
+    expect(a).not.toBe(b); // callers may hold the array across awaits
+    expect(a.map((i) => i.id).slice(0, 2).sort()).toEqual(["DS-003", "DS-004"]);
+    expect(a.map((i) => i.id)[2]).toBe("DS-001");
+    expect(a.map((i) => i.id)[3]).toBe("DS-002");
+    // In-place mutation must invalidate the memo.
+    await store.upsert({ ...store.get("DS-001")!, createdAt: "2026-04-01T00:00:00.000Z" });
+    expect(store.list()[0]!.id).toBe("DS-001");
+    await store.remove("DS-001");
+    expect(store.list().map((i) => i.id)).not.toContain("DS-001");
+    await store.close();
+  });
+
+  test("list() is cheap to call repeatedly on a large board (memoized sort)", async () => {
+    const dir = tempDir();
+    const store = makeCoreStore(dir);
+    await store.init();
+    for (let n = 1; n <= 1000; n++) {
+      await store.upsert(makeIssue({ id: `DS-${String(n).padStart(4, "0")}` }), { preserveTimestamps: true });
+    }
+    const t0 = performance.now();
+    for (let i = 0; i < 2000; i++) store.list();
+    // Pre-memo: 2000 × (copy + sort with two Date allocations per compare) ≈ seconds.
+    expect(performance.now() - t0).toBeLessThan(150);
+    await store.close();
+  });
+
+  test("onChange carries what changed: upsert / remove (with link scrub) / applySync / replaceAll", async () => {
+    const dir = tempDir();
+    const store = makeCoreStore(dir);
+    await store.init();
+    const events: Array<{ upserted: string[]; removed: string[]; reset: boolean; size: number }> = [];
+    const sub = store.onChange((c) =>
+      events.push({ upserted: c.upserted.map((i) => i.id), removed: c.removed, reset: c.reset, size: c.issues.length }),
+    );
+
+    await store.upsert(makeIssue({ id: "DS-001" }));
+    await store.upsert(makeIssue({ id: "DS-002", links: [{ targetId: "DS-001", kind: "relates-to" }] }));
+    expect(events.at(-2)).toEqual({ upserted: ["DS-001"], removed: [], reset: false, size: 1 });
+    expect(events.at(-1)).toEqual({ upserted: ["DS-002"], removed: [], reset: false, size: 2 });
+
+    await store.remove("DS-001");
+    // DS-002 lost its inbound link → it changed too.
+    expect(events.at(-1)).toEqual({ upserted: ["DS-002"], removed: ["DS-001"], reset: false, size: 1 });
+    expect(store.get("DS-002")!.links).toEqual([]);
+
+    await store.applySync({
+      upserts: [makeIssue({ id: "DS-003" })],
+      removals: ["DS-002"],
+      tombstoned: [],
+    });
+    expect(events.at(-1)).toEqual({ upserted: ["DS-003"], removed: ["DS-002"], reset: false, size: 1 });
+
+    await store.replaceAll([makeIssue({ id: "DS-010" })]);
+    expect(events.at(-1)).toMatchObject({ reset: true, size: 1 });
+
+    sub.dispose();
+    await store.close();
+  });
+});
+
+describe("write-behind persistence", () => {
+  function delayedFs(delays: number[]): { fsImpl: StorageFs; counters: { writes: number; renames: number } } {
+    const counters = { writes: 0, renames: 0 };
+    const fsImpl: StorageFs = {
+      ...nodeStorageFs,
+      writeFile: async (p, content) => {
+        const delay = delays[Math.min(counters.writes, delays.length - 1)] ?? 0;
+        counters.writes += 1;
+        await new Promise((r) => setTimeout(r, delay));
+        return nodeStorageFs.writeFile(p, content);
+      },
+      rename: async (from, to) => {
+        counters.renames += 1;
+        return nodeStorageFs.rename(from, to);
+      },
+    };
+    return { fsImpl, counters };
+  }
+
+  test("a burst of sequential upserts persists once, and close() flushes the last state", async () => {
+    const dir = tempDir();
+    const { fsImpl, counters } = delayedFs([0]);
+    const store = makeCoreStore(dir, fsImpl);
+    await store.init();
+    const renamesAfterInit = counters.renames;
+    const base = makeIssue({ id: "DS-001", title: "v0" });
+    for (let i = 1; i <= 20; i++) await store.upsert({ ...base, title: `v${i}` });
+    // Nothing has hit disk yet — each upsert returned after the in-memory commit.
+    expect(counters.renames - renamesAfterInit).toBe(0);
+    await store.close();
+    expect(counters.renames - renamesAfterInit).toBe(1);
+    const reader = makeCoreStore(dir);
+    await reader.init();
+    expect(reader.get("DS-001")?.title).toBe("v20");
+    await reader.close();
+  });
+
+  test("flush() with nothing pending is a no-op; the timer persists on its own", async () => {
+    const dir = tempDir();
+    const { fsImpl, counters } = delayedFs([0]);
+    const store = new IssueStoreCore({
+      storageDir: () => dir,
+      wasmBinary: async () => WASM_BINARY,
+      fs: fsImpl,
+      persistDelayMs: 20,
+    });
+    await store.init();
+    const after = counters.renames;
+    await store.flush();
+    expect(counters.renames).toBe(after);
+    await store.upsert(makeIssue({ id: "DS-001" }));
+    await new Promise((r) => setTimeout(r, 80));
+    expect(counters.renames).toBe(after + 1);
+    await store.flush();
+    expect(counters.renames).toBe(after + 1);
+    await store.close();
+  });
+
+  test("persistDelayMs: 0 keeps the old awaited semantics (dispose without flush is safe)", async () => {
+    const dir = tempDir();
+    const store = new IssueStoreCore({
+      storageDir: () => dir,
+      wasmBinary: async () => WASM_BINARY,
+      persistDelayMs: 0,
+    });
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001", title: "immediate" }));
+    await store.close();
+    const reader = makeCoreStore(dir);
+    await reader.init();
+    expect(reader.get("DS-001")?.title).toBe("immediate");
+    await reader.close();
+  });
+
+  test("globalState (KV) fallback is write-behind too and flushes on close()", async () => {
+    const writes: unknown[] = [];
+    const store = new IssueStoreCore({
+      storageDir: () => null,
+      wasmBinary: async () => WASM_BINARY,
+      kv: { get: () => undefined, update: async (v) => void writes.push(v) },
+    });
+    await store.init();
+    await store.upsert(makeIssue({ id: "DS-001" }));
+    await store.upsert(makeIssue({ id: "DS-002" }));
+    expect(writes).toHaveLength(0);
+    await store.close();
+    expect(writes).toHaveLength(1);
+    expect((writes[0] as Issue[]).map((i) => i.id).sort()).toEqual(["DS-001", "DS-002"]);
   });
 });

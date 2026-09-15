@@ -3,7 +3,7 @@
 // commits survive the host round-trip (see TagEditor's long comment).
 
 import { useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { type Issue, type LinkKind, type TicketLink } from "../types";
+import { type IssueRow, type LinkKind, type TicketLink } from "../types";
 import { Icon, STATUS_META, TYPE_ICON } from "./Icons";
 import { OutboundLinkChip, LINK_KIND_COLOR } from "./Links";
 import {
@@ -30,7 +30,7 @@ interface LinkEditorProps {
    *  caller stores the forward link on the target ticket. Required for inverse
    *  options to be offered. */
   onAddInverse?: (targetId: string, storedKind: LinkKind) => void;
-  allIssues: Issue[];
+  allIssues: IssueRow[];
   /** The ticket being edited — excluded from results so it can't self-link.
    *  Omit in the new-issue modal (no id yet). */
   currentIssueId?: string;
@@ -80,7 +80,7 @@ export function LinkEditor({
     onChange(next);
   };
 
-  const commit = (target: Issue) => {
+  const commit = (target: IssueRow) => {
     setDraft("");
     setOpen(false);
     if (opt.inverse) {

@@ -3,7 +3,7 @@
 // `revealTicket` so the host surfaces the referenced ticket.
 
 import type { CSSProperties } from "react";
-import type { Issue, LinkKind } from "../types";
+import type { IssueRow, LinkKind } from "../types";
 import { Icon, STATUS_META, TYPE_ICON } from "./Icons";
 import { INVERSE_LINK_KIND_LABEL, LINK_KIND_LABEL, type InboundLink } from "./linkModel";
 import { postRevealTicket } from "./messaging";
@@ -17,7 +17,7 @@ export const LINK_KIND_COLOR: Record<LinkKind, string> = {
 
 interface OutboundChipProps {
   kind: LinkKind;
-  target: Issue | undefined;
+  target: IssueRow | undefined;
   targetId: string;
   onRemove?: () => void;
 }
@@ -66,7 +66,7 @@ export function OutboundLinkChip({ kind, target, targetId, onRemove }: OutboundC
 
 interface InboundChipProps {
   link: InboundLink;
-  source: Issue | undefined;
+  source: IssueRow | undefined;
   /** When provided, renders a remove button that deletes the underlying link
    *  from the source ticket — so inbound relationships can be managed from
    *  either side, not just by opening the source. */

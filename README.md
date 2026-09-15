@@ -398,7 +398,57 @@ bun run package
 ## Changelog
 
 <details open>
-<summary><strong>v2.0.0</strong> (unreleased) — shared ticket boards via git, leaner MCP reads</summary>
+<summary><strong>v2.1.1</strong> (unreleased) — a human move resolves a pending request</summary>
+
+**Changed**
+
+- **Moving a ticket into the state an agent asked for now counts as approval.** When an agent has filed `request_ticket_complete` (or `request_ticket_close`) and you move the ticket to Complete (or Closed) yourself — dragging the card, the step-rail arrow, or the detail-panel status picker — the pending request is resolved on the spot instead of lingering under "Awaiting decision". `resolvedAt` is stamped as usual and the record gets "Completion request approved by move to Complete" (wording distinct from the banner's Approve button, so history shows which route resolved it). A mismatched move — to Complete while an OBE close request is pending, or vice versa — leaves the request pending: the two flows mean different things, so that verdict stays explicit.
+- Board cards show a clock badge while a close or completion request is pending, so you can spot them without opening the ticket.
+
+</details>
+
+<details>
+<summary><strong>v2.1.0</strong> (unreleased) — large boards, busy-host resilience for agents</summary>
+
+**Fixed**
+
+- **Git sync no longer freezes the editor on large boards.** A sync cycle used to spawn one `git hash-object` per ticket. Each spawn forks the extension host, and a fork costs 17–45 ms at a ~1 GB host, so a 650-ticket board blocked the extension host for 10–30 s per cycle — and made every git process that finished during the stall look like a 15 s timeout (which is also why agents saw "Cannot reach DoStuff" while the host was merely busy). Every blob in a cycle now goes through one `git fast-import`, an unchanged attachment subtree reuses its tree OID instead of re-running `mktree`, and git timeouts are measured from the child's spawn so a stalled event loop can't fake one; a real timeout now reports how long since spawn and whether the host stalled. At 1,000 tickets the worst stall in a sync cycle measured 179 ms.
+- Edits made in the moments before a window closes are flushed on deactivate (see write-behind below).
+
+**Changed**
+
+- **Persistence is write-behind.** A mutation commits in memory and updates the UI immediately; the wholesale `dostuff.db` rewrite happens at most once per 250 ms window, on window close, or when the store is explicitly flushed. A crash inside that window loses those edits; the tmp+rename write stays atomic, so the file is never torn.
+- **Webviews receive deltas, not the whole board.** List messages carry rows without the unbounded `record` / `statusHistory` / `commits` fields, edits arrive as a delta of just the rows that changed, and the detail panel fetches a ticket's full body on demand. On a 600-ticket board the old full-list broadcast was a multi-MB structured clone to up to three webviews per edit. Sorting in the store, the sidebar, and the board lanes now computes keys once per item instead of allocating `Date`s per comparison.
+- **The agent skill survives a busy host.** The helper script retries timeouts, empty replies, and `503`/`429` with backoff — `DOSTUFF_RETRIES` (default 3) attempts of `DOSTUFF_TIMEOUT` (default 15 s) each — under one `Idempotency-Key`, so a retried `create_ticket` never duplicates. Its errors now say what curl's exit code means ("busy, retry shortly" vs. "nothing is listening") instead of a blanket "cannot reach" that sent people chasing stale registry entries.
+- **MCP server: idempotent writes and backpressure.** A mutating tool call carrying an `Idempotency-Key` header replays the first result for a repeat within 10 minutes (scoped per tool; rejections are not cached, so a retry after a real failure runs for real). A mutating call arriving while 32 writes are already queued gets `503` + `Retry-After: 1` instead of a place in line; reads are never refused. Request bodies are capped at 1 MB.
+
+**Added**
+
+- `bun test -t PERF` (and `bun run bench:scale` for the 10,000-ticket row) prints per-size scaling for spawn counts, persist writes, and webview payloads, and asserts the structural contracts that must not regress.
+
+**Docs**
+
+- [docs/plans/agent-concurrency.md](docs/plans/agent-concurrency.md) records what shipped for concurrent agents and what is deferred (bulk write tools, moving the server off the extension host thread) and why.
+
+</details>
+
+<details>
+<summary><strong>v2.0.1</strong> — git sync hardening, optimistic board moves</summary>
+
+**Fixed**
+
+- **Sync failures back off instead of latching.** A transient network blip used to leave the warning up until the next interval — or forever with `dostuff.sync.intervalMinutes` set to `0`. Failed cycles now retry with exponential backoff (30 s doubling to a 10-minute ceiling), reset on the first successful cycle.
+- **Sync cycles coalesce.** Timers firing faster than a slow remote drains share one queued follow-up instead of stacking cycles, and the network waits (ls-remote, fetch, push) run off the state chain so a hung remote no longer blocks debounced local commits or tip-poll applies.
+- Stopping sync mid-cycle no longer mutates state after the stop.
+
+**Changed**
+
+- Board drag-and-drop moves the card immediately; the host echo confirms or reverts it, so a rejected move snaps back exactly as before.
+
+</details>
+
+<details>
+<summary><strong>v2.0.0</strong> — shared ticket boards via git, leaner MCP reads</summary>
 
 **Added**
 

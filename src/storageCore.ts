@@ -75,6 +75,8 @@ export interface SyncTombstones {
 }
 
 const DB_FILENAME = "dostuff.db";
+/** See `StorageHost.persistDelayMs`. */
+export const DEFAULT_PERSIST_DELAY_MS = 250;
 const DB_TMP_FILENAME = "dostuff.db.tmp";
 const LEGACY_BACKUP_DIR = "legacy-json-backup";
 const SCHEMA_VERSION = 1;
@@ -278,6 +280,19 @@ export function normalize(issue: Issue): { issue: Issue; coerced: string[] } {
  * `vscode.workspace.fs` so the extension keeps exactly its historical IO
  * semantics (and the storage test suite keeps its virtual-FS harness).
  */
+/**
+ * What a store mutation changed. `issues` is the whole (unsorted) cache for
+ * consumers that want it; `upserted` / `removed` let subscribers forward a
+ * delta instead of re-sending the board, and `reset: true` means the cache
+ * was rebuilt wholesale (init, import, merge) so a full refresh is needed.
+ */
+export interface StoreChange {
+  issues: Issue[];
+  upserted: Issue[];
+  removed: string[];
+  reset: boolean;
+}
+
 export interface StorageFs {
   readFile(path: string): Promise<Uint8Array>;
   writeFile(path: string, content: Uint8Array): Promise<void>;
@@ -339,6 +354,18 @@ export interface StorageHost {
   logger?: Logger;
   kv?: KvStore;
   fs?: StorageFs;
+  /**
+   * Write-behind delay for persistence (default 250ms). Every mutation
+   * commits to the in-memory DB and fires `onChange` immediately; the
+   * on-disk image (a wholesale `db.export()` + file write, O(board size)) is
+   * written at most once per `persistDelayMs` window (the timer arms on the
+   * first dirty mutation — a throttle, so a constant stream of edits still
+   * bounds the loss window), or by `flush()` / `close()`. `0` restores the
+   * old awaited-per-mutation path.
+   * Trade-off: a crash inside the window loses that window's edits; the
+   * tmp+rename write stays atomic, so the file is never torn.
+   */
+  persistDelayMs?: number;
 }
 
 // ─── sql.js singleton ─────────────────────────────────────────────────────
@@ -358,17 +385,24 @@ export class IssueStoreCore {
   private cache: Issue[] = [];
   private reservedNumber: number = 0;
   private db: Database | null = null;
-  private readonly emitter = new Emitter<Issue[]>();
+  private readonly emitter = new Emitter<StoreChange>();
   public readonly onChange = this.emitter.event;
+  /** Memoized `list()` order; nulled by `touchCache()` at every cache mutation. */
+  private sorted: Issue[] | null = null;
   private readonly logger: Logger;
   private readonly fs: StorageFs;
   // Export queue state — see exportDb().
   private exportRunning: Promise<void> | null = null;
   private exportQueued: Promise<void> | null = null;
+  /** Write-behind state: unpersisted mutations pending, and the trailing timer. */
+  private dirty = false;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly persistDelayMs: number;
 
   constructor(private readonly host: StorageHost) {
     this.logger = host.logger ?? silentLogger;
     this.fs = host.fs ?? nodeStorageFs;
+    this.persistDelayMs = host.persistDelayMs ?? DEFAULT_PERSIST_DELAY_MS;
   }
 
   // ─── public API ─────────────────────────────────────────────────────────
@@ -380,12 +414,13 @@ export class IssueStoreCore {
     } else {
       this.closeDb();
       this.cache = this.loadFromKv();
+      this.touchCache();
     }
     this.reservedNumber = this.cache.reduce(
       (max, i) => (Number.isFinite(i.number) && i.number > max ? i.number : max),
       0,
     );
-    this.emitter.fire(this.cache);
+    this.fire({ upserted: [], removed: [], reset: true });
   }
 
   /**
@@ -395,6 +430,7 @@ export class IssueStoreCore {
   async reload(): Promise<void> {
     this.closeDb();
     this.cache = [];
+    this.touchCache();
     this.reservedNumber = 0;
     await this.init();
   }
@@ -404,10 +440,34 @@ export class IssueStoreCore {
     this.logger.info(`[${new Date().toISOString()}] ${line}`);
   }
 
+  /**
+   * Issues newest-first by `createdAt`. The sort is memoized across calls
+   * (every mutation path calls `touchCache()`), and the key is parsed once
+   * per issue rather than twice per comparison — `list()` is called several
+   * times per edit by the host, the providers and the sync controller, and
+   * used to re-sort the whole board with two `Date` allocations per compare
+   * each time. Always returns a fresh array: callers hold it across awaits.
+   */
   list(): Issue[] {
-    return [...this.cache].sort(
-      (a, b) => +new Date(b.createdAt) - +new Date(a.createdAt)
-    );
+    if (!this.sorted) {
+      const keyed = this.cache.map((issue, index) => ({
+        issue,
+        key: Date.parse(issue.createdAt) || 0, // unparsable → oldest
+        index,
+      }));
+      keyed.sort((a, b) => b.key - a.key || a.index - b.index);
+      this.sorted = keyed.map((k) => k.issue);
+    }
+    return [...this.sorted];
+  }
+
+  /** Every write to `this.cache` (assignment or in-place) goes through here. */
+  private touchCache(): void {
+    this.sorted = null;
+  }
+
+  private fire(change: Omit<StoreChange, "issues">): void {
+    this.emitter.fire({ issues: this.cache, ...change });
   }
 
   get(id: string): Issue | undefined {
@@ -438,6 +498,7 @@ export class IssueStoreCore {
     const idx = this.cache.findIndex((i) => i.id === next.id);
     if (idx >= 0) this.cache[idx] = next;
     else this.cache.unshift(next);
+    this.touchCache();
     if (this.db) {
       this.runInTransaction(() => {
         if (!opts?.preserveTimestamps && prior) {
@@ -445,15 +506,14 @@ export class IssueStoreCore {
         }
         this.writeIssueRows(this.db!, next);
       });
-      await this.exportDb();
-    } else {
-      await this.persistKv();
     }
-    this.emitter.fire(this.cache);
+    await this.schedulePersist();
+    this.fire({ upserted: [next], removed: [], reset: false });
   }
 
   async remove(id: string): Promise<void> {
     const removed = this.cache.find((i) => i.id === id);
+    const before = this.cache;
     this.cache = this.cache
       .filter((i) => i.id !== id)
       // Inbound link cleanup: the DB cascades `issue_links` rows where this
@@ -465,6 +525,9 @@ export class IssueStoreCore {
           ? { ...i, links: i.links.filter((l) => l.targetId !== id) }
           : i,
       );
+    this.touchCache();
+    // Survivors whose links were scrubbed are new objects → they changed.
+    const scrubbed = this.cache.filter((i) => !before.includes(i));
     if (this.db) {
       this.runInTransaction(() => {
         // Deletion witness for sync — must land in the same transaction as
@@ -479,12 +542,10 @@ export class IssueStoreCore {
         this.db!.run("DELETE FROM issue_links WHERE target_id = ? OR source_id = ?", [id, id]);
         this.db!.run("DELETE FROM issues WHERE id = ?", [id]);
       });
-      await this.exportDb();
-    } else {
-      await this.persistKv();
     }
+    await this.schedulePersist();
     await this.deleteIssueAttachments(id);
-    this.emitter.fire(this.cache);
+    this.fire({ upserted: scrubbed, removed: removed ? [id] : [], reset: false });
   }
 
   async replaceAll(issues: Issue[]): Promise<void> {
@@ -493,6 +554,7 @@ export class IssueStoreCore {
     // exported timestamps/guids (01 §5).
     const next = issues.map((i) => ensureSyncFields(i));
     this.cache = [...next];
+    this.touchCache();
     this.bumpReserved(this.cache);
     if (this.db) {
       const now = new Date().toISOString();
@@ -506,12 +568,10 @@ export class IssueStoreCore {
         this.db!.run("DELETE FROM issues");
         for (const i of next) this.writeIssueRows(this.db!, i);
       });
-      await this.exportDb();
       await this.wipeAttachmentsRoot();
-    } else {
-      await this.persistKv();
     }
-    this.emitter.fire(this.cache);
+    await this.schedulePersist();
+    this.fire({ upserted: [], removed: [], reset: true });
   }
 
   async mergeAll(issues: Issue[]): Promise<void> {
@@ -520,6 +580,7 @@ export class IssueStoreCore {
     const byId = new Map(priorById);
     for (const i of incoming) byId.set(i.id, i);
     this.cache = [...byId.values()];
+    this.touchCache();
     this.bumpReserved(this.cache);
     if (this.db) {
       const now = new Date().toISOString();
@@ -530,11 +591,9 @@ export class IssueStoreCore {
           this.writeIssueRows(this.db!, i);
         }
       });
-      await this.exportDb();
-    } else {
-      await this.persistKv();
     }
-    this.emitter.fire(this.cache);
+    await this.schedulePersist();
+    this.fire({ upserted: [], removed: [], reset: true });
   }
 
   /**
@@ -575,6 +634,7 @@ export class IssueStoreCore {
       if (!seen.has(i.id)) nextCache.unshift(i);
     }
     this.cache = nextCache;
+    this.touchCache();
     this.bumpReserved(this.cache);
 
     if (this.db) {
@@ -585,14 +645,12 @@ export class IssueStoreCore {
         }
         for (const i of upserts) this.writeIssueRows(this.db!, i);
       });
-      await this.exportDb();
-    } else {
-      await this.persistKv();
     }
+    await this.schedulePersist();
     for (const id of removals) {
       if (tombstoned.has(id)) await this.deleteIssueAttachments(id);
     }
-    this.emitter.fire(this.cache);
+    this.fire({ upserted: upserts, removed: removals, reset: false });
   }
 
   /**
@@ -879,6 +937,7 @@ export class IssueStoreCore {
       }
       this.setSchemaMeta(db, "version", String(SCHEMA_VERSION));
       this.cache = migratedIssues;
+      this.touchCache();
       await this.exportDb();
       await this.moveLegacyFilesToBackup(folder, parsed);
       if (parsed.length > 0) {
@@ -888,6 +947,7 @@ export class IssueStoreCore {
       }
     } else {
       this.cache = this.hydrateFromDb(db);
+      this.touchCache();
       const ver = this.getSchemaMeta(db, "version");
       if (ver === null || Number(ver) < SCHEMA_VERSION) {
         // No version stamped, or older — run upgrade hook (no-op today) and stamp.
@@ -1287,6 +1347,49 @@ export class IssueStoreCore {
    * overlapping exports could rename in the wrong order and persist stale
    * bytes until the next write.
    */
+  /**
+   * Write-behind chokepoint for every mutator. With a delay, marks the store
+   * dirty and (re)arms one trailing timer; with `persistDelayMs: 0` it awaits
+   * the write like the pre-2.1 code did.
+   */
+  private schedulePersist(): Promise<void> {
+    this.dirty = true;
+    if (this.persistDelayMs <= 0) return this.persistNow();
+    if (!this.persistTimer) {
+      this.persistTimer = setTimeout(() => {
+        this.persistTimer = null;
+        void this.persistNow().catch((e) => {
+          this.appendLog(`Persist failed: ${e instanceof Error ? e.message : String(e)}`);
+        });
+      }, this.persistDelayMs);
+    }
+    return Promise.resolve();
+  }
+
+  private persistNow(): Promise<void> {
+    this.dirty = false;
+    return this.db ? this.exportDb() : this.persistKv();
+  }
+
+  /** Persist any pending mutation now and wait for in-flight writes to land. */
+  async flush(): Promise<void> {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (this.dirty) await this.persistNow();
+    // Whatever was already running (or queued behind it) must finish too.
+    while (this.exportRunning || this.exportQueued) {
+      await (this.exportQueued ?? this.exportRunning);
+    }
+  }
+
+  /** `flush()` then `dispose()` — the shutdown path for hosts that can await. */
+  async close(): Promise<void> {
+    await this.flush();
+    this.dispose();
+  }
+
   private exportDb(): Promise<void> {
     if (!this.db) return Promise.resolve();
     if (this.exportRunning) {
@@ -1355,7 +1458,18 @@ export class IssueStoreCore {
     await this.host.kv?.update(this.cache);
   }
 
+  /**
+   * Synchronous (VSCode's `Disposable` contract). A pending write-behind is
+   * snapshotted and its file write started, but cannot be awaited here —
+   * hosts that can wait use `close()` (headless) or `flush()` from
+   * `deactivate()` (extension).
+   */
   dispose() {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (this.dirty) void this.persistNow().catch(() => {});
     this.closeDb();
     this.emitter.dispose();
     this.logger.dispose?.();
