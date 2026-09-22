@@ -7,6 +7,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
@@ -21,8 +22,8 @@ import {
   type ForceManyBody,
   type Simulation,
 } from "d3-force";
-import { LINK_KINDS, type LinkKind } from "../types";
-import { Icon, TYPE_ICON } from "./Icons";
+import { LINK_KINDS, STATUSES, type LinkKind, type Status } from "../types";
+import { Icon, STATUS_META, TYPE_ICON } from "./Icons";
 import { LINK_KIND_COLOR } from "./Links";
 import {
   buildGraphModel,
@@ -99,22 +100,52 @@ export function Graph() {
       return next;
     });
 
-  // Edges surviving the kind toggles. Drives both the node set and the rendered
-  // edges, so hiding a kind also hides nodes whose only links were of that kind.
+  // Status toggles — same legend-as-checkbox shape as the kind row, colored
+  // from STATUS_META so the chips read as the node rims. Defaults to all shown.
+  const [shownStatuses, setShownStatuses] = useState<Set<Status>>(() => new Set(STATUSES));
+  const allStatusesShown = shownStatuses.size === STATUSES.length;
+  const toggleStatus = (s: Status) =>
+    setShownStatuses((prev) => {
+      const next = new Set(prev);
+      if (next.has(s)) next.delete(s);
+      else next.add(s);
+      return next;
+    });
+
+  // Nodes surviving the status toggles. Hiding a status removes the node *and*
+  // every edge incident to it, so a chain routed through it breaks rather than
+  // silently short-circuiting.
+  const statusVisibleIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const n of model.nodes) if (shownStatuses.has(n.status)) s.add(n.id);
+    return s;
+  }, [model.nodes, shownStatuses]);
+
+  // Edges surviving the kind + status toggles. Drives both the node set and the
+  // rendered edges, so hiding a kind (or a status at either end) also hides
+  // nodes whose only links ran through it.
   const activeEdges = useMemo(
-    () => model.edges.filter((e) => shownKinds.has(e.kind)),
-    [model.edges, shownKinds],
+    () =>
+      model.edges.filter(
+        (e) =>
+          shownKinds.has(e.kind) &&
+          statusVisibleIds.has(e.sourceId) &&
+          statusVisibleIds.has(e.targetId),
+      ),
+    [model.edges, shownKinds, statusVisibleIds],
   );
 
-  // Node visibility = (text filter, chain-preserving) ∩ (kind toggles). With no
-  // text filter, every node that still has a surviving edge is shown.
-  const visibleIds = useMemo(
-    () =>
-      filterActive
-        ? visibleGraphNodeIds(matchedIds, activeEdges)
-        : new Set(activeEdges.flatMap((e) => [e.sourceId, e.targetId])),
-    [filterActive, matchedIds, activeEdges],
-  );
+  // Node visibility = (text filter, chain-preserving) ∩ (kind ∩ status toggles).
+  // Matches are intersected with the status gate first so a hidden-status node
+  // can never seed a chain; the expansion itself can't reach hidden nodes
+  // because their edges are already gone. With no text filter, every node that
+  // still has a surviving edge is shown.
+  const visibleIds = useMemo(() => {
+    if (!filterActive) return new Set(activeEdges.flatMap((e) => [e.sourceId, e.targetId]));
+    const seeds = new Set<string>();
+    for (const id of matchedIds) if (statusVisibleIds.has(id)) seeds.add(id);
+    return visibleGraphNodeIds(seeds, activeEdges);
+  }, [filterActive, matchedIds, activeEdges, statusVisibleIds]);
 
   // Stable signature: only re-run the layout when the set of nodes/edges
   // actually changes, not on every unrelated issue edit (e.g. a title tweak).
@@ -373,12 +404,13 @@ export function Graph() {
     });
   };
 
-  // Reframe to the visible subset whenever the filter query changes, so the
-  // matched cluster comes into focus without a manual "Fit to view".
+  // Reframe to the visible subset whenever the filter query or the status
+  // selection changes, so the remaining cluster comes into focus without a
+  // manual "Fit to view".
   useEffect(() => {
     fitView();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filter]);
+  }, [filter, shownStatuses]);
 
   if (model.nodes.length === 0) {
     return (
@@ -403,7 +435,7 @@ export function Graph() {
           aria-label="Filter graph"
         />
         <span className="ds-graph-count">
-          {filterActive || !allKindsShown
+          {filterActive || !allKindsShown || !allStatusesShown
             ? `${visibleIds.size} of ${model.nodes.length} shown`
             : `${model.nodes.length} linked ticket${model.nodes.length === 1 ? "" : "s"} · ${model.edges.length} link${model.edges.length === 1 ? "" : "s"}`}
         </span>
@@ -433,6 +465,30 @@ export function Graph() {
                   />
                 </svg>
                 {LINK_KIND_LABEL[k]}
+              </button>
+            );
+          })}
+        </div>
+        <div className="ds-graph-legend ds-graph-status-legend" role="group" aria-label="Toggle ticket statuses">
+          {STATUSES.map((st) => {
+            const shown = shownStatuses.has(st);
+            return (
+              <button
+                key={st}
+                type="button"
+                className={`ds-graph-legend-item ds-graph-legend-toggle${shown ? "" : " is-off"}`}
+                aria-pressed={shown}
+                onClick={() => toggleStatus(st)}
+                title={`${shown ? "Hide" : "Show"} ${STATUS_META[st].label} tickets`}
+              >
+                {/* Same dot the sidebar/link chips use, from the same STATUS_META
+                    palette, so the chip reads as the node rim it controls. */}
+                <span
+                  className="ds-graph-legend-dot"
+                  style={{ background: STATUS_META[st].color }}
+                  aria-hidden="true"
+                />
+                {STATUS_META[st].label}
               </button>
             );
           })}
@@ -552,7 +608,9 @@ export function Graph() {
         <div className="ds-graph-no-match">
           {filterActive
             ? `No linked tickets match “${filter.trim()}”.`
-            : "No relationships of the selected type are shown."}
+            : !allStatusesShown
+              ? "No tickets in the selected statuses are linked."
+              : "No relationships of the selected type are shown."}
         </div>
       )}
     </div>
@@ -599,6 +657,10 @@ function NodeView({ node, label, dimmed, onPointerDown, onActivate }: NodeViewPr
     <g
       transform={`translate(${node.x} ${node.y})`}
       className={`ds-graph-node${dimmed ? " is-dimmed" : ""}`}
+      // The rim carries the ticket's status color (same STATUS_META palette as
+      // the sidebar dots and the status legend chips); hover/focus still
+      // override to --accent, so the click affordance is unchanged.
+      style={{ ["--status-color" as string]: STATUS_META[node.status].color } as CSSProperties}
       data-node={node.id}
       data-dimmed={dimmed ? "true" : undefined}
       tabIndex={0}

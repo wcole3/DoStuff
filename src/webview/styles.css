@@ -1541,6 +1541,15 @@ button { font: inherit; color: inherit; }
 .ds-graph-legend-toggle:hover { background: var(--vsc-hover); }
 .ds-graph-legend-toggle:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 .ds-graph-legend-toggle.is-off { opacity: 0.4; text-decoration: line-through; }
+/* Status toggles reuse the legend-toggle chrome; a round swatch stands in for
+   the kind row's line sample, matching the status dots used elsewhere. */
+.ds-graph-status-legend { gap: 8px; }
+.ds-graph-legend-dot {
+  display: inline-block;
+  width: 7px; height: 7px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
 .ds-graph-reset { margin-left: auto; }
 
 .ds-graph-svg {
@@ -1563,7 +1572,9 @@ button { font: inherit; color: inherit; }
 .ds-graph-node.is-dimmed:hover, .ds-graph-node.is-dimmed:focus-visible { opacity: 0.75; }
 .ds-graph-node-circle {
   fill: var(--vsc-card);
-  stroke: color-mix(in srgb, var(--accent) 70%, transparent);
+  /* --status-color is set per node from STATUS_META; the accent mix is the
+     fallback for any node rendered without one. */
+  stroke: var(--status-color, color-mix(in srgb, var(--accent) 70%, transparent));
   stroke-width: 1.5;
 }
 .ds-graph-node:hover .ds-graph-node-circle {
