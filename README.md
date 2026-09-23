@@ -48,11 +48,23 @@ You can also start a drag in the **sidebar**. The board lights each lane and dra
 
 ### Ticket links
 
-Relate tickets to each other from the detail panel's **Links** field. Pick a relationship — **blocks**, **blocked by**, **child of**, **parent of**, or **relates to** — then search the target by `#number`, `DS-id`, or a title substring. Forward kinds (blocks / child of / relates to) are stored on the current ticket and shown as chips; inverse kinds (blocked by / parent of) define the relationship from the *other* ticket's side without leaving the current one, and appear under **Linked by**. Click any chip to jump to that ticket; remove a **Linked by** chip to delete the relationship from its source. Links are directional and stored once — deleting the link, or the ticket, cleans up both ends. The new-issue dialog offers the same relationships (forward and inverse); inverse ones are applied to their source tickets right after the new ticket is created.
+Relate tickets to each other from the detail panel's **Links** field.
+
+- Pick a relationship — **blocks**, **blocked by**, **child of**, **parent of**, or **relates to** — then search the target by `#number`, `DS-id`, or a title substring.
+- Forward kinds (blocks / child of / relates to) are stored on the current ticket and shown as chips; inverse kinds (blocked by / parent of) define the relationship from the *other* ticket's side without leaving the current one, and appear under **Linked by**.
+- Click any chip to jump to that ticket; remove a **Linked by** chip to delete the relationship from its source. Links are directional and stored once — deleting the link, or the ticket, cleans up both ends.
+- The new-issue dialog offers the same relationships (forward and inverse); inverse ones are applied to their source tickets right after the new ticket is created.
+
 
 ### Graph view
 
-Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear. Edges are colored and arrowed by kind, and the legend doubles as a filter: click a relationship type to hide or show its edges (tickets left with no visible link drop out too). A second row of chips filters by **status** — each node's rim is colored by its status, so the chips read as the graph; hiding a status drops those tickets and any link that ran through them. All the filters compose, and the view reframes on the survivors. **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket. *Fit to view* frames everything currently shown, and **Forces** opens sliders to tune link distance, repulsion, and node spacing on the fly.
+Run **DoStuff: Show Graph** (command palette or the sidebar toolbar) to see the link network as an interactive node-link diagram — only tickets that participate in at least one link appear.
+
+- Edges are colored and arrowed by kind, and the legend doubles as a filter: click a relationship type to hide or show its edges (tickets left with no visible link drop out too). A second row of chips filters by **status** — each node's rim is colored by its status, so the chips read as the graph; hiding a status drops those tickets and any link that ran through them.
+- All the filters compose, and the view reframes on the survivors.
+- **Drag** a node to rearrange; **scroll** to zoom; **drag the background** to pan; **click** a node (or focus it and press Enter) to open that ticket.
+- *Fit to view* frames everything currently shown.
+- **Forces** opens sliders to tune link distance, repulsion, and node spacing on the fly.
 
 Use the **filter** box (by `#id`, title, or tag) to focus on part of the network. Filtering preserves context: a matched ticket keeps its whole connected chain so you never see it stripped of its blockers, children, or related tickets — matches render normally while the surrounding chain dims. The view auto-fits to the matching cluster.
 
@@ -398,7 +410,16 @@ bun run package
 ## Changelog
 
 <details open>
-<summary><strong>v2.1.1</strong> (unreleased) — a human move resolves a pending request</summary>
+<summary><strong>v2.1.2</strong> — add status filters to graph</summary>
+
+**Changed**
+
+- Add filter chips to graph to filter on ticket status, previous graph showed all tickets, always.
+
+</details>
+
+<details>
+<summary><strong>v2.1.1</strong> — a human move resolves a pending request</summary>
 
 **Changed**
 
@@ -408,7 +429,7 @@ bun run package
 </details>
 
 <details>
-<summary><strong>v2.1.0</strong> (unreleased) — large boards, busy-host resilience for agents</summary>
+<summary><strong>v2.1.0</strong> — large boards, busy-host resilience for agents</summary>
 
 **Fixed**
 
