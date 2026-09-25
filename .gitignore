@@ -182,6 +182,9 @@ media/styles.css.map
 media/index.js
 media/index.js.map
 
+# GitHub Pages demo build output (scripts/build-demo.ts)
+demo-dist
+
 #packages
 *.vsix
 

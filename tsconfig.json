@@ -23,5 +23,5 @@
       "vscode": ["./mocks/vscode.ts"]
     }
   },
-  "include": ["src/**/*", "scripts/**/*", "mocks/**/*"]
+  "include": ["src/**/*", "scripts/**/*", "mocks/**/*", "demo/**/*"]
 }

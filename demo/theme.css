@@ -1,0 +1,67 @@
+/* Stand-in for the --vscode-* variables VSCode injects into every webview.
+   Values follow the Dark Modern and Light Modern themes. They sit on the root
+   element (as VSCode sets them) because styles.css resolves them into its own
+   --vsc-* tokens on :root, where a body-level value would never be seen. */
+
+:root {
+  --vscode-font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+  --vscode-font-size: 13px;
+  --vscode-editor-font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Droid Sans Mono", monospace;
+}
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --vscode-editor-background: #1f1f1f;
+  --vscode-foreground: #cccccc;
+  --vscode-descriptionForeground: #9d9d9d;
+  --vscode-disabledForeground: #6e6e6e;
+  --vscode-sideBar-background: #181818;
+  --vscode-sideBar-foreground: #cccccc;
+  --vscode-panel-border: #2b2b2b;
+  --vscode-widget-border: #313131;
+  --vscode-input-background: #313131;
+  --vscode-input-foreground: #cccccc;
+  --vscode-input-border: #3c3c3c;
+  --vscode-list-hoverBackground: #2a2d2e;
+  --vscode-list-activeSelectionBackground: #04395e;
+  --vscode-editorWidget-background: #202020;
+  --vscode-editorHoverWidget-background: #252526;
+  --vscode-tree-tableColumnsBorder: rgba(204, 204, 204, 0.12);
+  --vscode-focusBorder: #0078d4;
+  --vscode-button-background: #0078d4;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-hoverBackground: #026ec1;
+  --vscode-button-secondaryBackground: #313131;
+  --vscode-button-secondaryForeground: #cccccc;
+  --vscode-button-secondaryHoverBackground: #3c3c3c;
+  --vscode-textLink-foreground: #4daafc;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --vscode-editor-background: #ffffff;
+  --vscode-foreground: #3b3b3b;
+  --vscode-descriptionForeground: #6b6b6b;
+  --vscode-disabledForeground: #8b8b8b;
+  --vscode-sideBar-background: #f8f8f8;
+  --vscode-sideBar-foreground: #3b3b3b;
+  --vscode-panel-border: #e5e5e5;
+  --vscode-widget-border: #e5e5e5;
+  --vscode-input-background: #ffffff;
+  --vscode-input-foreground: #3b3b3b;
+  --vscode-input-border: #cecece;
+  --vscode-list-hoverBackground: #f2f2f2;
+  --vscode-list-activeSelectionBackground: #e4e6f1;
+  --vscode-editorWidget-background: #f8f8f8;
+  --vscode-editorHoverWidget-background: #f3f3f3;
+  --vscode-tree-tableColumnsBorder: rgba(97, 97, 97, 0.13);
+  --vscode-focusBorder: #005fb8;
+  --vscode-button-background: #005fb8;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-hoverBackground: #0258a8;
+  --vscode-button-secondaryBackground: #e5e5e5;
+  --vscode-button-secondaryForeground: #3b3b3b;
+  --vscode-button-secondaryHoverBackground: #cccccc;
+  --vscode-textLink-foreground: #005fb8;
+}

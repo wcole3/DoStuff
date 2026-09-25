@@ -1,29 +1,23 @@
 // Sidebar provider — the WebviewView shown in the activity bar.
 
 import * as vscode from "vscode";
-import { randomUUID } from "node:crypto";
 import { IssueStore } from "./storage";
-import { formatIssueId } from "./syncMerge";
 import { getWebviewHtml } from "./webviewHtml";
 import { type IssueRow,
-  coerceLinks,
-  coerceTags,
-  isLinkKind,
   isPriority,
   isType,
   type CommitDetail,
   type Issue,
-  type LinkKind,
   type Settings,
-  type TicketLink,
   type WebviewToHost,
 } from "./types";
-import { validateLinks } from "./types";
 import { changeToMessage, readSettings } from "./webviewProtocol";
 import { toRow } from "./types";
 
-/** The `createIssue` message's `partial` payload (webview → host). */
-export type CreateIssuePartial = Extract<WebviewToHost, { type: "createIssue" }>["partial"];
+// `buildCreatedIssue` / `applyInboundLinks` moved to issueRules.ts (vscode-free, shared with the
+// browser demo); re-exported so old import sites keep working.
+export { applyInboundLinks, buildCreatedIssue, type CreateIssuePartial } from "./issueRules";
+import { applyInboundLinks, buildCreatedIssue } from "./issueRules";
 
 /**
  * Host-supplied handler for "updateIssue" messages. Owns the statusHistory
@@ -110,52 +104,6 @@ const ID_RE = /^DS-\d+$/;
 // ─── createIssue helpers (extracted so they're unit-testable without a webview) ─
 
 /**
- * Build the `Issue` for a new ticket from the webview's `createIssue` partial.
- * New tickets always land in `Thinking` (humans or agents may promote them
- * out later). Tags are coerced; inline forward links are coerced + validated
- * against `knownIds` (unknown targets and self-links are dropped and returned
- * in `droppedLinks` so the caller can log). Pure — no store access.
- */
-export function buildCreatedIssue(
-  partial: CreateIssuePartial,
-  opts: { number: number; now: string; knownIds: ReadonlySet<string> },
-): { issue: Issue; droppedLinks: TicketLink[] } {
-  const id = formatIssueId(opts.number);
-  const status: Issue["status"] = "Thinking";
-  const { kept, dropped } = validateLinks(
-    coerceLinks((partial as { links?: unknown }).links, id),
-    id,
-    opts.knownIds,
-  );
-  const issue: Issue = {
-    id,
-    number: opts.number,
-    title: partial.title,
-    type: partial.type,
-    priority: partial.priority,
-    status,
-    description: typeof partial.description === "string" ? partial.description : "",
-    verifyCriteria: typeof partial.verifyCriteria === "string" ? partial.verifyCriteria : "",
-    tasks: (Array.isArray(partial.tasks) ? partial.tasks : []).map((t) => ({
-      ...t,
-      updatedAt: opts.now,
-    })),
-    tags: coerceTags((partial as { tags?: unknown }).tags),
-    attachments: [],
-    links: kept,
-    createdAt: opts.now,
-    resolvedAt: null,
-    pendingClose: null,
-    statusHistory: [{ status, at: opts.now, by: "user" }],
-    record: [],
-    guid: randomUUID(),
-    updatedAt: opts.now,
-    commits: [],
-  };
-  return { issue, droppedLinks: dropped };
-}
-
-/**
  * Replay inline attachments staged in the new-issue modal through the regular
  * host chokepoint (`onAddBytes`) so size + workspace guards apply identically.
  * Malformed entries are skipped (counted, not thrown). Returns counts.
@@ -179,48 +127,6 @@ export async function applyInlineAttachments(
       }
       await handlers.onAddBytes(issueId, att.name, att.mimeType, new Uint8Array(att.bytes as number[]));
       applied += 1;
-    }
-  }
-  return { applied, skipped };
-}
-
-/**
- * Apply inverse links staged in the modal ("new ticket blocked by X"). Each is
- * stored single-source as a forward link on the source ticket X, pointing at
- * the just-minted ticket. Skips entries with a bad/unknown/self source or bad
- * kind; existing identical links are a no-op (deduped). Returns what was
- * applied + the count skipped.
- */
-export async function applyInboundLinks(
-  store: IssueStore,
-  newIssueId: string,
-  raw: unknown,
-): Promise<{ applied: Array<{ sourceId: string; kind: LinkKind }>; skipped: number }> {
-  const applied: Array<{ sourceId: string; kind: LinkKind }> = [];
-  let skipped = 0;
-  if (Array.isArray(raw)) {
-    for (const inbound of raw) {
-      const sourceId = (inbound as { sourceId?: unknown })?.sourceId;
-      const kind = (inbound as { kind?: unknown })?.kind;
-      if (typeof sourceId !== "string" || !ID_RE.test(sourceId) || sourceId === newIssueId) {
-        skipped += 1;
-        continue;
-      }
-      if (!isLinkKind(kind)) {
-        skipped += 1;
-        continue;
-      }
-      const source = store.get(sourceId);
-      if (!source) {
-        skipped += 1;
-        continue;
-      }
-      if (source.links.some((l) => l.targetId === newIssueId && l.kind === kind)) continue;
-      await store.upsert({
-        ...source,
-        links: [...source.links, { targetId: newIssueId, kind }],
-      });
-      applied.push({ sourceId, kind });
     }
   }
   return { applied, skipped };

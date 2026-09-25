@@ -23,7 +23,9 @@
     "vsce-package": "bun run vsce package --no-dependencies",
     "package": "bun run build && bun run vsce-package",
     "bench:scale": "DOSTUFF_BENCH_SCALE=1 bun test src/perf.bench.test.ts",
-    "clean": "rm -rf ./dist ./media/index.js ./media/index.js.map ./media/styles.css ./media/styles.css.map"
+    "build:demo": "bun run ./scripts/build-demo.ts",
+    "demo": "bun run ./scripts/build-demo.ts --serve",
+    "clean": "rm -rf ./demo-dist ./dist ./media/index.js ./media/index.js.map ./media/styles.css ./media/styles.css.map"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

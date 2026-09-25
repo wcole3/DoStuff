@@ -8,6 +8,8 @@ Keeps an audit log of changes to a ticket — in case you still have the willpow
 
 ![DoStuff board screenshot](media/board_image.png)
 
+**[Try it in your browser →](https://wcole3.github.io/DoStuff/)** The real sidebar, board and graph running on a sample project, saved in your browser. The MCP server, attachments and git sync need the extension.
+
 > **New in 2.0.0** — Share one ticket board across clones and contributors over plain git (a hidden ref, no server, no worktree noise), or skip the VSCode window entirely with the bundled headless server. Claude Code drives the queue for near-zero context cost via the new agent skill, and parallel agents can finally write without clobbering each other. [Full changelog ↓](#changelog)
 
 ## Install
@@ -406,6 +408,8 @@ bun run package
 ```
 
 `bun run package` produces a `.vsix`. In VSCode, right-click the file and choose **Install Extension VSIX**.
+
+`bun run demo` builds the browser demo into `demo-dist/` and serves it at `http://localhost:4173/`. The demo loads the unmodified webview bundle into three iframes, and an in-page stand-in for the extension host (`demo/demoHost.ts`) answers them. That stand-in runs the same update rules as the extension (`src/issueRules.ts`). `.github/workflows/demo-pages.yml` publishes the demo to GitHub Pages on every push to `main`.
 
 ## Changelog
 

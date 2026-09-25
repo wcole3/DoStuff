@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DoStuff</title>
+  <link rel="stylesheet" href="theme.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    // Stand-in for VSCode's webview runtime. The webview bundle reads
+    // `__DOSTUFF_MODE__` and posts through `__VSCODE_API__` (see
+    // src/webview/messaging.ts); here that relays to the parent page, whose
+    // DemoHost plays the extension host. Replies arrive as plain
+    // window messages, exactly like VSCode's.
+    (function () {
+      var mode = new URLSearchParams(location.search).get("mode");
+      if (mode !== "board" && mode !== "graph") mode = "sidebar";
+      window.__DOSTUFF_MODE__ = mode;
+      document.body.dataset.mode = mode;
+      try {
+        document.documentElement.dataset.theme = parent.document.documentElement.dataset.theme || "dark";
+      } catch (e) {}
+      var target = location.origin === "null" ? "*" : location.origin;
+      var state;
+      window.__VSCODE_API__ = {
+        postMessage: function (msg) { parent.postMessage({ __dostuffDemo: 1, mode: mode, msg: msg }, target); },
+        getState: function () { return state; },
+        setState: function (s) { state = s; },
+      };
+    })();
+  </script>
+  <script src="index.js"></script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DoStuff Demo</title>
+  <meta name="description" content="Try DoStuff, the issue board for VSCode with an MCP server for coding agents, right in your browser." />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="shell.css" />
+  <script>
+    // Resolve the theme before first paint so neither the shell nor the
+    // frames flash the wrong palette.
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("dostuff-demo:theme"); } catch (e) {}
+      if (t !== "light" && t !== "dark") {
+        t = window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      }
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="3" y="5" width="5" height="14" rx="1" />
+        <rect x="9.5" y="5" width="5" height="9.5" rx="1" />
+        <rect x="16" y="5" width="5" height="6" rx="1" />
+      </svg>
+      <span class="brand-name">DoStuff</span>
+      <span class="brand-tag">browser demo</span>
+    </div>
+    <nav class="actions" aria-label="Demo controls">
+      <button type="button" class="tb-btn" id="theme-toggle" aria-label="Switch theme"></button>
+      <button type="button" class="tb-btn" id="reset-demo">Reset</button>
+      <a class="tb-btn" href="https://github.com/wcole3/DoStuff" target="_blank" rel="noopener">GitHub</a>
+      <a class="tb-btn tb-primary" href="https://marketplace.visualstudio.com/items?itemName=wcole3.dostuff" target="_blank" rel="noopener">Get the extension</a>
+    </nav>
+  </header>
+
+  <div class="workbench" id="workbench" data-main="board" data-pane="board">
+    <div class="activitybar" aria-hidden="true">
+      <div class="ab-item is-active">
+        <svg viewBox="0 0 24 24">
+          <rect x="3" y="5" width="5" height="14" rx="1" />
+          <rect x="9.5" y="5" width="5" height="9.5" rx="1" />
+          <rect x="16" y="5" width="5" height="6" rx="1" />
+        </svg>
+      </div>
+    </div>
+
+    <section class="pane pane-sidebar" aria-label="Issues sidebar">
+      <div class="pane-title">
+        <span>DoStuff: Issues</span>
+        <!-- The extension's view/title actions (package.json menus). -->
+        <div class="view-actions">
+          <button type="button" class="view-action" data-command="newIssue" title="New Issue…" aria-label="New Issue">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" /></svg>
+          </button>
+          <button type="button" class="view-action" data-command="importJson" title="Import Issues (JSON)…" aria-label="Import Issues (JSON)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V3M5 6l3-3 3 3M3 11v2h10v-2" /></svg>
+          </button>
+          <button type="button" class="view-action" data-command="exportJson" title="Export Issues (JSON)…" aria-label="Export Issues (JSON)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v8M5 8l3 3 3-3M3 11v2h10v-2" /></svg>
+          </button>
+          <button type="button" class="view-action" data-command="clearAll" title="Clear All Issues…" aria-label="Clear All Issues">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5" /></svg>
+          </button>
+        </div>
+      </div>
+      <iframe id="frame-sidebar" title="DoStuff issues sidebar" src="view.html?mode=sidebar"></iframe>
+    </section>
+
+    <div class="sash" id="sash" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
+
+    <section class="pane pane-main" aria-label="Editor area">
+      <div class="tabs" role="tablist" aria-label="Views">
+        <button type="button" role="tab" class="tab tab-sidebar-only" data-pane="sidebar" aria-selected="false">Issues</button>
+        <button type="button" role="tab" class="tab" data-pane="board" aria-selected="true">DoStuff: Board</button>
+        <button type="button" role="tab" class="tab" data-pane="graph" aria-selected="false">DoStuff: Graph</button>
+      </div>
+      <div class="editors">
+        <iframe id="frame-board" class="editor" data-view="board" title="DoStuff board" src="view.html?mode=board"></iframe>
+        <iframe id="frame-graph" class="editor" data-view="graph" title="DoStuff link graph" src="view.html?mode=graph"></iframe>
+      </div>
+    </section>
+  </div>
+
+  <footer class="statusbar">
+    <span class="sb-item sb-accent">DoStuff demo</span>
+    <span class="sb-item" id="storage-status">Saved in this browser</span>
+    <span class="sb-spacer"></span>
+    <span class="sb-item sb-muted" title="Coding agents reach the queue through the extension's local MCP server">MCP server: extension only</span>
+  </footer>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <div class="quickpick-backdrop" id="quickpick" hidden>
+    <div class="quickpick" role="dialog" aria-modal="true" aria-labelledby="quickpick-title">
+      <div class="qp-title" id="quickpick-title"></div>
+      <div class="qp-options" id="quickpick-options"></div>
+    </div>
+  </div>
+
+  <input type="file" id="import-file" accept=".json,application/json" hidden />
+  <script src="shell.js"></script>
+</body>
+</html>
