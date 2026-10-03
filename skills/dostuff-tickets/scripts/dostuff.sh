@@ -110,6 +110,10 @@ post() { # $1=JSON-RPC body
     line=$(discover) || exit $?
     port=${line%%"$(printf '\t')"*}
   fi
+  # 15s covers a wholesale db.export()+write on a ~650-ticket board (the
+  # persist stall an extension host sees under load); a healthy call answers
+  # in well under 1s. 3 attempts with 1s/2s backoff spans one 250ms persist
+  # window plus a sync cycle; most busy-host failures clear by the second try.
   timeout=${DOSTUFF_TIMEOUT:-15}
   attempts=${DOSTUFF_RETRIES:-3}
   key=$(idem_key)

@@ -414,6 +414,17 @@ bun run package
 ## Changelog
 
 <details open>
+<summary><strong>v2.1.3</strong> — restructure the agent skill</summary>
+
+**Changed**
+
+- **`skills/dostuff-tickets/SKILL.md` is reorganized along Anthropic's skill-authoring guide.** It now opens with a contents map, carries a one-row-per-tool table with each tool's gate, a numbered "Work a ticket" sequence, and a symptom → fix failure table keyed to the script's real stderr. Transport detail (manual registry discovery, raw curl, SSE framing, the headless server) moved to `references/transport.md`; `references/tools.md` gained a contents map. Installed copies refresh on activation via the version bump.
+- `scripts/dostuff.sh` documents why its defaults are 15s and 3 attempts.
+- The skill drift tests now derive their expectations from code: every tool's schema parameters and read-only flag must appear in `tools.md`, every `FIELD_LIMITS` cap is exercised at cap and cap+1 against a fake server, documented subcommands and env vars must exist in the script, and reference files must be one level deep. Prose-only string pins were removed.
+
+</details>
+
+<details>
 <summary><strong>v2.1.2</strong> — add status filters to graph</summary>
 
 **Changed**

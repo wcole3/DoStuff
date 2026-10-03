@@ -5,7 +5,21 @@ All requests are `tools/call` POSTs; the tool's payload is the JSON string at
 `result.content[0].text`. Unknown extra fields are **rejected** (strict
 schemas). Over-long values are rejected, never truncated.
 
-Shared enums:
+## Contents
+
+- Shared enums
+- get_ticket (read-only)
+- list_issues (read-only)
+- create_ticket
+- update_ticket_status
+- update_ticket_progress
+- update_ticket_draft (Thinking only)
+- update_ticket_description
+- request_ticket_close / request_ticket_complete
+- Resources (`resources/read`)
+- Worked examples
+
+## Shared enums
 
 - `type`: `Bug | Feature | Refactor | Chore | Spike`
 - `priority`: `Critical | High | Regular | Low`
