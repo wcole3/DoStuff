@@ -1921,7 +1921,13 @@ export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
 
 /** `Idempotency-Key` header of the HTTP request behind a tool call, scoped per tool. */
 function idemKey(extra: { requestInfo?: { headers: Record<string, unknown> } } | undefined, tool: string): string | undefined {
-  const raw = extra?.requestInfo?.headers?.["idempotency-key"];
+  // Case-insensitive on purpose: Node's IncomingMessage and the Fetch Headers
+  // API lowercase names, but the SDK copies headers out of whatever global
+  // Request/Headers is installed, and a DOM shim (happy-dom under bun test)
+  // preserves the wire case ("Idempotency-Key").
+  const headers = extra?.requestInfo?.headers ?? {};
+  const name = Object.keys(headers).find((k) => k.toLowerCase() === "idempotency-key");
+  const raw = name === undefined ? undefined : headers[name];
   const v = Array.isArray(raw) ? raw[0] : raw;
   if (typeof v !== "string") return undefined;
   const key = v.trim().slice(0, 200);
