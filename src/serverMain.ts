@@ -401,12 +401,14 @@ export function stderrLogger(): Logger {
   };
 }
 
-/** dist/server.cjs sits next to sql-wasm.wasm; dev/test runs resolve node_modules. */
+/**
+ * dist/server.cjs sits next to sql-wasm.wasm; dev/test runs resolve node_modules.
+ * `__dirname` only: the CJS bundle has it natively and Bun injects it into TS
+ * modules, so an `import.meta.url` fallback would be dead code that also makes
+ * esbuild warn (import.meta is empty in cjs output).
+ */
 export function resolveWasmPath(): string {
-  const dir =
-    typeof __dirname !== "undefined"
-      ? __dirname
-      : path.dirname(new URL(import.meta.url).pathname);
+  const dir = __dirname;
   const candidates = [
     path.join(dir, "sql-wasm.wasm"),
     path.join(dir, "..", "node_modules", "sql.js", "dist", "sql-wasm.wasm"),
