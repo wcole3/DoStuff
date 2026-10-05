@@ -3597,6 +3597,18 @@ describe("concurrency: Idempotency-Key and write backpressure", () => {
     expect(store.list()).toHaveLength(2);
   });
 
+  test("a key reused with different arguments runs as its own write, not a replay", async () => {
+    const key = "weak-client-key";
+    const a = await call("create_ticket", { title: "First", description: "d" }, { "Idempotency-Key": key });
+    const b = await call("create_ticket", { title: "Second", description: "d" }, { "Idempotency-Key": key });
+    expect(payloadOf(b).id).not.toBe(payloadOf(a).id);
+    expect(store.list().map((i) => i.title).sort()).toEqual(["First", "Second"]);
+    // The true retry — same key, same arguments — still replays.
+    const again = await call("create_ticket", { title: "Second", description: "d" }, { "Idempotency-Key": key });
+    expect(payloadOf(again).id).toBe(payloadOf(b).id);
+    expect(store.list()).toHaveLength(2);
+  });
+
   test("keys are scoped per tool, and calls without a key are never deduplicated", async () => {
     const key = "shared-key";
     const created = await call("create_ticket", { title: "Scoped", description: "d" }, { "Idempotency-Key": key });

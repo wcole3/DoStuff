@@ -50,7 +50,7 @@
 
 import * as http from "http";
 import type { AddressInfo } from "node:net";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { newTaskId } from "./ids";
 import { z } from "zod";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -1919,8 +1919,18 @@ export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   "request_ticket_complete",
 ]);
 
-/** `Idempotency-Key` header of the HTTP request behind a tool call, scoped per tool. */
-function idemKey(extra: { requestInfo?: { headers: Record<string, unknown> } } | undefined, tool: string): string | undefined {
+/**
+ * `Idempotency-Key` header of the HTTP request behind a tool call, scoped per
+ * tool and bound to the arguments. A retry resends the same arguments and
+ * replays; a key reused with different arguments (a client with a weak key
+ * source — two writes in one second once shared a key) runs as its own write
+ * instead of silently returning the earlier result.
+ */
+function idemKey(
+  extra: { requestInfo?: { headers: Record<string, unknown> } } | undefined,
+  tool: string,
+  args: unknown,
+): string | undefined {
   // Case-insensitive on purpose: Node's IncomingMessage and the Fetch Headers
   // API lowercase names, but the SDK copies headers out of whatever global
   // Request/Headers is installed, and a DOM shim (happy-dom under bun test)
@@ -1931,7 +1941,9 @@ function idemKey(extra: { requestInfo?: { headers: Record<string, unknown> } } |
   const v = Array.isArray(raw) ? raw[0] : raw;
   if (typeof v !== "string") return undefined;
   const key = v.trim().slice(0, 200);
-  return key ? `${tool}:${key}` : undefined;
+  if (!key) return undefined;
+  const argsHash = createHash("sha256").update(JSON.stringify(args) ?? "").digest("hex");
+  return `${tool}:${key}:${argsHash}`;
 }
 
 /**
@@ -2013,7 +2025,7 @@ export function registerMcpTools(
         "with a warning; links cannot be edited afterwards via the MCP server.",
       inputSchema: NEW_TICKET_INPUT,
     },
-    async (args, extra) => serialized(() => runCreateTicket(store, args as CreateTicketInput, host), idemKey(extra, "runCreateTicket")),
+    async (args, extra) => serialized(() => runCreateTicket(store, args as CreateTicketInput, host), idemKey(extra, "runCreateTicket", args)),
   );
 
   const liveCap = host.activeLaneCap();
@@ -2028,7 +2040,7 @@ export function registerMcpTools(
         `Each active lane is capped at ${liveCap} tickets; a move that would exceed the cap is rejected. Thinking is uncapped.`,
       inputSchema: STATUS_INPUT,
     },
-    async (args, extra) => serialized(() => runUpdateTicketStatus(store, args as UpdateStatusInput, host), idemKey(extra, "runUpdateTicketStatus")),
+    async (args, extra) => serialized(() => runUpdateTicketStatus(store, args as UpdateStatusInput, host), idemKey(extra, "runUpdateTicketStatus", args)),
   );
 
   mcp.registerTool(
@@ -2047,7 +2059,7 @@ export function registerMcpTools(
       inputSchema: PROGRESS_INPUT,
     },
     async (args, extra) =>
-      serialized(() => runUpdateTicketProgress(store, args as UpdateProgressInput, host), idemKey(extra, "runUpdateTicketProgress")),
+      serialized(() => runUpdateTicketProgress(store, args as UpdateProgressInput, host), idemKey(extra, "runUpdateTicketProgress", args)),
   );
 
   mcp.registerTool(
@@ -2062,7 +2074,7 @@ export function registerMcpTools(
         "Link kinds: blocks, child-of, relates-to (unknown targets are dropped).",
       inputSchema: DRAFT_INPUT,
     },
-    async (args, extra) => serialized(() => runUpdateTicketDraft(store, args as UpdateDraftInput, host), idemKey(extra, "runUpdateTicketDraft")),
+    async (args, extra) => serialized(() => runUpdateTicketDraft(store, args as UpdateDraftInput, host), idemKey(extra, "runUpdateTicketDraft", args)),
   );
 
   mcp.registerTool(
@@ -2075,7 +2087,7 @@ export function registerMcpTools(
       inputSchema: DESCRIPTION_INPUT,
     },
     async (args, extra) =>
-      serialized(() => runUpdateTicketDescription(store, args as UpdateDescriptionInput, host), idemKey(extra, "runUpdateTicketDescription")),
+      serialized(() => runUpdateTicketDescription(store, args as UpdateDescriptionInput, host), idemKey(extra, "runUpdateTicketDescription", args)),
   );
 
   mcp.registerTool(
@@ -2091,7 +2103,7 @@ export function registerMcpTools(
         "ticket left the board. Poll get_ticket with view 'status' to see the outcome.",
       inputSchema: CLOSE_REQUEST_INPUT,
     },
-    async (args, extra) => serialized(() => runRequestTicketClose(store, args as RequestCloseInput, host), idemKey(extra, "runRequestTicketClose")),
+    async (args, extra) => serialized(() => runRequestTicketClose(store, args as RequestCloseInput, host), idemKey(extra, "runRequestTicketClose", args)),
   );
 
   mcp.registerTool(
@@ -2108,7 +2120,7 @@ export function registerMcpTools(
       inputSchema: CLOSE_REQUEST_INPUT,
     },
     async (args, extra) =>
-      serialized(() => runRequestTicketComplete(store, args as RequestCloseInput, host), idemKey(extra, "runRequestTicketComplete")),
+      serialized(() => runRequestTicketComplete(store, args as RequestCloseInput, host), idemKey(extra, "runRequestTicketComplete", args)),
   );
 }
 

@@ -746,17 +746,24 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("dostuff.installAgentSkill", async () => {
       const os = await import("node:os");
-      const { installAgentSkill, SkillInstallError } = await import("./skillInstall");
+      const { installAgentSkill, installedSkillVersion, SkillInstallError } = await import("./skillInstall");
       const src = context.asAbsolutePath(path.join("skills", "dostuff-tickets"));
       const dest = path.join(os.homedir(), ".claude", "skills", "dostuff-tickets");
       const fsNode = await import("node:fs");
       if (fsNode.existsSync(dest)) {
-        const pick = await vscode.window.showWarningMessage(
-          `Replace the existing Claude Code skill at ${dest}?`,
-          { modal: true },
-          "Replace",
-        );
-        if (pick !== "Replace") return;
+        // Same version is still worth offering: the bundled files can differ
+        // from an install of the same version (dev builds, local edits).
+        const installed = installedSkillVersion(dest);
+        const bundled = extensionVersion();
+        const question =
+          installed === bundled
+            ? `The Claude Code skill at ${dest} is already version ${bundled}. Overwrite it with this build's copy?`
+            : installed
+              ? `Replace the Claude Code skill at ${dest} (version ${installed}) with version ${bundled}?`
+              : `Replace the existing Claude Code skill at ${dest}?`;
+        const action = installed === bundled ? "Overwrite" : "Replace";
+        const pick = await vscode.window.showWarningMessage(question, { modal: true }, action);
+        if (pick !== action) return;
       }
       try {
         const { copied } = installAgentSkill(src, dest, extensionVersion());

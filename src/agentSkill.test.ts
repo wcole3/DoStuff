@@ -649,6 +649,39 @@ describe("agent skill: retries with a stable Idempotency-Key", () => {
     }
   }, 20_000);
 
+  test("calls fired in the same second each carry a distinct key", async () => {
+    const keys: string[] = [];
+    const result = { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ ok: true }) }] } };
+    const srv = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        keys.push(req.headers["idempotency-key"] as string);
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(result));
+      });
+    });
+    const port = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as net.AddressInfo).port)),
+    );
+    try {
+      const runs = await Promise.all(
+        Array.from({ length: 12 }, () => runScript(["call", "list_issues", "{}"], { env: { DOSTUFF_PORT: String(port) } })),
+      );
+      for (const r of runs) expect(r.code).toBe(0);
+      expect(keys).toHaveLength(12);
+      expect(new Set(keys).size).toBe(12);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  }, 20_000);
+
+  test("the key never comes from a clock-seeded awk srand()", () => {
+    const body = script.slice(script.indexOf("idem_key() {"));
+    const code = body.slice(0, body.indexOf("\n}\n")).replace(/#.*$/gm, "");
+    expect(code).not.toMatch(/srand\(/);
+    expect(code).toMatch(/\/dev\/urandom/);
+  });
+
   test("a 503 that never clears fails with a busy message after the retry budget", async () => {
     const srv = http.createServer((_req, res) => {
       res.statusCode = 503;
