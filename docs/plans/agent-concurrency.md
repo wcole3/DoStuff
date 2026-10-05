@@ -11,7 +11,7 @@ Parallel agents drive the ticket queue through the skill (`skills/dostuff-ticket
 | # | Change | Where |
 |---|--------|-------|
 | 1 | Script retries timeouts / empty replies / 503 / 429 with 1s, 2s backoff, bounded by `DOSTUFF_RETRIES` (default 3); per-attempt budget `DOSTUFF_TIMEOUT` (default 15s); exit-code-specific error messages | `dostuff.sh` `post()` / `transport_die()` |
-| 2 | `Idempotency-Key` header: the server caches a mutating tool's result per `(tool, key)` for 10 minutes (500 entries) and replays it on a repeat, joining an in-flight call if still running; rejections are not cached. The script sends one key per logical call across all its attempts | `mcpServer.ts` `WriteQueue.run(task, key)` |
+| 2 | `Idempotency-Key` header: the server caches a mutating tool's result per `(tool, key, sha256(args))` for 10 minutes (500 entries) and replays it on a repeat, joining an in-flight call if still running; rejections are not cached. The script sends one key per logical call across all its attempts, drawn from `/dev/urandom` (a key reused with different arguments runs as a fresh write, not a replay) | `mcpServer.ts` `WriteQueue.run(task, key)` |
 | 3 | Backpressure: a mutating `tools/call` arriving while `MAX_PENDING_WRITES` (32) writes are queued gets `503` + `Retry-After: 1` before the transport runs. Reads never refused. The HTTP layer now parses the body itself (streamed, 1 MB cap) and passes it to the transport | `mcpServer.ts` `handleHttpRequest`, `isMutatingRpc`, `writeQueueDepth` |
 
 Tests: `mcpServer.test.ts` "concurrency: Idempotency-Key and write backpressure"; `agentSkill.test.ts` "transport failure messages" and "retries with a stable Idempotency-Key".
