@@ -63,6 +63,15 @@ function readMarker(destDir: string): SkillMarker | null {
 }
 
 /**
+ * Version recorded by the last extension-managed install at `destDir`, or
+ * null when nothing is there or the copy has no marker (a manual copy). Lets
+ * the install command say what an overwrite would replace.
+ */
+export function installedSkillVersion(destDir: string): string | null {
+  return readMarker(destDir)?.version ?? null;
+}
+
+/**
  * Recursively copy the skill package, replacing any existing install, restore
  * the execute bit on shell scripts (vsce packaging does not preserve file
  * modes), and write the version/hash marker. Returns the copied file paths

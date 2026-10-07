@@ -17,6 +17,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { registerMcpTools, type DoStuffMcpServer } from "./mcpServer";
 import { FIELD_LIMITS } from "./mcpLimits";
+import { PRIORITIES, STATUSES, TYPES } from "./types";
+import { DEFAULT_WORKFLOW_PROMPT } from "./workflowPrompt";
 import {
   bootServer,
   makeTestStore,
@@ -33,7 +35,7 @@ const SCRIPT = nodePath.join(SKILL_DIR, "scripts", "dostuff.sh");
 // truncated by Claude Code), a skill body is not hard-cut — but it loads into
 // context on every trigger and stays for the session, so it must remain far
 // cheaper than the surface it replaces. Cut prose rather than raising this.
-const SKILL_BODY_BYTE_BUDGET = 10_000;
+const SKILL_BODY_BYTE_BUDGET = 8_000;
 
 // The always-in-context cost: Claude Code truncates the name+description skill
 // listing entry at 1,536 chars. Stay well under so trigger phrases survive.
@@ -58,23 +60,6 @@ function frontmatter(): Record<string, string> {
     }
   }
   return out;
-}
-
-async function registeredToolNames(): Promise<string[]> {
-  setMcpConfig({});
-  try {
-    const store = await makeTestStore([]);
-    const mcp = new McpServer({ name: "skill-test", version: "0.0.0" });
-    registerMcpTools(mcp, store);
-    const client = new Client({ name: "skill-test-client", version: "0.0.0" });
-    const [ct, st] = InMemoryTransport.createLinkedPair();
-    await Promise.all([client.connect(ct), mcp.connect(st)]);
-    const res = await client.listTools();
-    await client.close();
-    return res.tools.map((t) => t.name);
-  } finally {
-    restoreMcpConfig();
-  }
 }
 
 // Async on purpose: several tests call the script against an HTTP server that
@@ -110,104 +95,195 @@ function makeJqlessPath(): string {
   return dir;
 }
 
+// The static tests below are drift guards, not prose pins: each derives its
+// expectation from code (the registered tools and their schemas, FIELD_LIMITS,
+// the enums in types.ts, the workflow prompt, the script's own command table)
+// or from a structural rule in Anthropic's skill-authoring guide (contents
+// map, one-level-deep references). A test that only re-reads a sentence the
+// doc author just wrote does not belong here.
+
+const REFERENCES_DIR = nodePath.join(SKILL_DIR, "references");
+const referenceFiles = fs.readdirSync(REFERENCES_DIR).filter((f) => f.endsWith(".md"));
+const referenceText = Object.fromEntries(
+  referenceFiles.map((f) => [f, fs.readFileSync(nodePath.join(REFERENCES_DIR, f), "utf8")]),
+);
+
+// A reference file long enough that a partial read (head -100) would miss
+// sections needs a contents map up top (skill-authoring guide).
+const CONTENTS_MAP_LINE_THRESHOLD = 100;
+
+interface ToolShape {
+  name: string;
+  params: string[];
+  readOnly: boolean;
+}
+
+async function registeredTools(): Promise<ToolShape[]> {
+  setMcpConfig({});
+  try {
+    const store = await makeTestStore([]);
+    const mcp = new McpServer({ name: "skill-test", version: "0.0.0" });
+    registerMcpTools(mcp, store);
+    const client = new Client({ name: "skill-test-client", version: "0.0.0" });
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await Promise.all([client.connect(ct), mcp.connect(st)]);
+    const res = await client.listTools();
+    await client.close();
+    return res.tools.map((t) => ({
+      name: t.name,
+      params: Object.keys((t.inputSchema as { properties?: Record<string, unknown> }).properties ?? {}),
+      readOnly: t.annotations?.readOnlyHint === true,
+    }));
+  } finally {
+    restoreMcpConfig();
+  }
+}
+
+// Subcommands the script actually dispatches — parsed from its final `case`.
+function scriptSubcommands(): string[] {
+  const tail = script.slice(script.lastIndexOf('case "$cmd" in'));
+  return [...tail.matchAll(/^\s+([a-z]+)\)\s/gm)].map((m) => m[1]!);
+}
+
 describe("agent skill: static shape", async () => {
-  test("skill files exist and the script is valid sh", async () => {
-    expect(fs.existsSync(SKILL_MD)).toBe(true);
-    expect(fs.existsSync(TOOLS_MD)).toBe(true);
-    expect(fs.existsSync(SCRIPT)).toBe(true);
-    const p = Bun.spawnSync(["sh", "-n", SCRIPT]);
-    expect(p.exitCode).toBe(0);
+  test("script is valid sh", () => {
+    expect(Bun.spawnSync(["sh", "-n", SCRIPT]).exitCode).toBe(0);
   });
 
-  test("frontmatter parses, names the skill, and scopes tools", async () => {
+  test("frontmatter names the installed skill and grants the tools the script needs", () => {
+    // The name is the install directory (skillInstall.ts) and the plugin id;
+    // Bash(sh:*) runs the script, Bash(curl:*) is the manual fallback.
     const fm = frontmatter();
     expect(fm.name).toBe("dostuff-tickets");
     expect(fm["allowed-tools"]).toContain("Bash(curl:*)");
     expect(fm["allowed-tools"]).toContain("Bash(sh:*)");
   });
 
-  test("name + description fit the listing budget and carry trigger phrases", async () => {
+  test("name + description fit the listing budget and carry trigger phrases", () => {
     const fm = frontmatter();
-    const listing = `${fm.name}: ${fm.description}`;
-    expect(listing.length).toBeLessThanOrEqual(SKILL_LISTING_CHAR_BUDGET);
+    expect(`${fm.name}: ${fm.description}`.length).toBeLessThanOrEqual(SKILL_LISTING_CHAR_BUDGET);
     expect(fm.description).toMatch(/ticket/i);
     expect(fm.description).toContain("DS-");
     expect(fm.description).toMatch(/DoStuff/);
   });
 
-  test("SKILL.md fits its byte budget", async () => {
+  test("SKILL.md fits its byte budget", () => {
     expect(Buffer.byteLength(skillMd, "utf8")).toBeLessThanOrEqual(SKILL_BODY_BYTE_BUDGET);
   });
 
-  test("every registered MCP tool is documented in SKILL.md and references/tools.md", async () => {
-    const names = await registeredToolNames();
-    expect(names.length).toBeGreaterThanOrEqual(9);
-    for (const name of names) {
-      expect(skillMd).toContain(name);
-      expect(toolsMd).toContain(name);
+  test("SKILL.md opens with a contents map; long reference files carry one too", () => {
+    // The map must precede the first instructional section so a partial read
+    // still shows the whole scope of the skill.
+    const firstSection = skillMd.indexOf("\n## ");
+    const contents = skillMd.indexOf("\n## Contents");
+    expect(contents).toBeGreaterThan(-1);
+    expect(contents).toBe(firstSection);
+    for (const [file, text] of Object.entries(referenceText)) {
+      if (text.split("\n").length > CONTENTS_MAP_LINE_THRESHOLD) {
+        expect(text, `${file} exceeds ${CONTENTS_MAP_LINE_THRESHOLD} lines and needs a ## Contents map`)
+          .toContain("\n## Contents");
+      }
     }
   });
 
-  test("carries the human-approval, immutability, write-terse and recordLimit rules", async () => {
-    expect(skillMd).toContain("request_ticket_close");
-    expect(skillMd).toContain("request_ticket_complete");
-    expect(skillMd).toMatch(/only a human/i);
-    expect(skillMd).toMatch(/title, priority, type/);
-    expect(skillMd).toContain("~15 words");
-    expect(skillMd).toContain("recordLimit");
-    expect(skillMd).toContain("Verification");
-    expect(skillMd).toMatch(/mcp__dostuff__/); // coexistence rule with a registered server
+  test("every reference file is linked from SKILL.md and none links to another", () => {
+    // One level deep: Claude partially reads files reached via a second hop.
+    expect(referenceFiles.length).toBeGreaterThan(0);
+    for (const file of referenceFiles) {
+      expect(skillMd, `SKILL.md never mentions references/${file}`).toContain(`references/${file}`);
+      for (const [other, text] of Object.entries(referenceText)) {
+        if (other !== file) {
+          expect(text, `${other} links to ${file}; references must be one level deep`).not.toContain(file);
+        }
+      }
+    }
   });
 
-  test("documents the expectedUpdatedAt CAS guard on the replace-shaped writes", () => {
-    // Concurrency L3: parallel subagents must know the opt-in stale-write
-    // rejection exists, or the one-writer-per-ticket rule is their only tool.
-    expect(skillMd).toContain("expectedUpdatedAt");
-    expect(toolsMd).toContain("expectedUpdatedAt");
-    expect(toolsMd).toMatch(/updatedAt.*from your last read/);
+  test("the contents map in SKILL.md names every section", () => {
+    const sections = [...skillMd.matchAll(/^## (.+)$/gm)].map((m) => m[1]!).filter((s) => s !== "Contents");
+    const map = skillMd.slice(skillMd.indexOf("## Contents"), skillMd.indexOf("\n## ", skillMd.indexOf("## Contents") + 1));
+    for (const s of sections) expect(map, `contents map omits section "${s}"`).toContain(s);
+  });
+
+  test("every registered tool is documented, with its parameters and read-only marking", async () => {
+    const tools = await registeredTools();
+    expect(tools.length).toBeGreaterThanOrEqual(9);
+    for (const t of tools) {
+      // SKILL.md: one table row per tool.
+      expect(skillMd).toMatch(new RegExp(`^\\| \`${t.name}\` \\|`, "m"));
+      // tools.md: a heading, every schema property, and the read-only flag
+      // that lets Claude Code dispatch it concurrently.
+      // Two request tools share one heading, so match the name anywhere on it.
+      const hm = toolsMd.match(new RegExp(`^## .*\\b${t.name}\\b.*$`, "m"));
+      expect(hm, `tools.md has no section for ${t.name}`).toBeTruthy();
+      const heading = hm!.index!;
+      const headingLine = toolsMd.slice(heading, toolsMd.indexOf("\n", heading));
+      if (t.readOnly) expect(headingLine, `${t.name} is readOnlyHint but not marked`).toContain("read-only");
+      else expect(headingLine).not.toContain("read-only");
+      const next = toolsMd.indexOf("\n## ", heading + 1);
+      const section = toolsMd.slice(heading, next === -1 ? undefined : next);
+      for (const p of t.params) {
+        expect(section, `tools.md section for ${t.name} omits param ${p}`).toContain(`\`${p}\``);
+      }
+    }
+  });
+
+  test("tools.md lists every enum value the schemas accept", () => {
+    for (const v of [...STATUSES, ...PRIORITIES, ...TYPES]) expect(toolsMd).toContain(v);
+    // SKILL.md must name the terminal states: the human-only rule is about them.
+    for (const s of STATUSES) expect(skillMd).toContain(s);
+  });
+
+  test("the skill's write-terse rule matches the workflow prompt's", () => {
+    // Agents reach the rule through either surface; the two must not drift.
+    const m = DEFAULT_WORKFLOW_PROMPT.match(/~\d+ words/);
+    expect(m).toBeTruthy();
+    expect(skillMd).toContain(m![0]);
+    expect(skillMd).toMatch(/only a human/i);
+    expect(skillMd).toMatch(/mcp__dostuff__/); // coexistence with a registered server
   });
 
   test("plugin manifest version tracks the extension version", () => {
-    // The plugin marketplace channel only picks up skill changes when the
-    // plugin version bumps; pin it to package.json so a release can't ship a
-    // stale plugin. The extension-copy channel uses the same version for its
-    // auto-update marker (skillInstall.ts).
     const root = nodePath.resolve(import.meta.dir, "..");
     const pkg = JSON.parse(fs.readFileSync(nodePath.join(root, "package.json"), "utf8"));
-    const plugin = JSON.parse(
-      fs.readFileSync(nodePath.join(root, ".claude-plugin", "plugin.json"), "utf8"),
-    );
+    const plugin = JSON.parse(fs.readFileSync(nodePath.join(root, ".claude-plugin", "plugin.json"), "utf8"));
     expect(plugin.version).toBe(pkg.version);
   });
 
-  test("does not hardcode the active lane cap", async () => {
-    // The cap tracks the dostuff.activeLaneCap setting; the skill must describe
-    // it, never state a number that would drift.
-    expect(skillMd).not.toMatch(/cap(ped)?\s*(at|of)?\s*\d/i);
-    expect(toolsMd).not.toMatch(/cap(ped)?\s*(at|of)?\s*\d/i);
+  test("does not hardcode the active lane cap", () => {
+    // The cap tracks the dostuff.activeLaneCap setting.
+    for (const text of [skillMd, ...Object.values(referenceText)]) {
+      expect(text).not.toMatch(/cap(ped)?\s*(at|of)?\s*\d/i);
+    }
   });
 
-  test("script cap table and reference doc stay in sync with FIELD_LIMITS", async () => {
-    // Script cap table (field:max pairs, exact spellings).
-    expect(script).toContain(`title:${FIELD_LIMITS.title}`);
-    expect(script).toContain(`description:${FIELD_LIMITS.description}`);
-    expect(script).toContain(`verifyCriteria:${FIELD_LIMITS.verifyCriteria}`);
-    expect(script).toContain(`tasks:${FIELD_LIMITS.taskText}`);
-    expect(script).toContain(`tags:${FIELD_LIMITS.tag}`);
-    expect(script).toContain(`note:${FIELD_LIMITS.statusNote}`);
-    expect(script).toContain(`recordEntry:${FIELD_LIMITS.recordEntry}`);
-    expect(script).toContain(`note:${FIELD_LIMITS.note}`);
-    expect(script).toContain(`{${FIELD_LIMITS.commitMinHex},${FIELD_LIMITS.commitMaxHex}}`);
-    expect(script).toContain(`-le ${FIELD_LIMITS.recordLimitMax}`);
-    expect(script).toContain(`-le ${FIELD_LIMITS.listLimitMax}`);
-    // Reference doc carries the same numbers.
-    expect(toolsMd).toContain(`${FIELD_LIMITS.title}`);
-    expect(toolsMd).toContain(`${FIELD_LIMITS.description}`);
-    expect(toolsMd).toContain(`${FIELD_LIMITS.statusNote}`);
-    expect(toolsMd).toContain(`${FIELD_LIMITS.recordEntry}`);
-    expect(toolsMd).toContain(`${FIELD_LIMITS.tag}`);
+  test("docs only invoke subcommands and env vars the script implements", () => {
+    const subs = scriptSubcommands();
+    expect(subs).toEqual(expect.arrayContaining(["discover", "call", "resource"]));
+    const docs = [skillMd, ...Object.values(referenceText)].join("\n");
+    for (const m of docs.matchAll(/dostuff\.sh\s+([a-z]+)/g)) {
+      expect(subs, `docs invoke unknown subcommand "${m[1]}"`).toContain(m[1]!);
+    }
+    // $DOSTUFF_SERVER_JS is a user placeholder in the headless-server snippet,
+    // not a variable the script reads.
+    const envInDocs = new Set([...skillMd.matchAll(/DOSTUFF_[A-Z_]+/g)].map((m) => m[0]));
+    for (const v of envInDocs) expect(script, `SKILL.md documents ${v} but the script never reads it`).toContain(v);
+  });
+
+  test("the failure table is keyed to the script's real stderr", () => {
+    // Each symptom an agent is told to match must be a string the script emits.
+    for (const phrase of ["Nothing is listening", "did not answer within", "exceeds", "busy", "No registry"]) {
+      expect(script).toContain(phrase);
+      expect(skillMd, `SKILL.md failure table lost symptom "${phrase}"`).toContain(phrase);
+    }
+  });
+
+  test("tools.md carries every FIELD_LIMITS number", () => {
+    for (const [k, v] of Object.entries(FIELD_LIMITS)) {
+      if (k === "commitMinHex" || k === "commitMaxHex") continue;
+      expect(toolsMd, `tools.md omits FIELD_LIMITS.${k} = ${v}`).toContain(String(v));
+    }
     expect(toolsMd).toContain(`${FIELD_LIMITS.commitMinHex}–${FIELD_LIMITS.commitMaxHex}`);
-    expect(toolsMd).toContain(`${FIELD_LIMITS.listLimitMax}`);
   });
 });
 
@@ -348,17 +424,75 @@ describe("agent skill: live server round-trip", async () => {
     expect(r.stdout).toContain("ERROR:");
   });
 
-  test("over-cap recordEntry is rejected locally with exit 2 and no request", async () => {
-    const long = "x".repeat(FIELD_LIMITS.recordEntry + 1);
-    // A dead port proves no request was attempted: a network error would exit 1
-    // with the connectivity hint, not 2 with the cap message.
-    const r = await runScript(
-      ["call", "update_ticket_progress", JSON.stringify({ id: "DS-001", recordEntry: long })],
-      { env: { DOSTUFF_PORT: "1" } },
+  test("every FIELD_LIMITS cap is enforced locally at cap+1 and let through at cap", async () => {
+    // Behavioral mirror of the script's caps_for() table: the string greps this
+    // replaced could pass while the jq check silently measured the wrong field.
+    // A fake server counts arrivals so "no request sent" is proven, not read
+    // off stderr.
+    const L = FIELD_LIMITS;
+    const cases: Array<{ tool: string; field: string; cap: number; wrap: (v: string) => unknown }> = [
+      { tool: "create_ticket", field: "title", cap: L.title, wrap: (v) => v },
+      { tool: "create_ticket", field: "description", cap: L.description, wrap: (v) => v },
+      { tool: "create_ticket", field: "verifyCriteria", cap: L.verifyCriteria, wrap: (v) => v },
+      { tool: "create_ticket", field: "tasks", cap: L.taskText, wrap: (v) => ["ok", v] },
+      { tool: "create_ticket", field: "tags", cap: L.tag, wrap: (v) => ["ok", v] },
+      { tool: "update_ticket_status", field: "note", cap: L.statusNote, wrap: (v) => v },
+      { tool: "update_ticket_progress", field: "recordEntry", cap: L.recordEntry, wrap: (v) => v },
+      { tool: "update_ticket_draft", field: "tags", cap: L.tag, wrap: (v) => [v] },
+      { tool: "update_ticket_draft", field: "tasks", cap: L.taskText, wrap: (v) => [{ text: "ok" }, { text: v }] },
+      { tool: "update_ticket_description", field: "description", cap: L.description, wrap: (v) => v },
+      { tool: "update_ticket_description", field: "note", cap: L.note, wrap: (v) => v },
+      { tool: "request_ticket_close", field: "note", cap: L.note, wrap: (v) => v },
+      { tool: "request_ticket_complete", field: "note", cap: L.note, wrap: (v) => v },
+    ];
+    let hits = 0;
+    const ok = JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "{}" }] } });
+    const srv = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => { hits++; res.setHeader("Content-Type", "application/json"); res.end(ok); });
+    });
+    const fakePort = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as net.AddressInfo).port)),
     );
-    expect(r.code).toBe(2);
-    expect(r.stderr).toContain(`exceeds ${FIELD_LIMITS.recordEntry}`);
-    expect(r.stderr).toContain("No request sent");
+    const base = (tool: string) => (tool === "create_ticket" ? { title: "t" } : tool === "update_ticket_status" ? { id: "DS-001", status: "Working" } : tool === "update_ticket_description" ? { id: "DS-001", description: "d" } : { id: "DS-001" });
+    try {
+      for (const c of cases) {
+        const label = `${c.tool}.${c.field}`;
+        const over = await runScript(
+          ["call", c.tool, JSON.stringify({ ...base(c.tool), [c.field]: c.wrap("x".repeat(c.cap + 1)) })],
+          { env: { DOSTUFF_PORT: String(fakePort) } },
+        );
+        expect(over.code, label).toBe(2);
+        expect(over.stderr, label).toContain(`field ${c.field} exceeds ${c.cap}`);
+        expect(over.stderr, label).toContain("No request sent");
+        const before = hits;
+        const at = await runScript(
+          ["call", c.tool, JSON.stringify({ ...base(c.tool), [c.field]: c.wrap("x".repeat(c.cap)) })],
+          { env: { DOSTUFF_PORT: String(fakePort) } },
+        );
+        expect(at.code, label).toBe(0);
+        expect(hits, `${label}: a value exactly at the cap must reach the server`).toBe(before + 1);
+      }
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  }, 60_000);
+
+  test("commit sha and numeric ranges are validated locally from FIELD_LIMITS", async () => {
+    const dead = { env: { DOSTUFF_PORT: "1" } };
+    const bad = [
+      ["update_ticket_progress", { id: "DS-001", commit: "x".repeat(FIELD_LIMITS.commitMinHex) }, "commit must be"],
+      ["update_ticket_progress", { id: "DS-001", commit: "a".repeat(FIELD_LIMITS.commitMaxHex + 1) }, "commit must be"],
+      ["get_ticket", { query: "1", recordLimit: FIELD_LIMITS.recordLimitMax + 1 }, `recordLimit must be 0-${FIELD_LIMITS.recordLimitMax}`],
+      ["list_issues", { limit: FIELD_LIMITS.listLimitMax + 1 }, `limit must be 1-${FIELD_LIMITS.listLimitMax}`],
+      ["list_issues", { limit: 0 }, `limit must be 1-${FIELD_LIMITS.listLimitMax}`],
+    ] as const;
+    for (const [tool, args, msg] of bad) {
+      const r = await runScript(["call", tool, JSON.stringify(args)], dead);
+      expect(r.code, `${tool} ${JSON.stringify(args)}`).toBe(2);
+      expect(r.stderr).toContain(msg);
+      expect(r.stderr).toContain("No request sent");
+    }
   });
 
   test("without jq the same over-cap input reaches the server and is rejected there", async () => {
@@ -514,6 +648,39 @@ describe("agent skill: retries with a stable Idempotency-Key", () => {
       await new Promise((resolve) => srv.close(resolve));
     }
   }, 20_000);
+
+  test("calls fired in the same second each carry a distinct key", async () => {
+    const keys: string[] = [];
+    const result = { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify({ ok: true }) }] } };
+    const srv = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        keys.push(req.headers["idempotency-key"] as string);
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(result));
+      });
+    });
+    const port = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as net.AddressInfo).port)),
+    );
+    try {
+      const runs = await Promise.all(
+        Array.from({ length: 12 }, () => runScript(["call", "list_issues", "{}"], { env: { DOSTUFF_PORT: String(port) } })),
+      );
+      for (const r of runs) expect(r.code).toBe(0);
+      expect(keys).toHaveLength(12);
+      expect(new Set(keys).size).toBe(12);
+    } finally {
+      await new Promise((resolve) => srv.close(resolve));
+    }
+  }, 20_000);
+
+  test("the key never comes from a clock-seeded awk srand()", () => {
+    const body = script.slice(script.indexOf("idem_key() {"));
+    const code = body.slice(0, body.indexOf("\n}\n")).replace(/#.*$/gm, "");
+    expect(code).not.toMatch(/srand\(/);
+    expect(code).toMatch(/\/dev\/urandom/);
+  });
 
   test("a 503 that never clears fails with a busy message after the retry budget", async () => {
     const srv = http.createServer((_req, res) => {

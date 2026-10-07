@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   installAgentSkill,
+  installedSkillVersion,
   maybeUpdateAgentSkill,
   MARKER_FILE,
   SkillInstallError,
@@ -41,6 +42,15 @@ describe("installAgentSkill", () => {
     const { copied } = installAgentSkill(SKILL_SRC, dest);
     expect(fs.existsSync(path.join(dest, "stale.md"))).toBe(false);
     expect(copied).toContain("SKILL.md");
+  });
+
+  test("installedSkillVersion reports the marker version, null without one", () => {
+    const dest = destDir();
+    expect(installedSkillVersion(dest)).toBeNull(); // nothing installed
+    installAgentSkill(SKILL_SRC, dest, "1.2.3");
+    expect(installedSkillVersion(dest)).toBe("1.2.3");
+    fs.rmSync(path.join(dest, MARKER_FILE)); // manual copy
+    expect(installedSkillVersion(dest)).toBeNull();
   });
 
   test("missing source throws SkillInstallError", () => {

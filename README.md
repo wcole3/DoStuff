@@ -257,7 +257,7 @@ Why bother: a registered MCP server costs every Claude Code session the workflow
 
 Install one of two ways:
 
-- **From the extension** — run **DoStuff: Install Claude Code Agent Skill** (command palette). Copies the bundled skill to `~/.claude/skills/dostuff-tickets`; new Claude Code sessions pick it up automatically. **Stays current on its own**: each install records the extension version plus a hash of every file, and on activation a newer extension silently refreshes an unmodified copy. If you've edited the skill locally it is never overwritten — you get a one-time "Replace / Keep mine" prompt instead, and a manual copy without the marker file is never touched at all.
+- **From the extension** — run **DoStuff: Install Claude Code Agent Skill** (command palette). Copies the bundled skill to `~/.claude/skills/dostuff-tickets`; new Claude Code sessions pick it up automatically. **Stays current on its own**: each install records the extension version plus a hash of every file, and on activation a newer extension silently refreshes an unmodified copy. If you've edited the skill locally it is never overwritten — you get a one-time "Replace / Keep mine" prompt instead, and a manual copy without the marker file is never touched at all. Re-running the command over an existing install names the installed and bundled versions before asking to replace it.
 - **As a plugin** — `/plugin marketplace add wcole3/DoStuff`, then `/plugin install dostuff@dostuff`. Versioned with the repo; updates arrive through Claude Code's plugin update flow (the plugin version is pinned to the extension version by a CI test, so every release is pickable).
 
 Keep registering the MCP server instead when you want typed tool schemas with client-side validation, concurrent dispatch of read-only tools (`readOnlyHint`), per-tool permission gating, or a non-Claude-Code client. The two paths coexist: the skill detects registered `mcp__dostuff__*` tools and defers to them, so installing both is safe.
@@ -414,6 +414,25 @@ bun run package
 ## Changelog
 
 <details open>
+<summary><strong>v2.2.0</strong> — restructure the agent skill</summary>
+
+**Changed**
+
+- **`skills/dostuff-tickets/SKILL.md` is reorganized along Anthropic's skill-authoring guide.** It now opens with a contents map, carries a one-row-per-tool table with each tool's gate, a numbered "Work a ticket" sequence, and a symptom → fix failure table keyed to the script's real stderr. Transport detail (manual registry discovery, raw curl, SSE framing, the headless server) moved to `references/transport.md`; `references/tools.md` gained a contents map. Installed copies refresh on activation via the version bump.
+- `scripts/dostuff.sh` documents why its defaults are 15s and 3 attempts.
+- The skill drift tests now derive their expectations from code: every tool's schema parameters and read-only flag must appear in `tools.md`, every `FIELD_LIMITS` cap is exercised at cap and cap+1 against a fake server, documented subcommands and env vars must exist in the script, and reference files must be one level deep. Prose-only string pins were removed.
+- **DoStuff: Install Claude Code Agent Skill** now says what it would replace. Over an extension-managed install it names the installed and bundled versions; when they match it offers "Overwrite" (the bundled files can still differ, e.g. a dev build) instead of a bare "Replace".
+- `@vscode/vsce` updated to 4.0.0.
+
+**Fixed**
+
+- **Two skill writes in the same second no longer collapse into one.** Without `/proc/sys/kernel/random/uuid` (macOS, Git Bash) the helper script seeded its `Idempotency-Key` from awk's clock-based `srand()`, so back-to-back calls shared a key and the server replayed the first write's result for the second — e.g. a second `create_ticket` silently returned the first ticket. The script now reads `/dev/urandom` on every platform, falling back to time + pid + a body checksum.
+- **The MCP server binds an `Idempotency-Key` to the call's arguments.** The replay cache is keyed on tool + key + a SHA-256 of the arguments, so a retry (same arguments) still replays, but a reused key with different arguments runs as its own write. Header lookup is now case-insensitive, fixing tests that failed when a DOM shim preserved the wire case `Idempotency-Key`.
+- The headless server's wasm path resolution drops a dead `import.meta.url` fallback that made esbuild warn on the CJS build.
+
+</details>
+
+<details>
 <summary><strong>v2.1.2</strong> — add status filters to graph</summary>
 
 **Changed**

@@ -9,6 +9,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import * as http from "http";
+import * as net from "node:net";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
@@ -2696,9 +2697,26 @@ describe("DoStuffMcpServer HTTP (live)", () => {
     const store = await makeStore([]);
     ({ server, port } = await bootServer(store));
 
-    const res = await rawRequest(port, { host: "", body: "{}" });
-    expect(res.status).toBe(403);
-    expect(res.body).toContain("non-loopback Host");
+    // node:http (Node and Bun alike) replaces `Host: ""` with the connection
+    // host, so the only way to put an empty Host on the wire is a raw socket.
+    const res = await new Promise<string>((resolve, reject) => {
+      const s = net.connect(port, "127.0.0.1", () => {
+        s.write(
+          "POST /mcp HTTP/1.1\r\nHost: \r\nContent-Type: application/json\r\n" +
+            "Accept: application/json, text/event-stream\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}",
+        );
+      });
+      let buf = "";
+      s.on("data", (c: Buffer) => (buf += c.toString()));
+      s.on("end", () => resolve(buf));
+      s.on("error", reject);
+      s.setTimeout(5_000, () => {
+        s.destroy();
+        resolve(buf);
+      });
+    });
+    expect(res).toMatch(/^HTTP\/1\.1 403 /);
+    expect(res).toContain("non-loopback Host");
   });
 
   test("non-loopback Host header is rejected with 403", async () => {
@@ -3576,6 +3594,18 @@ describe("concurrency: Idempotency-Key and write backpressure", () => {
     expect(store.list()).toHaveLength(1);
     const c = await call("create_ticket", { title: "Once", description: "d" }, { "Idempotency-Key": "another-key" });
     expect(payloadOf(c).id).not.toBe(payloadOf(a).id);
+    expect(store.list()).toHaveLength(2);
+  });
+
+  test("a key reused with different arguments runs as its own write, not a replay", async () => {
+    const key = "weak-client-key";
+    const a = await call("create_ticket", { title: "First", description: "d" }, { "Idempotency-Key": key });
+    const b = await call("create_ticket", { title: "Second", description: "d" }, { "Idempotency-Key": key });
+    expect(payloadOf(b).id).not.toBe(payloadOf(a).id);
+    expect(store.list().map((i) => i.title).sort()).toEqual(["First", "Second"]);
+    // The true retry — same key, same arguments — still replays.
+    const again = await call("create_ticket", { title: "Second", description: "d" }, { "Idempotency-Key": key });
+    expect(payloadOf(again).id).toBe(payloadOf(b).id);
     expect(store.list()).toHaveLength(2);
   });
 

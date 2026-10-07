@@ -110,16 +110,21 @@ post() { # $1=JSON-RPC body
     line=$(discover) || exit $?
     port=${line%%"$(printf '\t')"*}
   fi
+  # 15s covers a wholesale db.export()+write on a ~650-ticket board (the
+  # persist stall an extension host sees under load); a healthy call answers
+  # in well under 1s. 3 attempts with 1s/2s backoff spans one 250ms persist
+  # window plus a sync cycle; most busy-host failures clear by the second try.
   timeout=${DOSTUFF_TIMEOUT:-15}
   attempts=${DOSTUFF_RETRIES:-3}
-  key=$(idem_key)
+  key=$(idem_key "$1")
   n=0; delay=1
   while :; do
     n=$((n + 1))
     # One Idempotency-Key for every attempt of this call: the server replays
     # the first result for a repeat, so a retried create never duplicates.
     # curl appends the HTTP status as a final line; on failure the output is
-    # curl's own error text. Only sh, curl, sed and awk are assumed here.
+    # curl's own error text. Only sh, curl, sed, awk, od and
+    # cksum are assumed here.
     out=$(curl -sS --max-time "$timeout" -w '\n%{http_code}' -X POST "http://127.0.0.1:${port}/mcp" \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json, text/event-stream' \
@@ -148,10 +153,14 @@ post() { # $1=JSON-RPC body
   done
 }
 
-idem_key() { # a random token; the server scopes it per tool
-  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
-  else awk 'BEGIN { srand(); for (i = 0; i < 4; i++) printf "%08x", int(rand() * 4294967296); print "" }'
-  fi
+idem_key() { # $1=JSON-RPC body; a random token, the server scopes it per tool
+  # /dev/urandom first on every platform (Linux, macOS, Git Bash). Never seed
+  # awk's srand() from the clock: it ticks once a second, so two calls in the
+  # same second shared a key and the server replayed the first write.
+  k=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | sed 's/[^0-9a-f]//g')
+  if [ "${#k}" -eq 32 ]; then printf '%s\n' "$k"; return; fi
+  # No urandom: time + pid + body checksum, so same-second calls still differ.
+  printf '%s-%s-%s\n' "$(date +%s)" "$$" "$(printf '%s' "$1" | cksum | sed 's/[^0-9]/-/g')"
 }
 
 # curl failed: say what the exit code actually means. A blanket "cannot
